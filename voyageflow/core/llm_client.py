@@ -12,7 +12,8 @@ import json
 import time
 from typing import Optional, Dict, Any
 from google import genai
-from google.genai import types
+# from google.genai import types 4/9変更　github対策
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
