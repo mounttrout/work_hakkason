@@ -1,10 +1,9 @@
-# 【バージョン名】VoyageFlow app_hearing_recovery_v2
+# 【バージョン名】app_validation_logging_v1
 # 【制作日】2026-04-10
 # 【修正内容】
-# - 旅行相談の固定質問順送りを、目的地の有無に応じた聞き直しフローへ局所修正
-# - 目的地が取れた場合は確認文、取れない場合は質問文、さらに曖昧なら誘導質問へ分岐
-# - update_planning_state_from_user_text が session_state のコピーだけを更新していた不具合を修正
-# - CSS / 既存タブ構成 / Streamlit key 名は変更しない
+# - 検証用ログを強化し、会話入力・条件保持・Phase1投入条件を観測できるようにした版
+# - 不具合を推測だけで直さず、planning_state とローカル変数の差分を追えるログを追加
+# - 既存のUI/処理フローは変えず、観測用の表示とログのみを局所追加
 
 import html
 import os
@@ -183,6 +182,77 @@ def clear_logs() -> None:
     st.session_state.app_logs = []
 
 
+def extract_destination_candidate_for_log(text: str) -> Optional[str]:
+    """検証用の簡易候補抽出。挙動変更には使わず、観測だけに使う。"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+
+    transport_budget_keywords = [
+        "徒歩", "電車", "タクシー", "レンタカー", "車",
+        "節約", "普通", "贅沢", "ホテル", "宿", "日帰り",
+    ]
+    if any(keyword in text for keyword in transport_budget_keywords):
+        return None
+    if extract_trip_days_from_text(text):
+        return None
+
+    explicit_match = re.search(r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]+(?:都|道|府|県|市|区|町|村|駅|空港|温泉|島))", text)
+    if explicit_match:
+        return explicit_match.group(1)
+
+    if len(text) <= 20 and "、" not in text and "。" not in text and " " not in text:
+        return text
+    return None
+
+
+def build_planning_state_snapshot(state: Optional[Dict] = None) -> Dict[str, object]:
+    s = dict(state or st.session_state.get("planning_state", {}))
+    notes = s.get("conversation_notes", []) or []
+    revisions = s.get("revision_requests", []) or []
+    return {
+        "departure_place": s.get("departure_place"),
+        "return_place": s.get("return_place"),
+        "departure_time": s.get("departure_time"),
+        "start_date": s.get("start_date"),
+        "trip_days": s.get("trip_days"),
+        "transport_style": s.get("transport_style"),
+        "budget_style": s.get("budget_style"),
+        "hotel_required": s.get("hotel_required"),
+        "conversation_notes_count": len(notes),
+        "last_conversation_note": notes[-1] if notes else None,
+        "revision_requests_count": len(revisions),
+        "last_revision_request": revisions[-1] if revisions else None,
+    }
+
+
+def format_snapshot_for_log(snapshot: Dict[str, object]) -> str:
+    return " / ".join([f"{key}={snapshot.get(key)}" for key in snapshot.keys()])
+
+
+def log_planning_state_snapshot(stage: str, label: str, state: Optional[Dict] = None, level: str = "info") -> None:
+    snapshot = build_planning_state_snapshot(state)
+    log_event(stage, f"{label}: {format_snapshot_for_log(snapshot)}", level=level)
+
+
+def build_phase1_input_summary(state: Dict[str, object]) -> str:
+    notes = state.get("conversation_notes", []) or []
+    revisions = state.get("revision_requests", []) or []
+    destination_candidates = []
+    for note in notes[-5:]:
+        candidate = extract_destination_candidate_for_log(note)
+        if candidate:
+            destination_candidates.append(candidate)
+    return (
+        f"departure_place={state.get('departure_place')} / return_place={state.get('return_place')} / "
+        f"start_date={state.get('start_date')} / departure_time={state.get('departure_time')} / "
+        f"trip_days={state.get('trip_days')} / transport_style={state.get('transport_style')} / "
+        f"budget_style={state.get('budget_style')} / hotel_required={state.get('hotel_required')} / "
+        f"destination_candidates={destination_candidates or 'None'} / "
+        f"notes_count={len(notes)} / revisions_count={len(revisions)}"
+    )
+
+
 def extract_trip_days_from_text(text: str) -> Optional[int]:
     text = str(text or "")
     match = re.search(r"(\d+)\s*泊\s*(\d+)\s*日", text)
@@ -192,123 +262,6 @@ def extract_trip_days_from_text(text: str) -> Optional[int]:
     if match:
         return int(match.group(1))
     return None
-
-
-# =========================================================
-# 会話聞き直し（局所復旧）
-# =========================================================
-DESTINATION_STOPWORDS = {
-    "旅行", "観光", "グルメ", "温泉", "自然", "都市", "海", "山", "国内", "海外", "どこか", "どこ", "未定", "未指定",
-    "のんびり", "ゆっくり", "体験", "食べ歩き", "散歩", "旅", "方面", "あたり", "周辺", "近場", "日帰り"
-}
-
-
-def normalize_destination_candidate(text: str) -> str:
-    candidate = str(text or "").strip()
-    candidate = re.sub(r"^(?:へ|に|で|を|から|まで)+", "", candidate)
-    candidate = re.sub(r"(?:へ|に|で|を|から|まで|方面|周辺|あたり)$", "", candidate)
-    candidate = re.sub(r"[、。,.!！?？].*$", "", candidate)
-    candidate = candidate.strip(" 　")
-    return candidate
-
-
-def extract_destination_from_text(text: str, departure_place: str = "", return_place: str = "") -> Optional[str]:
-    source = str(text or "")
-    if not source.strip():
-        return None
-
-    patterns = [
-        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:へ|に)\s*(?:行きたい|行く|旅行|行って|行こう)",
-        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:で|へ|に)\s*\d+\s*泊\s*\d+\s*日",
-        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:で|へ|に)\s*\d+\s*日",
-        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:旅行|観光|食べ歩き|散策|満喫|滞在)",
-        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:メイン|中心)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, source)
-        if m:
-            candidate = normalize_destination_candidate(m.group(1))
-            if candidate and candidate not in {departure_place, return_place} and candidate not in DESTINATION_STOPWORDS:
-                return candidate
-
-    m = re.search(r"から\s*([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:へ|に)", source)
-    if m:
-        candidate = normalize_destination_candidate(m.group(1))
-        if candidate and candidate not in {departure_place, return_place} and candidate not in DESTINATION_STOPWORDS:
-            return candidate
-
-    loose = re.findall(r"([一-龥]{2,10}|[A-Za-z][A-Za-z\-]{2,20})", source)
-    for raw in loose:
-        candidate = normalize_destination_candidate(raw)
-        if candidate and candidate not in {departure_place, return_place} and candidate not in DESTINATION_STOPWORDS:
-            return candidate
-    return None
-
-
-def infer_destination_from_conversation() -> Optional[str]:
-    planning_state = st.session_state.planning_state
-    departure_place = safe_text(planning_state.get("departure_place"), "")
-    return_place = safe_text(planning_state.get("return_place"), "")
-    notes = list(planning_state.get("conversation_notes", []))
-    for text in reversed(notes):
-        candidate = extract_destination_from_text(text, departure_place=departure_place, return_place=return_place)
-        if candidate:
-            return candidate
-    return None
-
-
-def infer_trip_days_from_conversation() -> Optional[int]:
-    planning_state = st.session_state.planning_state
-    notes = list(planning_state.get("conversation_notes", []))
-    for text in reversed(notes):
-        days = extract_trip_days_from_text(text)
-        if days:
-            return days
-    return None
-
-
-def build_adaptive_advisor_reply(user_text: str) -> str:
-    destination = infer_destination_from_conversation()
-    trip_days = infer_trip_days_from_conversation()
-    idx = int(st.session_state.get("advisor_question_index", 0))
-
-    if st.session_state.get("advisor_done"):
-        return "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。"
-
-    if not destination:
-        if idx == 0:
-            st.session_state.advisor_question_index = 1
-            return "目的地がまだ分かりません。どこへ行きたいですか？ 例: 東京 / 京都 / 金沢"
-        st.session_state.advisor_question_index = 2
-        return "まだ目的地を決めきれていないようです。都市 / 自然 / 温泉 ならどれに近いですか？"
-
-    st.session_state.resolved_conditions = {
-        **st.session_state.get("resolved_conditions", {}),
-        "destination_candidate": destination,
-    }
-
-    if idx == 0:
-        st.session_state.advisor_question_index = 1
-        if trip_days:
-            return f"{destination}方面で{trip_days}日くらいの旅ですね？ 合っていれば、どんな過ごし方にしたいか教えてください。例: のんびり / グルメ / 体験型"
-        return f"{destination}方面で考えていきますね。旅行日数は何日くらいにしますか？ 例: 日帰り / 1泊2日 / 2泊3日"
-
-    if idx == 1:
-        st.session_state.advisor_question_index = 2
-        if trip_days:
-            return "ありがとうございます。移動はどうしたいですか？ 例: 電車メイン / 歩きを減らしたい / タクシーも使いたい / レンタカー"
-        return f"{destination}方面ですね。旅行日数は何日くらいにしますか？ 例: 日帰り / 1泊2日 / 2泊3日"
-
-    if idx == 2:
-        st.session_state.advisor_question_index = 3
-        return "予算感はどうしますか？ 例: 節約 / 普通 / 少し贅沢"
-
-    if idx == 3:
-        st.session_state.advisor_question_index = 4
-        return "ホテルは必須ですか？ また、駅近・温泉・安さ重視など希望があれば教えてください。"
-
-    st.session_state.advisor_done = True
-    return "ありがとうございます。条件がだいたい揃いました。『旅行案を作成』を押すと、まず自由記述の旅程案を作ります。"
 
 
 def resolve_planning_state() -> Dict:
@@ -343,6 +296,11 @@ def render_internal_logs_sidebar() -> None:
     resolved = st.session_state.get("resolved_conditions", {})
     st.markdown("### 内部ログ")
     st.markdown("<div class='vf-log-panel'>PowerShell を見なくても、条件採用・Phase進行・移動判定・不足区間をここで確認できます。</div>", unsafe_allow_html=True)
+    with st.expander("検証時に見てほしい場所", expanded=False):
+        st.write("1. 『東京』などを入力した直後の会話欄")
+        st.write("2. 同じタイミングのサイドバー内部ログ")
+        st.write("3. 『プラン確認』タブの『Phase1 に渡した最終プロンプト』")
+        st.write("4. 生成された旅行案の冒頭")
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("🧹 ログをクリア", key="clear_app_logs", use_container_width=True):
@@ -697,9 +655,18 @@ def append_chat(role: str, content: str) -> None:
 
 
 def update_planning_state_from_user_text(user_text: str) -> None:
-    # --- 修正: resolve_planning_state() のコピーではなく、session_state の正本を更新する ---
-    s = st.session_state.planning_state
+    s = resolve_planning_state()
     text = user_text.strip()
+
+    # --- 検証ログ追加: 入力値・推定候補・更新前状態を必ず残す ---
+    log_event("会話入力", f"ユーザー入力受信: {text}")
+    destination_candidate = extract_destination_candidate_for_log(text)
+    inferred_days = extract_trip_days_from_text(text)
+    log_event(
+        "会話入力",
+        f"入力からの候補抽出: destination_candidate={destination_candidate or 'None'} / trip_days_candidate={inferred_days or 'None'}",
+    )
+    log_planning_state_snapshot("会話入力", "更新前planning_state(正本)", st.session_state.planning_state)
 
     if "徒歩" in text:
         s["transport_style"] = "徒歩メイン"
@@ -722,32 +689,29 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     elif "ホテル" in text or "宿" in text:
         s["hotel_required"] = True
 
-    if text:
-        s["conversation_notes"].append(text)
-
-    inferred_days = extract_trip_days_from_text(text)
+    s["conversation_notes"].append(text)
     if inferred_days:
         log_event("会話解析", f"会話から旅行日数候補を検出: {inferred_days}日")
-        s["trip_days"] = inferred_days
-
-    destination = extract_destination_from_text(
-        text,
-        departure_place=safe_text(s.get("departure_place"), ""),
-        return_place=safe_text(s.get("return_place"), ""),
-    )
-    if destination:
-        log_event("会話解析", f"会話から目的地候補を検出: {destination}")
-        st.session_state.resolved_conditions = {
-            **st.session_state.get("resolved_conditions", {}),
-            "destination_candidate": destination,
-        }
 
     if st.session_state.advisor_done and text:
         s["revision_requests"].append(text)
 
+    # --- 検証ログ追加: ローカル変数 s と session_state 正本の差を観測する ---
+    log_planning_state_snapshot("会話入力", "更新後planning_state(正本)", st.session_state.planning_state)
+    log_planning_state_snapshot("会話入力", "更新後ローカルs(未反映候補)", s, level="warning")
+    log_event(
+        "会話入力",
+        "検証メモ: この関数ではローカル変数 s を更新しています。session_state.planning_state への明示代入有無をログで確認してください。",
+        level="warning",
+    )
+
 
 def build_phase1_request_text() -> str:
     s = resolve_planning_state()
+
+    # --- 検証ログ追加: Phase1 に渡す前の条件サマリーを観測する ---
+    log_event("Phase1準備", f"投入条件サマリー: {build_phase1_input_summary(s)}")
+    log_planning_state_snapshot("Phase1準備", "Phase1直前planning_state(正本)", st.session_state.planning_state)
 
     notes_text = " / ".join(s["conversation_notes"]) if s["conversation_notes"] else "特になし"
     revisions_text = " / ".join(s["revision_requests"]) if s["revision_requests"] else "なし"
@@ -796,10 +760,14 @@ def build_phase1_request_text() -> str:
 
 def generate_phase1_draft() -> None:
     clear_logs()
+    log_event("Phase1", "旅行案作成ボタン押下。検証ログを新規収集開始")
+    log_planning_state_snapshot("Phase1", "旅行案作成押下時planning_state(正本)", st.session_state.planning_state)
     resolved = resolve_planning_state()
     prompt_text = build_phase1_request_text()
     st.session_state.phase1_prompt_text = prompt_text
     log_event("Phase1", f"LLM候補生成を開始。最終採用: {resolved['trip_days']}日 / {resolved['transport_style']} / {resolved['budget_style']}")
+    prompt_preview = prompt_text[:800].replace("\n", " / ")
+    log_event("Phase1", f"最終プロンプト冒頭(800文字まで): {prompt_preview}")
 
     generator = Phase1Generator(logger=log_event)
     draft = generator.generate_trip_plan(prompt_text, temperature=st.session_state.temperature)
@@ -985,9 +953,6 @@ def render_planning_summary() -> None:
     c6.metric("予算感", s["budget_style"])
 
     st.caption(f"ホテル必須: {'あり' if s['hotel_required'] else 'なし'}")
-    destination_candidate = st.session_state.get("resolved_conditions", {}).get("destination_candidate")
-    if destination_candidate:
-        st.caption(f"会話から推測した目的地: {destination_candidate}")
 
     if s["conversation_notes"]:
         st.markdown("**相談メモ**")
@@ -999,13 +964,23 @@ def render_planning_summary() -> None:
         for note in s["revision_requests"][-5:]:
             st.write(f"- {note}")
 
+    # --- 検証表示追加: いま保持している planning_state を画面から確認できるようにする ---
+    with st.expander("検証用: planning_state の保持値を見る", expanded=False):
+        st.json(build_planning_state_snapshot(s))
+        destination_candidates = []
+        for note in s.get("conversation_notes", [])[-5:]:
+            candidate = extract_destination_candidate_for_log(note)
+            if candidate:
+                destination_candidates.append(candidate)
+        st.write(f"会話メモから見える目的地候補: {destination_candidates or 'None'}")
+
 
 def render_chat_history() -> None:
     st.markdown("### 旅行相談")
     if not st.session_state.chat_history:
         st.info("まず条件を少しずつ決めていきましょう。")
-        # --- 修正: 固定質問の順送りではなく、最初は自由入力を促す案内に変更 ---
-        append_chat("assistant", "行きたい場所や雰囲気が決まっていれば、そのまま自然文で教えてください。まだ曖昧でも大丈夫です。")
+        first_q = conversation_advisor_questions()[0]
+        append_chat("assistant", first_q)
 
     for item in st.session_state.chat_history:
         if item["role"] == "user":
@@ -1368,9 +1343,34 @@ with tabs[0]:
             append_chat("user", user_message)
             update_planning_state_from_user_text(user_message)
 
-            # --- 修正: 固定質問の順送りではなく、目的地の有無に応じて確認 or 質問へ切り替える ---
-            advisor_reply = build_adaptive_advisor_reply(user_message)
-            append_chat("assistant", advisor_reply)
+            questions = conversation_advisor_questions()
+            idx = st.session_state.advisor_question_index
+            log_event(
+                "会話分岐",
+                f"分岐判定前: advisor_done={st.session_state.advisor_done} / advisor_question_index={idx} / chat_history_count={len(st.session_state.chat_history)}",
+            )
+
+            if not st.session_state.advisor_done:
+                if idx + 1 < len(questions):
+                    st.session_state.advisor_question_index += 1
+                    next_question = questions[st.session_state.advisor_question_index]
+                    log_event("会話分岐", f"次質問を採用: index={st.session_state.advisor_question_index} / text={next_question}")
+                    append_chat("assistant", next_question)
+                else:
+                    st.session_state.advisor_done = True
+                    final_message = "ありがとうございます。条件がだいたい揃いました。『旅行案を作成』を押すと、まず自由記述の旅程案を作ります。"
+                    log_event("会話分岐", f"質問完了メッセージを採用: {final_message}")
+                    append_chat(
+                        "assistant",
+                        final_message
+                    )
+            else:
+                revision_message = "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。"
+                log_event("会話分岐", f"advisor_done=True のため修正受付メッセージを採用: {revision_message}")
+                append_chat(
+                    "assistant",
+                    revision_message
+                )
             st.rerun()
 
         st.divider()
