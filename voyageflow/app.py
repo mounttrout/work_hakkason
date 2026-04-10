@@ -1,15 +1,20 @@
-# 【バージョン名】app_validation_logging_v1
-# 【制作日】2026-04-10
-# 【修正内容】
-# - 検証用ログを強化し、会話入力・条件保持・Phase1投入条件を観測できるようにした版
-# - 不具合を推測だけで直さず、planning_state とローカル変数の差分を追えるログを追加
-# - 既存のUI/処理フローは変えず、観測用の表示とログのみを局所追加
+# -*- coding: utf-8 -*-
+"""
+【バージョン名】app_conversation_priority_fix_v3
+【制作日】2026-04-10
+【修正内容】
+- 会話内容を基本情報より優先して、主目的地(primary_destination)と旅行日数を採用するよう修正
+- 「日帰り→1日」「◯泊→◯+1日」を明示的に扱うよう修正
+- 固定質問の順送りをやめ、不足項目ベースで次の質問を返すよう修正
+- Phase1プロンプトで主目的地を強く優先し、別都市へ勝手変換しない指示を追加
+- 修正箇所には「# --- 修正箇所 ---」コメントを付与
+"""
 
-import html
 import os
 import sys
 import urllib.parse
 import re
+import html
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
@@ -23,6 +28,7 @@ from orchestration.phase2_structuring import Phase2Structuring
 from orchestration.phase3_routing import Phase3Routing
 from orchestration.execution_engine import ExecutionEngine
 from utils.display_formatters import build_transport_display, clean_address, format_genre, format_purpose
+from utils.weather_mock import build_mock_weather_context
 from maps.places_api import PlacesAPI
 
 
@@ -89,6 +95,53 @@ st.markdown(
 )
 
 
+def render_mock_weather_panel(planning_state: Dict[str, object], context_label: str = "plan") -> None:
+    weather_context = build_mock_weather_context(planning_state)
+    caption_suffix = "※モック表示です。後で実天気APIに差し替え可能な形にしています。"
+
+    with st.container():
+        st.markdown("### 🌤️ 天候メモ")
+        st.caption(f"{weather_context['mode_label']} / {weather_context['date_range_label']} / {caption_suffix}")
+        st.info(f"**{weather_context['headline']}**\n\n{weather_context['summary']}")
+
+        d1, d2 = st.columns(2)
+        with d1:
+            st.markdown("**気象の見立て**")
+            for line in weather_context["detail_lines"]:
+                st.write(f"- {line}")
+            st.write(f"- 服装メモ: {weather_context['packing']}")
+        with d2:
+            st.markdown("**移動・地域差アドバイス**")
+            st.write(f"- 出発地: {weather_context['departure_label']}")
+            st.write(f"- 到着地: {weather_context['destination_label']}")
+            st.write(f"- 差分メモ: {weather_context['gap_advice']}")
+            if context_label == "execution":
+                st.write(f"- 実行中メモ: {weather_context['execution_hint']}")
+
+
+
+def build_weather_event_detail(planning_state: Dict[str, object]) -> str:
+    weather_context = build_mock_weather_context(planning_state)
+    summary = str(weather_context.get("summary", "") or "")
+    gap_advice = str(weather_context.get("gap_advice", "") or "")
+    execution_hint = str(weather_context.get("execution_hint", "") or "")
+    detail_lines = weather_context.get("detail_lines", [])
+    rain_like = any("雨" in str(line) or "スコール" in str(line) for line in detail_lines)
+
+    base_text = "次は屋外の予定だが、今は天候が悪い。必要なら屋内へ変更し、徒歩移動ならタクシーも提案して。"
+    if rain_like:
+        base_text = "次は屋外の予定だが、今は雨の想定。必要なら屋内へ変更し、徒歩移動ならタクシーも提案して。"
+
+    parts = [base_text]
+    if summary:
+        parts.append(f"想定メモ: {summary}")
+    if gap_advice:
+        parts.append(f"地域差メモ: {gap_advice}")
+    if execution_hint:
+        parts.append(f"実行中メモ: {execution_hint}")
+
+    return " ".join(part for part in parts if part).strip()
+
 
 # =========================================================
 # 初期化
@@ -107,12 +160,14 @@ def init_session_state() -> None:
             "transport_style": "自動（おすすめ）",
             "budget_style": "普通",
             "hotel_required": True,
+            "primary_destination": "",
             "conversation_notes": [],
             "revision_requests": [],
         },
         "chat_history": [],
         "advisor_question_index": 0,
         "advisor_done": False,
+        "pending_confirmation": None,
 
         "phase1_prompt_text": "",
         "trip_plan_draft": None,
@@ -167,6 +222,67 @@ def safe_text(value, default: str = "-") -> str:
 
 
 
+
+
+def format_phase1_preview_text(plan_text: str) -> str:
+    if not plan_text:
+        return ""
+
+    import re
+    import html
+
+    text = html.escape(plan_text)
+
+    text = re.sub(
+        r"^【(.*?)】(.*)$",
+        r"<div style='font-size:1.9rem;font-weight:800;margin:18px 0 10px 0;'>【\1】\2</div>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    text = re.sub(
+        r"^テーマ:\s*(.*)$",
+        r"<div style='margin-bottom:12px;'>テーマ：\1</div>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    text = re.sub(
+        r"^\*\s*(\d{1,2}:\d{2}\s*-\s*.*)$",
+        r"<div style='margin:12px 0 4px 0;font-weight:800;color:#2563eb;'>\1</div>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    text = re.sub(
+        r"^\s*-\s*目的:\s*(.*)$",
+        r"<div style='margin-left:16px;'>目的: \1</div>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    text = re.sub(
+        r"^\s*-\s*滞在時間:\s*(.*)$",
+        r"<div style='margin-left:16px;'>🕒 \1</div>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    text = re.sub(
+        r"^\s*-\s*ワンポイント:\s*(.*)$",
+        r"<div style='margin-left:16px;'>\1</div>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    text = re.sub(
+        r"\*\*(.*?)\*\*",
+        r"<strong>\1</strong>",
+        text,
+    )
+
+    return text
+
 def log_event(stage: str, message: str, level: str = "info") -> None:
     logs = st.session_state.get("app_logs", [])
     logs.append({
@@ -182,86 +298,137 @@ def clear_logs() -> None:
     st.session_state.app_logs = []
 
 
-def extract_destination_candidate_for_log(text: str) -> Optional[str]:
-    """検証用の簡易候補抽出。挙動変更には使わず、観測だけに使う。"""
-    text = str(text or "").strip()
-    if not text:
-        return None
-
-    transport_budget_keywords = [
-        "徒歩", "電車", "タクシー", "レンタカー", "車",
-        "節約", "普通", "贅沢", "ホテル", "宿", "日帰り",
-    ]
-    if any(keyword in text for keyword in transport_budget_keywords):
-        return None
-    if extract_trip_days_from_text(text):
-        return None
-
-    explicit_match = re.search(r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]+(?:都|道|府|県|市|区|町|村|駅|空港|温泉|島))", text)
-    if explicit_match:
-        return explicit_match.group(1)
-
-    if len(text) <= 20 and "、" not in text and "。" not in text and " " not in text:
-        return text
-    return None
-
-
-def build_planning_state_snapshot(state: Optional[Dict] = None) -> Dict[str, object]:
-    s = dict(state or st.session_state.get("planning_state", {}))
-    notes = s.get("conversation_notes", []) or []
-    revisions = s.get("revision_requests", []) or []
-    return {
-        "departure_place": s.get("departure_place"),
-        "return_place": s.get("return_place"),
-        "departure_time": s.get("departure_time"),
-        "start_date": s.get("start_date"),
-        "trip_days": s.get("trip_days"),
-        "transport_style": s.get("transport_style"),
-        "budget_style": s.get("budget_style"),
-        "hotel_required": s.get("hotel_required"),
-        "conversation_notes_count": len(notes),
-        "last_conversation_note": notes[-1] if notes else None,
-        "revision_requests_count": len(revisions),
-        "last_revision_request": revisions[-1] if revisions else None,
-    }
-
-
-def format_snapshot_for_log(snapshot: Dict[str, object]) -> str:
-    return " / ".join([f"{key}={snapshot.get(key)}" for key in snapshot.keys()])
-
-
-def log_planning_state_snapshot(stage: str, label: str, state: Optional[Dict] = None, level: str = "info") -> None:
-    snapshot = build_planning_state_snapshot(state)
-    log_event(stage, f"{label}: {format_snapshot_for_log(snapshot)}", level=level)
-
-
-def build_phase1_input_summary(state: Dict[str, object]) -> str:
-    notes = state.get("conversation_notes", []) or []
-    revisions = state.get("revision_requests", []) or []
-    destination_candidates = []
-    for note in notes[-5:]:
-        candidate = extract_destination_candidate_for_log(note)
-        if candidate:
-            destination_candidates.append(candidate)
-    return (
-        f"departure_place={state.get('departure_place')} / return_place={state.get('return_place')} / "
-        f"start_date={state.get('start_date')} / departure_time={state.get('departure_time')} / "
-        f"trip_days={state.get('trip_days')} / transport_style={state.get('transport_style')} / "
-        f"budget_style={state.get('budget_style')} / hotel_required={state.get('hotel_required')} / "
-        f"destination_candidates={destination_candidates or 'None'} / "
-        f"notes_count={len(notes)} / revisions_count={len(revisions)}"
-    )
-
-
 def extract_trip_days_from_text(text: str) -> Optional[int]:
+    # --- 修正箇所 --- 会話内の日数表現を優先的に拾う
     text = str(text or "")
+    if not text.strip():
+        return None
+    if "日帰り" in text:
+        return 1
     match = re.search(r"(\d+)\s*泊\s*(\d+)\s*日", text)
     if match:
         return int(match.group(2))
+    match = re.search(r"(\d+)\s*泊", text)
+    if match:
+        return int(match.group(1)) + 1
     match = re.search(r"(\d+)\s*日", text)
     if match:
         return int(match.group(1))
     return None
+
+
+def extract_primary_destination_from_text(text: str, departure_place: str = "", return_place: str = "") -> str:
+    # --- 修正箇所 --- 短文入力（例: 東京）や「東京日帰り」を主目的地として拾いやすくする
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return ""
+
+    cleaned = re.sub(r"[、。,.!！?？]", " ", raw_text)
+    compact = re.sub(r"\s+", "", raw_text)
+    patterns = [
+        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:へ|に)\s*行きたい",
+        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:旅行|観光|散策|滞在)",
+        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:日帰り|\d+\s*泊(?:\s*\d+\s*日)?)",
+    ]
+    candidates = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, cleaned):
+            candidate = str(match.group(1) or "").strip(" 　")
+            if candidate:
+                candidates.append(candidate)
+
+    if not candidates:
+        simple = re.match(r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})(?:日帰り|\d+\s*泊)", compact)
+        if simple:
+            candidates.append(str(simple.group(1)).strip())
+
+    exclusions = {
+        str(departure_place or "").strip(),
+        str(return_place or "").strip(),
+        "旅行", "観光", "グルメ", "温泉", "ホテル", "泊", "日", "日帰り",
+        "電車", "徒歩", "タクシー", "レンタカー", "普通", "節約", "贅沢",
+    }
+    filtered = []
+    for candidate in candidates:
+        candidate = re.sub(r"(日帰り|\d+\s*泊.*|\d+\s*日.*)$", "", candidate).strip(" 　")
+        if candidate and candidate not in exclusions:
+            filtered.append(candidate)
+
+    if filtered:
+        return filtered[0]
+
+    if re.fullmatch(r"[一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20}", compact):
+        if compact not in exclusions:
+            return compact
+    return ""
+
+
+def has_trip_days_signal(planning_state: Dict) -> bool:
+    notes = planning_state.get("conversation_notes", []) + planning_state.get("revision_requests", [])
+    text = " / ".join(str(x) for x in notes if x)
+    return extract_trip_days_from_text(text) is not None
+
+
+
+def build_next_advisor_message(planning_state: Dict) -> str:
+    # --- 修正箇所 --- 不足項目ベースで次の会話を返す
+    primary_destination = safe_text(planning_state.get("primary_destination"), "")
+    if not primary_destination:
+        return "目的地がまだ分かっていません。どこへ行きたいですか？ 例: 東京 / 金沢 / 温泉地"
+    if not has_trip_days_signal(planning_state):
+        return f"{primary_destination}方面ですね。旅行日数は何日くらいにしますか？ 例: 日帰り / 1泊2日 / 2泊3日"
+    return "ありがとうございます。条件がだいたい揃いました。上の確認内容で問題なければ、このまま旅行案を作成できます。"
+
+
+def should_offer_confirmation(planning_state: Dict) -> bool:
+    primary_destination = safe_text(planning_state.get("primary_destination"), "")
+    return bool(primary_destination) and has_trip_days_signal(planning_state)
+
+
+
+def build_confirmation_payload_from_state(source_text: str = "") -> Optional[Dict[str, str]]:
+    planning_state = resolve_planning_state()
+    if not should_offer_confirmation(planning_state):
+        return None
+
+    resolved_destination = safe_text(planning_state.get("primary_destination"), "")
+    resolved_trip_days = int(planning_state.get("trip_days", 2))
+    departure_place = safe_text(planning_state.get("departure_place"), "-")
+
+    message = (
+        f"確認です。主な目的地は「{resolved_destination or '-'}」、"
+        f"旅行日数は「{resolved_trip_days}日」、"
+        f"出発地は「{departure_place}」でよいですか？ その他希望がなければ、この条件で計画します。"
+    )
+    return {
+        "primary_destination": resolved_destination,
+        "trip_days": str(resolved_trip_days),
+        "message": message,
+        "source_text": source_text,
+    }
+
+
+def apply_confirmation_payload(payload: Dict[str, str]) -> None:
+    if not payload:
+        return
+    planning_state = dict(st.session_state.planning_state)
+    primary_destination = str(payload.get("primary_destination", "")).strip()
+    if primary_destination:
+        planning_state["primary_destination"] = primary_destination
+    trip_days = payload.get("trip_days")
+    if str(trip_days).strip().isdigit():
+        planning_state["trip_days"] = int(str(trip_days).strip())
+    st.session_state.planning_state = planning_state
+
+
+def build_route_source_text(row_dict: Dict) -> str:
+    source = safe_text(row_dict.get("route_data_source"), "").lower()
+    departure_at = safe_text(row_dict.get("route_departure_at"), "")
+    if source == "google_routes_api":
+        if departure_at and departure_at != "-":
+            return f"移動時間: 実検索（Google Routes / {departure_at} 出発想定）"
+        return "移動時間: 実検索（Google Routes）"
+    return "移動時間: 推定値（フォールバック）"
 
 
 def resolve_planning_state() -> Dict:
@@ -280,11 +447,13 @@ def resolve_planning_state() -> Dict:
         log_event("条件解決", f"旅行日数を採用: {resolved['trip_days']}日（採用元: {adopted_source}）")
     resolved["resolved_trip_days_source"] = adopted_source
     resolved["conversation_trip_days"] = conversation_trip_days
+    resolved["primary_destination"] = safe_text(s.get("primary_destination"), "")
     st.session_state.resolved_conditions = {
         "trip_days_form": int(s.get("trip_days", 2)),
         "trip_days_conversation": conversation_trip_days,
         "trip_days_final": resolved["trip_days"],
         "trip_days_source": adopted_source,
+        "primary_destination": resolved.get("primary_destination", ""),
         "transport_style_final": resolved.get("transport_style", "自動（おすすめ）"),
         "budget_style_final": resolved.get("budget_style", "普通"),
     }
@@ -296,11 +465,6 @@ def render_internal_logs_sidebar() -> None:
     resolved = st.session_state.get("resolved_conditions", {})
     st.markdown("### 内部ログ")
     st.markdown("<div class='vf-log-panel'>PowerShell を見なくても、条件採用・Phase進行・移動判定・不足区間をここで確認できます。</div>", unsafe_allow_html=True)
-    with st.expander("検証時に見てほしい場所", expanded=False):
-        st.write("1. 『東京』などを入力した直後の会話欄")
-        st.write("2. 同じタイミングのサイドバー内部ログ")
-        st.write("3. 『プラン確認』タブの『Phase1 に渡した最終プロンプト』")
-        st.write("4. 生成された旅行案の冒頭")
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("🧹 ログをクリア", key="clear_app_logs", use_container_width=True):
@@ -311,6 +475,7 @@ def render_internal_logs_sidebar() -> None:
     if resolved:
         with st.expander("採用された条件", expanded=True):
             st.write(f"旅行日数: 基本情報={resolved.get('trip_days_form')} / 会話={resolved.get('trip_days_conversation')} / 最終採用={resolved.get('trip_days_final')} ({resolved.get('trip_days_source')})")
+            st.write(f"主目的地: {resolved.get('primary_destination') or '未確定'}")
             st.write(f"移動スタイル: {resolved.get('transport_style_final')}")
             st.write(f"予算感: {resolved.get('budget_style_final')}")
     if not logs:
@@ -347,12 +512,14 @@ def reset_all() -> None:
         "transport_style": "自動（おすすめ）",
         "budget_style": "普通",
         "hotel_required": True,
+        "primary_destination": "",
         "conversation_notes": [],
         "revision_requests": [],
     }
     st.session_state.chat_history = []
     st.session_state.advisor_question_index = 0
     st.session_state.advisor_done = False
+    st.session_state.pending_confirmation = None
     st.session_state.phase1_prompt_text = ""
     st.session_state.trip_plan_draft = None
     st.session_state.trip_plan = None
@@ -658,16 +825,6 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     s = resolve_planning_state()
     text = user_text.strip()
 
-    # --- 検証ログ追加: 入力値・推定候補・更新前状態を必ず残す ---
-    log_event("会話入力", f"ユーザー入力受信: {text}")
-    destination_candidate = extract_destination_candidate_for_log(text)
-    inferred_days = extract_trip_days_from_text(text)
-    log_event(
-        "会話入力",
-        f"入力からの候補抽出: destination_candidate={destination_candidate or 'None'} / trip_days_candidate={inferred_days or 'None'}",
-    )
-    log_planning_state_snapshot("会話入力", "更新前planning_state(正本)", st.session_state.planning_state)
-
     if "徒歩" in text:
         s["transport_style"] = "徒歩メイン"
     elif "電車" in text:
@@ -689,32 +846,33 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     elif "ホテル" in text or "宿" in text:
         s["hotel_required"] = True
 
+    primary_destination = extract_primary_destination_from_text(
+        text,
+        s.get("departure_place", ""),
+        s.get("return_place", ""),
+    )
+    if primary_destination:
+        s["primary_destination"] = primary_destination
+        log_event("会話解析", f"会話から主目的地候補を検出: {primary_destination}")
+
     s["conversation_notes"].append(text)
+    inferred_days = extract_trip_days_from_text(text)
     if inferred_days:
         log_event("会話解析", f"会話から旅行日数候補を検出: {inferred_days}日")
+        s["trip_days"] = int(inferred_days)
 
     if st.session_state.advisor_done and text:
         s["revision_requests"].append(text)
 
-    # --- 検証ログ追加: ローカル変数 s と session_state 正本の差を観測する ---
-    log_planning_state_snapshot("会話入力", "更新後planning_state(正本)", st.session_state.planning_state)
-    log_planning_state_snapshot("会話入力", "更新後ローカルs(未反映候補)", s, level="warning")
-    log_event(
-        "会話入力",
-        "検証メモ: この関数ではローカル変数 s を更新しています。session_state.planning_state への明示代入有無をログで確認してください。",
-        level="warning",
-    )
+    st.session_state.planning_state = s
 
 
 def build_phase1_request_text() -> str:
     s = resolve_planning_state()
 
-    # --- 検証ログ追加: Phase1 に渡す前の条件サマリーを観測する ---
-    log_event("Phase1準備", f"投入条件サマリー: {build_phase1_input_summary(s)}")
-    log_planning_state_snapshot("Phase1準備", "Phase1直前planning_state(正本)", st.session_state.planning_state)
-
     notes_text = " / ".join(s["conversation_notes"]) if s["conversation_notes"] else "特になし"
     revisions_text = " / ".join(s["revision_requests"]) if s["revision_requests"] else "なし"
+    primary_destination = safe_text(s.get("primary_destination"), "未指定")
     hotel_instruction = "ホテル（宿泊先）は必ず含めてください。" if s["hotel_required"] else "ホテルは必須ではありません。"
 
     text = f"""
@@ -733,12 +891,15 @@ def build_phase1_request_text() -> str:
 - 出発時間: {s["departure_time"]}
 - 旅行開始日: {s["start_date"]}
 - 旅行日数: {s["trip_days"]}日
+- 主目的地: {primary_destination}
 - 移動スタイル: {s["transport_style"]}
 - 予算感: {s["budget_style"]}
 - 相談メモ: {notes_text}
 - 追加の修正希望: {revisions_text}
 
 【旅程の作り方】
+- 主目的地が指定されている場合は、その都市・エリアを旅の中心として最優先してください。
+- 主目的地が「東京」なら、金沢や他都市へ勝手に置き換えないでください。ユーザー入力の地名を優先してください。
 - ユーザーの希望内容から、旅行の主目的地・主エリア・体験内容を自然に決めてください。
 - Day 1, Day 2 のように日別に分けてください。
 - 各日の時刻、訪問先、目的、滞在時間の目安がわかる形にしてください。
@@ -760,14 +921,10 @@ def build_phase1_request_text() -> str:
 
 def generate_phase1_draft() -> None:
     clear_logs()
-    log_event("Phase1", "旅行案作成ボタン押下。検証ログを新規収集開始")
-    log_planning_state_snapshot("Phase1", "旅行案作成押下時planning_state(正本)", st.session_state.planning_state)
     resolved = resolve_planning_state()
     prompt_text = build_phase1_request_text()
     st.session_state.phase1_prompt_text = prompt_text
     log_event("Phase1", f"LLM候補生成を開始。最終採用: {resolved['trip_days']}日 / {resolved['transport_style']} / {resolved['budget_style']}")
-    prompt_preview = prompt_text[:800].replace("\n", " / ")
-    log_event("Phase1", f"最終プロンプト冒頭(800文字まで): {prompt_preview}")
 
     generator = Phase1Generator(logger=log_event)
     draft = generator.generate_trip_plan(prompt_text, temperature=st.session_state.temperature)
@@ -936,6 +1093,95 @@ def apply_transport_change_during_execution(step_index: int, new_mode: str) -> D
     return engine.update_transport_step(step_index, new_mode, reason="ユーザーが実行中に移動手段を変更")
 
 
+def _activity_position_from_phase3(df_phase3: pd.DataFrame, absolute_idx: int) -> Optional[int]:
+    if df_phase3 is None or df_phase3.empty or absolute_idx < 0 or absolute_idx >= len(df_phase3):
+        return None
+    activity_positions = df_phase3.index[df_phase3["is_transport"] == False].tolist()  # noqa: E712
+    try:
+        return activity_positions.index(absolute_idx)
+    except ValueError:
+        return None
+
+
+def rebuild_final_itinerary_from_phase2(updated_df2: pd.DataFrame, reason: str) -> Dict[str, str]:
+    if updated_df2 is None or updated_df2.empty:
+        raise ValueError("構造化データが空のため完成旅程を再構築できません。")
+
+    normalized_df2 = normalize_phase2_dataframe(updated_df2.copy(), st.session_state.planning_state)
+    router = Phase3Routing(logger=log_event)
+    request_text = st.session_state.trip_plan or st.session_state.trip_plan_draft or build_phase1_request_text()
+    df3 = router.insert_routes(
+        normalized_df2,
+        user_request=request_text,
+        transport_preference=st.session_state.planning_state["transport_style"],
+    )
+    if df3 is None or df3.empty:
+        raise ValueError("完成旅程の再構築に失敗しました。")
+
+    st.session_state.df_phase2 = normalized_df2.reset_index(drop=True)
+    st.session_state.df_phase3 = df3.reset_index(drop=True)
+    st.session_state.execution_engine = ExecutionEngine(st.session_state.df_phase3)
+    log_event("完成旅程編集", reason)
+    return {"message": reason}
+
+
+def delete_spot_from_plan(activity_position: int) -> Dict[str, str]:
+    df2 = st.session_state.get("df_phase2")
+    if df2 is None or df2.empty:
+        raise ValueError("構造化データがありません。")
+    activity_idx = df2.index[df2["is_transport"] == False].tolist()  # noqa: E712
+    if activity_position is None or activity_position < 0 or activity_position >= len(activity_idx):
+        raise ValueError("削除対象スポットを特定できません。")
+    if len(activity_idx) <= 1:
+        raise ValueError("最後の1件は削除できません。")
+
+    target_idx = activity_idx[activity_position]
+    target_name = safe_text(df2.iloc[target_idx].get("destination"))
+    updated_df2 = df2.drop(index=target_idx).reset_index(drop=True)
+    return rebuild_final_itinerary_from_phase2(updated_df2, f"スポットを削除しました: {target_name}")
+
+
+def update_spot_in_plan(activity_position: int, new_destination: str, new_purpose: str = "", new_one_point: str = "") -> Dict[str, str]:
+    df2 = st.session_state.get("df_phase2")
+    if df2 is None or df2.empty:
+        raise ValueError("構造化データがありません。")
+    activity_idx = df2.index[df2["is_transport"] == False].tolist()  # noqa: E712
+    if activity_position is None or activity_position < 0 or activity_position >= len(activity_idx):
+        raise ValueError("変更対象スポットを特定できません。")
+
+    target_idx = activity_idx[activity_position]
+    updated_df2 = df2.copy()
+    updated_df2.at[target_idx, "destination"] = new_destination.strip()
+    if str(new_purpose).strip():
+        updated_df2.at[target_idx, "purpose"] = new_purpose.strip()
+    if str(new_one_point).strip():
+        updated_df2.at[target_idx, "one_point"] = new_one_point.strip()
+
+    return rebuild_final_itinerary_from_phase2(updated_df2, f"スポットを変更しました: {new_destination.strip()}")
+
+
+def run_mood_change_action(engine: ExecutionEngine, action: str, free_text: str = "") -> None:
+    detail_map = {
+        "寄り道": ("mood_change", "近くで短時間の寄り道候補を出して、残り旅程に無理がない形で提案して。"),
+        "次の予定をキャンセル": ("cancel", "次の予定をキャンセルして、この先だけを調整して。"),
+        "その日の予定をキャンセル": ("cancel", "その日の残り予定をキャンセルして、以降を調整して。"),
+        "全体キャンセルして帰路へ": ("cancel", "全体キャンセルして帰路へ変更して。"),
+        "移動手段変更": ("mood_change", "移動手段を変更したい。徒歩を減らして楽な移動を優先して提案して。"),
+    }
+
+    if action == "自由会話":
+        request = str(free_text).strip()
+        if not request:
+            raise ValueError("自由会話の内容を入力してください。")
+        generate_execution_replan_preview(request, source_event="mood_change")
+        st.session_state.show_mood_dialog = False
+        return
+
+    event_type, detail = detail_map[action]
+    st.session_state.event_result = engine.trigger_event(event_type, detail)
+    st.session_state.show_mood_dialog = False
+
+
 def render_planning_summary() -> None:
     s = st.session_state.planning_state
 
@@ -952,7 +1198,8 @@ def render_planning_summary() -> None:
     c5.metric("移動スタイル", s["transport_style"])
     c6.metric("予算感", s["budget_style"])
 
-    st.caption(f"ホテル必須: {'あり' if s['hotel_required'] else 'なし'}")
+    primary_destination = safe_text(s.get("primary_destination"), "未指定")
+    st.caption(f"主目的地: {primary_destination} / ホテル必須: {'あり' if s['hotel_required'] else 'なし'}")
 
     if s["conversation_notes"]:
         st.markdown("**相談メモ**")
@@ -963,16 +1210,6 @@ def render_planning_summary() -> None:
         st.markdown("**追加修正依頼**")
         for note in s["revision_requests"][-5:]:
             st.write(f"- {note}")
-
-    # --- 検証表示追加: いま保持している planning_state を画面から確認できるようにする ---
-    with st.expander("検証用: planning_state の保持値を見る", expanded=False):
-        st.json(build_planning_state_snapshot(s))
-        destination_candidates = []
-        for note in s.get("conversation_notes", [])[-5:]:
-            candidate = extract_destination_candidate_for_log(note)
-            if candidate:
-                destination_candidates.append(candidate)
-        st.write(f"会話メモから見える目的地候補: {destination_candidates or 'None'}")
 
 
 def render_chat_history() -> None:
@@ -1090,11 +1327,13 @@ def render_itinerary_cards(
                     note = safe_text(row_dict.get("modification_note"), "")
                     status_text = f"状態: {status_label}"
                     transport_display = build_transport_display(row_dict)
+                    route_source_text = build_route_source_text(row_dict)
                     body = f"""
 <div class="vf-card {card_class}">
   <div><b>🚗 {safe_text(row_dict.get('start_time'))} - {safe_text(row_dict.get('end_time'))}{current_badge}</b></div>
   <div>{status_text}</div>
   <div>移動手段: {transport_display}</div>
+  <div>{html.escape(route_source_text)}</div>
 </div>
 """
                     st.markdown(body, unsafe_allow_html=True)
@@ -1105,55 +1344,55 @@ def render_itinerary_cards(
                     st.link_button("🗺️ Google Mapsでルートを見る", route_url, use_container_width=True)
 
                     if allow_transport_edit and absolute_idx is not None:
-                        current_mode = safe_text(row_dict.get("transport_mode"), "walk").lower()
-                        if current_mode == "car":
-                            current_mode = "private_car"
-                        selection_key = f"transport_choice_{transport_edit_scope}_{absolute_idx}"
-                        if selection_key not in st.session_state:
-                            st.session_state[selection_key] = current_mode if current_mode in mode_options else "walk"
+                        with st.expander(f"移動手段を変更 Day{int(day)}-Step{absolute_idx + 1}", expanded=False):
+                            current_mode = safe_text(row_dict.get("transport_mode"), "walk").lower()
+                            if current_mode == "car":
+                                current_mode = "private_car"
+                            selection_key = f"transport_choice_{transport_edit_scope}_{absolute_idx}"
+                            if selection_key not in st.session_state:
+                                st.session_state[selection_key] = current_mode if current_mode in mode_options else "walk"
 
-                        rental_info = get_rental_car_availability(df, absolute_idx)
-                        rental_available = bool(rental_info.get("available"))
+                            rental_info = get_rental_car_availability(df, absolute_idx)
+                            rental_available = bool(rental_info.get("available"))
 
-                        st.caption(f"移動手段を変更 Day{int(day)}-Step{absolute_idx + 1}")
-                        cols = st.columns(len(mode_options))
-                        for col, (mode_key, mode_label_button) in zip(cols, mode_options.items()):
-                            disabled = (mode_key == "rental_car" and not rental_available)
-                            selected = st.session_state.get(selection_key) == mode_key
-                            label = f"✅ {mode_label_button}" if selected else mode_label_button
-                            if col.button(label, key=f"pick_{transport_edit_scope}_{day}_{absolute_idx}_{local_pos}_{mode_key}", use_container_width=True, disabled=disabled):
-                                st.session_state[selection_key] = mode_key
-                                st.rerun()
+                            cols = st.columns(len(mode_options))
+                            for col, (mode_key, mode_label_button) in zip(cols, mode_options.items()):
+                                disabled = (mode_key == "rental_car" and not rental_available)
+                                selected = st.session_state.get(selection_key) == mode_key
+                                label = f"✅ {mode_label_button}" if selected else mode_label_button
+                                if col.button(label, key=f"pick_{transport_edit_scope}_{day}_{absolute_idx}_{local_pos}_{mode_key}", use_container_width=True, disabled=disabled):
+                                    st.session_state[selection_key] = mode_key
+                                    st.rerun()
 
-                        selected_mode = st.session_state.get(selection_key, current_mode)
-                        selected_label = mode_options.get(selected_mode, selected_mode)
-                        st.caption(f"選択中: {selected_label}")
+                            selected_mode = st.session_state.get(selection_key, current_mode)
+                            selected_label = mode_options.get(selected_mode, selected_mode)
+                            st.caption(f"選択中: {selected_label}")
 
-                        if rental_available:
-                            shop_names = [str(shop.get("name")) for shop in rental_info.get("shops", [])[:3] if shop.get("name")]
-                            if shop_names:
-                                st.caption(f"レンタカー候補: {' / '.join(shop_names)}")
-                        else:
-                            st.markdown(
-                                "<div style='padding:8px 10px;border-radius:8px;background:#f1f3f5;color:#6c757d;border:1px solid #d9dee3;margin:6px 0 10px 0;'>レンタカーはグレーアウト中です。周囲1km以内に営業所がないか、位置情報を確認できません。</div>",
-                                unsafe_allow_html=True,
-                            )
-                            reason = safe_text(rental_info.get("reason"), "周囲1km以内にレンタカー営業所が見つかりません。")
-                            st.caption(reason)
+                            if rental_available:
+                                shop_names = [str(shop.get("name")) for shop in rental_info.get("shops", [])[:3] if shop.get("name")]
+                                if shop_names:
+                                    st.caption(f"レンタカー候補: {' / '.join(shop_names)}")
+                            else:
+                                st.markdown(
+                                    "<div style='padding:8px 10px;border-radius:8px;background:#f1f3f5;color:#6c757d;border:1px solid #d9dee3;margin:6px 0 10px 0;'>レンタカーはグレーアウト中です。周囲1km以内に営業所がないか、位置情報を確認できません。</div>",
+                                    unsafe_allow_html=True,
+                                )
+                                reason = safe_text(rental_info.get("reason"), "周囲1km以内にレンタカー営業所が見つかりません。")
+                                st.caption(reason)
 
-                        apply_disabled = selected_mode == "rental_car" and not rental_available
-                        if st.button("この移動手段に変更", key=f"apply_transport_{transport_edit_scope}_{day}_{absolute_idx}_{local_pos}", use_container_width=True, disabled=apply_disabled):
-                            try:
-                                if transport_edit_scope == "plan":
-                                    result = apply_transport_change_to_plan(absolute_idx, selected_mode)
-                                else:
-                                    result = apply_transport_change_during_execution(absolute_idx, selected_mode)
-                                st.success(result.get("message", "移動手段を変更しました。"))
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"移動変更エラー: {e}")
-                                if st.session_state.debug_mode:
-                                    st.exception(e)
+                            apply_disabled = selected_mode == "rental_car" and not rental_available
+                            if st.button("この移動手段に変更", key=f"apply_transport_{transport_edit_scope}_{day}_{absolute_idx}_{local_pos}", use_container_width=True, disabled=apply_disabled):
+                                try:
+                                    if transport_edit_scope == "plan":
+                                        result = apply_transport_change_to_plan(absolute_idx, selected_mode)
+                                    else:
+                                        result = apply_transport_change_during_execution(absolute_idx, selected_mode)
+                                    st.success(result.get("message", "移動手段を変更しました。"))
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"移動変更エラー: {e}")
+                                    if st.session_state.debug_mode:
+                                        st.exception(e)
                 else:
                     place_url = build_google_maps_search_url(safe_text(row_dict.get("destination")))
                     one_point = safe_text(row_dict.get("one_point"), "")
@@ -1190,6 +1429,58 @@ def render_itinerary_cards(
                     if note:
                         st.markdown(f"<div class='vf-card-note'>差分: {note}</div>", unsafe_allow_html=True)
                     st.link_button("📍 Google Mapsで場所を見る", place_url, use_container_width=True)
+
+                    if transport_edit_scope == "plan" and absolute_idx is not None:
+                        activity_position = _activity_position_from_phase3(df, absolute_idx)
+                        edit_key = f"plan_spot_edit_{absolute_idx}"
+                        current_destination_text = safe_text(row_dict.get("destination"), "")
+                        current_purpose_text = safe_text(row_dict.get("purpose"), "")
+                        current_comment_text = safe_text(row_dict.get("one_point"), "")
+
+                        if f"{edit_key}_destination" not in st.session_state:
+                            st.session_state[f"{edit_key}_destination"] = current_destination_text
+                        if f"{edit_key}_purpose" not in st.session_state:
+                            st.session_state[f"{edit_key}_purpose"] = current_purpose_text
+                        if f"{edit_key}_comment" not in st.session_state:
+                            st.session_state[f"{edit_key}_comment"] = current_comment_text
+
+                        with st.expander("このスポットを編集", expanded=False):
+                            edit_cols = st.columns(2)
+                            with edit_cols[0]:
+                                if st.button("このスポットを削除", key=f"delete_spot_{absolute_idx}_{local_pos}", use_container_width=True):
+                                    try:
+                                        result = delete_spot_from_plan(activity_position)
+                                        st.success(result.get("message", "スポットを削除しました。"))
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"スポット削除エラー: {e}")
+                                        if st.session_state.debug_mode:
+                                            st.exception(e)
+                            with edit_cols[1]:
+                                st.caption("削除すると、このスポットに関連する完成旅程を再構築します。")
+
+                            st.text_input("変更後のスポット名", key=f"{edit_key}_destination")
+                            st.text_input("変更後の目的（任意）", key=f"{edit_key}_purpose")
+                            st.text_area("変更後のワンポイント（任意）", key=f"{edit_key}_comment", height=90)
+
+                            if st.button("この内容でスポット変更", key=f"update_spot_{absolute_idx}_{local_pos}", use_container_width=True):
+                                try:
+                                    new_destination_value = str(st.session_state.get(f"{edit_key}_destination", "")).strip()
+                                    if not new_destination_value:
+                                        st.warning("変更後のスポット名を入力してください。")
+                                    else:
+                                        result = update_spot_in_plan(
+                                            activity_position,
+                                            new_destination_value,
+                                            str(st.session_state.get(f"{edit_key}_purpose", "")).strip(),
+                                            str(st.session_state.get(f"{edit_key}_comment", "")).strip(),
+                                        )
+                                        st.success(result.get("message", "スポットを変更しました。"))
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error(f"スポット変更エラー: {e}")
+                                    if st.session_state.debug_mode:
+                                        st.exception(e)
 
 def status_emoji(status: str) -> str:
     mapping = {
@@ -1343,57 +1634,69 @@ with tabs[0]:
             append_chat("user", user_message)
             update_planning_state_from_user_text(user_message)
 
-            questions = conversation_advisor_questions()
-            idx = st.session_state.advisor_question_index
-            log_event(
-                "会話分岐",
-                f"分岐判定前: advisor_done={st.session_state.advisor_done} / advisor_question_index={idx} / chat_history_count={len(st.session_state.chat_history)}",
-            )
-
-            if not st.session_state.advisor_done:
-                if idx + 1 < len(questions):
-                    st.session_state.advisor_question_index += 1
-                    next_question = questions[st.session_state.advisor_question_index]
-                    log_event("会話分岐", f"次質問を採用: index={st.session_state.advisor_question_index} / text={next_question}")
-                    append_chat("assistant", next_question)
-                else:
-                    st.session_state.advisor_done = True
-                    final_message = "ありがとうございます。条件がだいたい揃いました。『旅行案を作成』を押すと、まず自由記述の旅程案を作ります。"
-                    log_event("会話分岐", f"質問完了メッセージを採用: {final_message}")
-                    append_chat(
-                        "assistant",
-                        final_message
-                    )
-            else:
-                revision_message = "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。"
-                log_event("会話分岐", f"advisor_done=True のため修正受付メッセージを採用: {revision_message}")
+            if st.session_state.get("advisor_done"):
                 append_chat(
                     "assistant",
-                    revision_message
+                    "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。"
                 )
+                st.rerun()
+
+            # --- 修正箇所 --- 固定質問の順送りではなく、不足項目ベースで確認と質問を行う
+            resolved_state = resolve_planning_state()
+            confirmation_payload = None if st.session_state.get("pending_confirmation") else build_confirmation_payload_from_state(user_message)
+            if confirmation_payload:
+                st.session_state.pending_confirmation = confirmation_payload
+                append_chat("assistant", confirmation_payload["message"])
+                st.rerun()
+
+            next_message = build_next_advisor_message(resolved_state)
+            append_chat("assistant", next_message)
             st.rerun()
+
+        pending_confirmation = st.session_state.get("pending_confirmation")
+        if pending_confirmation:
+            st.info(pending_confirmation.get("message", "確認が必要です。"))
+            confirm_col1, confirm_col2 = st.columns(2)
+            with confirm_col1:
+                if st.button("✅ この条件で続ける", key="accept_pending_confirmation", use_container_width=True):
+                    apply_confirmation_payload(pending_confirmation)
+                    st.session_state.pending_confirmation = None
+                    st.session_state.advisor_done = True
+                    append_chat("assistant", "ありがとうございます。この条件で計画を続けます。")
+                    st.rerun()
+            with confirm_col2:
+                if st.button("✏️ 条件を修正する", key="reject_pending_confirmation", use_container_width=True):
+                    st.session_state.pending_confirmation = None
+                    append_chat("assistant", "了解です。条件を修正してください。修正後に改めて確認します。")
+                    st.rerun()
 
         st.divider()
         b1, b2 = st.columns(2)
         with b1:
             if st.button("🪄 旅行案を作成", use_container_width=True):
-                try:
-                    generate_phase1_draft()
-                    st.success("旅行案を作成しました。次の『プラン確認』タブで確認してください。")
-                except Exception as e:
-                    st.error(f"旅行案作成エラー: {e}")
-                    if st.session_state.debug_mode:
-                        st.exception(e)
+                if st.session_state.get("pending_confirmation"):
+                    st.warning("確認待ちです。上の『この条件で続ける』または『条件を修正する』を選んでください。")
+                else:
+                    try:
+                        generate_phase1_draft()
+                        st.success("旅行案を作成しました。次の『プラン確認』タブで確認してください。")
+                    except Exception as e:
+                        st.error(f"旅行案作成エラー: {e}")
+                        if st.session_state.debug_mode:
+                            st.exception(e)
 
         with b2:
             if st.button("🔁 旅行案を再作成", use_container_width=True):
-                try:
-                    generate_phase1_draft()
-                    st.success("修正内容を反映して旅行案を再作成しました。")
-                except Exception as e:
-                    st.error(f"旅行案再作成エラー: {e}")
-                    if st.session_state.debug_mode:
-                        st.exception(e)
+                if st.session_state.get("pending_confirmation"):
+                    st.warning("確認待ちです。上の『この条件で続ける』または『条件を修正する』を選んでください。")
+                else:
+                    try:
+                        generate_phase1_draft()
+                        st.success("修正内容を反映して旅行案を再作成しました。")
+                    except Exception as e:
+                        st.error(f"旅行案再作成エラー: {e}")
+                        if st.session_state.debug_mode:
+                            st.exception(e)
 
     with right:
         render_planning_summary()
@@ -1411,9 +1714,11 @@ with tabs[1]:
     if st.session_state.trip_plan_draft:
         st.success("相談内容をもとに作成した自由記述の旅行案です。")
         st.markdown("### Phase1: 自由記述の旅行案")
-        st.markdown(st.session_state.trip_plan_draft)
+        st.markdown(format_phase1_preview_text(st.session_state.trip_plan_draft), unsafe_allow_html=True)
 
         st.info("※移動時間や所要時間は目安です。完成旅程では、実際の移動経路や実時間にあわせて調整して表示します。")
+
+        render_mock_weather_panel(st.session_state.planning_state, context_label="plan")
 
         with st.expander("Phase1 に渡した最終プロンプトを見る", expanded=False):
             st.code(st.session_state.phase1_prompt_text, language="text")
@@ -1572,6 +1877,9 @@ with tabs[3]:
                 st.progress(progress_pct / 100)
 
             st.divider()
+            render_mock_weather_panel(st.session_state.planning_state, context_label="execution")
+
+            st.divider()
             st.markdown("### ステップ操作")
 
             cbtn1, cbtn2, cbtn3, cbtn4, cbtn5 = st.columns(5)
@@ -1639,9 +1947,16 @@ with tabs[3]:
 
             if st.session_state.show_weather_dialog:
                 st.markdown("#### 🌥️ 天候不順の内容")
+                weather_context = build_mock_weather_context(st.session_state.planning_state)
+                st.info(
+                    f"**現在の天候メモ連動**\n\n"
+                    f"- 想定: {weather_context['summary']}\n"
+                    f"- 実行中メモ: {weather_context['execution_hint']}\n"
+                    f"- 地域差: {weather_context['gap_advice']}"
+                )
                 weather_detail = st.text_area(
                     "例: 次は屋外の予定だが、今は強い雨。移動が徒歩ならタクシー提案もしたい。",
-                    value="次は屋外の予定だが、今は天候が悪い。必要なら屋内へ変更し、徒歩移動ならタクシーも提案して。",
+                    value=build_weather_event_detail(st.session_state.planning_state),
                     key="weather_detail_input"
                 )
                 wx1, wx2, wx3 = st.columns(3)
@@ -1671,34 +1986,44 @@ with tabs[3]:
                         st.rerun()
 
             if st.session_state.show_mood_dialog:
-                st.markdown("#### 💭 気分の変化")
-                mood_detail = st.text_area(
-                    "例: 疲れたので次の予定は短めにして、移動は楽にしたい",
-                    value="疲れたので次の予定を少し軽くして、移動は楽にしたい。",
-                    key="mood_detail_input"
+                st.markdown("#### 💭 気分が変わった")
+                mood_action = st.radio(
+                    "やりたい操作を選んでください",
+                    ["寄り道", "次の予定をキャンセル", "その日の予定をキャンセル", "全体キャンセルして帰路へ", "移動手段変更", "自由会話"],
+                    key="mood_action_choice",
                 )
-                md1, md2, md3 = st.columns(3)
+
+                free_chat_text = ""
+                if mood_action == "自由会話":
+                    free_chat_text = st.text_area(
+                        "自由に入力してください",
+                        value="疲れたので次の予定だけ軽めにして、できれば屋内中心にしたい。",
+                        key="mood_free_chat_input",
+                        height=120,
+                    )
+                elif mood_action == "寄り道":
+                    st.info("近くで短時間の立ち寄り候補を提案します。")
+                elif mood_action == "次の予定をキャンセル":
+                    st.info("次の予定だけを外して、この先を局所的に調整します。")
+                elif mood_action == "その日の予定をキャンセル":
+                    st.info("その日の残り予定をキャンセルして、以降を調整します。")
+                elif mood_action == "全体キャンセルして帰路へ":
+                    st.info("残り予定を止めて、帰路中心の提案に切り替えます。")
+                elif mood_action == "移動手段変更":
+                    st.info("楽な移動を優先する方向で提案します。必要なら各移動カードから個別変更もできます。")
+
+                md1, md2 = st.columns(2)
                 with md1:
-                    if st.button("簡易提案を出す", key="mood_simple", use_container_width=True):
+                    button_label = "自由会話から組み直し案を作る" if mood_action == "自由会話" else "この内容で提案を出す"
+                    if st.button(button_label, key="mood_action_apply", use_container_width=True):
                         try:
-                            st.session_state.event_result = engine.trigger_event("mood_change", mood_detail)
-                            st.session_state.show_mood_dialog = False
+                            run_mood_change_action(engine, mood_action, free_chat_text)
                             st.rerun()
                         except Exception as e:
-                            st.error(f"イベント提案エラー: {e}")
+                            st.error(f"気分変化処理エラー: {e}")
                             if st.session_state.debug_mode:
                                 st.exception(e)
                 with md2:
-                    if st.button("自由に組み直し案を作る", key="mood_replan", use_container_width=True):
-                        try:
-                            generate_execution_replan_preview(mood_detail, source_event="mood_change")
-                            st.session_state.show_mood_dialog = False
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"組み直し案生成エラー: {e}")
-                            if st.session_state.debug_mode:
-                                st.exception(e)
-                with md3:
                     if st.button("キャンセル", key="mood_cancel", use_container_width=True):
                         st.session_state.show_mood_dialog = False
                         st.rerun()
@@ -1818,68 +2143,7 @@ with tabs[3]:
                     st.write(f"- [{ts}] {safe_text(log.get('event'))} / {safe_text(log.get('details'), '')}{suffix}")
     else:
         st.info("まず『プラン確認』で旅行案を了承してください。")
-def format_phase1_preview_text(plan_text: str) -> str:
-    if not plan_text:
-        return ""
 
-    text = html.escape(plan_text)
-
-    # 【日付】を強調
-    text = re.sub(
-        r"^【(.*?)】(.*)$",
-        r"<div style='font-size:1.9rem;font-weight:800;color:#1f3b73;margin:18px 0 10px 0;'>【\1】\2</div>",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # テーマ（弱め表示）
-    text = re.sub(
-        r"^テーマ:\s*(.*)$",
-        r"<div style='font-size:0.95rem;color:#6b7280;margin-bottom:12px;'>\1</div>",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # スポット（主役）
-    text = re.sub(
-        r"^\*\s*(\d{1,2}:\d{2}\s*-\s*.*)$",
-        r"<div style='margin:12px 0 4px 0;font-weight:800;color:#1d4ed8;'>\1</div>",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # 目的
-    text = re.sub(
-        r"^\s*-\s*目的:\s*(.*)$",
-        r"<div style='margin-left:16px;font-size:0.9rem;color:#374151;'>\1</div>",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # 滞在時間
-    text = re.sub(
-        r"^\s*-\s*滞在時間:\s*(.*)$",
-        r"<div style='margin-left:16px;font-size:0.85rem;color:#6b7280;'>⏱ \1</div>",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # 🔥 ワンポイント → ラベル削除して本文だけ
-    text = re.sub(
-        r"^\s*-\s*ワンポイント:\s*(.*)$",
-        r"<div style='margin-left:16px;font-size:0.95rem;color:#111827;'>\1</div>",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # 強調
-    text = re.sub(
-        r"\*\*(.*?)\*\*",
-        r"<span style='font-weight:800;color:#dc2626;'>\1</span>",
-        text,
-    )
-
-    return text
 
 st.divider()
 st.caption("VoyageFlow | 対話 → 自由記述案 → 構造化 → 経路補完 → 実行")
