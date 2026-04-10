@@ -1,20 +1,17 @@
-# -*- coding: utf-8 -*-
-"""
-【バージョン名】app_conversation_priority_fix_v3
-【制作日】2026-04-10
-【修正内容】
-- 会話内容を基本情報より優先して、主目的地(primary_destination)と旅行日数を採用するよう修正
-- 「日帰り→1日」「◯泊→◯+1日」を明示的に扱うよう修正
-- 固定質問の順送りをやめ、不足項目ベースで次の質問を返すよう修正
-- Phase1プロンプトで主目的地を強く優先し、別都市へ勝手変換しない指示を追加
-- 修正箇所には「# --- 修正箇所 ---」コメントを付与
-"""
+# 【バージョン名】app_v4_20260410_phase1_validator_generic
+# 【制作日】2026-04-10
+# 【修正内容】
+# - Phase1生成後に汎用バリデーションLLMを追加し、条件との整合性を確認して必要時のみ自動再生成
+# - 固定イベント・予約・日時付き予定などを一般化してプロンプト上で必須反映するよう強化
+# - 目的地抽出で『3人』など人数語を除外し、『京都に行く』のような地名表現を優先
+# - 修正箇所には『# --- 修正箇所 ---』コメントを付与
 
 import os
 import sys
 import urllib.parse
 import re
 import html
+import json
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
@@ -170,6 +167,7 @@ def init_session_state() -> None:
         "pending_confirmation": None,
 
         "phase1_prompt_text": "",
+        "phase1_validation_report": None,
         "trip_plan_draft": None,
         "trip_plan": None,
         "df_phase2": None,
@@ -298,8 +296,177 @@ def clear_logs() -> None:
     st.session_state.app_logs = []
 
 
+# --- 修正箇所: Phase1生成後の汎用バリデーションと自動再生成で使う共通関数 ---
+def _extract_json_block(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "{}"
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+    plain = re.search(r"(\{.*\})", raw, flags=re.DOTALL)
+    if plain:
+        return plain.group(1)
+    return raw
+
+
+def _safe_json_loads(text: str) -> Dict[str, object]:
+    json_text = _extract_json_block(text)
+    try:
+        data = json.loads(json_text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_issue_list(value: object) -> List[str]:
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def build_generic_requirement_summary(planning_state: Dict) -> str:
+    notes = planning_state.get("conversation_notes", []) + planning_state.get("revision_requests", [])
+    compact_notes = [str(x).strip() for x in notes if str(x).strip()]
+    if not compact_notes:
+        return "特記事項なし"
+    important_lines: List[str] = []
+    keywords = ["時", "分", "/", "月", "日", "泊", "日帰り", "ライブ", "コンサート", "試合", "観劇", "舞台", "予約", "開演", "開場", "開始", "集合", "チェックイン", "チェックアウト", "会場", "飛行機", "新幹線", "終電", "打合せ", "面談", "イベント"]
+    for note in compact_notes:
+        if any(keyword in note for keyword in keywords):
+            important_lines.append(note)
+    if not important_lines:
+        important_lines = compact_notes[-3:]
+    return " / ".join(important_lines)
+
+
+def build_phase1_validation_prompt(planning_state: Dict, draft_text: str) -> str:
+    notes_text = " / ".join(planning_state.get("conversation_notes", [])) or "特になし"
+    revisions_text = " / ".join(planning_state.get("revision_requests", [])) or "なし"
+    requirement_summary = build_generic_requirement_summary(planning_state)
+    return f"""
+あなたは旅行プランの品質監査担当です。
+
+以下の『ユーザー条件』と『生成された旅行案』を読み、条件への整合性を厳格に確認してください。
+京都やコンサートのような特定事例に限定せず、一般の旅行相談として判断してください。
+
+【ユーザー条件】
+- 出発地: {safe_text(planning_state.get('departure_place'))}
+- 帰着地: {safe_text(planning_state.get('return_place'))}
+- 出発時間: {safe_text(planning_state.get('departure_time'))}
+- 旅行開始日: {safe_text(planning_state.get('start_date'))}
+- 旅行日数: {safe_text(planning_state.get('trip_days'))}日
+- 主目的地: {safe_text(planning_state.get('primary_destination'), '未指定')}
+- 移動スタイル: {safe_text(planning_state.get('transport_style'))}
+- 予算感: {safe_text(planning_state.get('budget_style'))}
+- 相談メモ: {notes_text}
+- 追加の修正希望: {revisions_text}
+- 重要な要望・固定予定: {requirement_summary}
+
+【生成された旅行案】
+{draft_text}
+
+【監査観点】
+1. 主目的地・旅行日数・出発地/帰着地が条件と矛盾していないか
+2. 相談メモ内の固定予定・イベント・予約・日時付き予定・人数条件など、重要要件が旅程から落ちていないか
+3. 本文に書いたテーマや前置きと、実際の行程内容が一致しているか
+4. 重要要件が曖昧なまま観光案に置き換わっていないか
+
+【出力形式】
+JSONのみを返してください。説明文は不要です。
+{{
+  "is_valid": true or false,
+  "summary": "監査結果の一文要約",
+  "issues": ["不整合1", "不整合2"],
+  "repair_instructions": ["修正指示1", "修正指示2"],
+  "missing_requirements": ["落ちている要件1"]
+}}
+
+重要: 問題が少しでもあれば is_valid は false にしてください。
+""".strip()
+
+
+def validate_phase1_draft_with_llm(planning_state: Dict, draft_text: str) -> Dict[str, object]:
+    validator = Phase1Generator(logger=log_event)
+    prompt = build_phase1_validation_prompt(planning_state, draft_text)
+    raw = validator.generate_trip_plan(prompt, temperature=0.0)
+    data = _safe_json_loads(raw)
+
+    issues = _normalize_issue_list(data.get("issues"))
+    repairs = _normalize_issue_list(data.get("repair_instructions"))
+    missing_requirements = _normalize_issue_list(data.get("missing_requirements"))
+
+    primary_destination = safe_text(planning_state.get("primary_destination"), "")
+    if primary_destination and primary_destination not in draft_text:
+        issues.append(f"主目的地『{primary_destination}』が旅程本文で明示されていません。")
+        repairs.append(f"主目的地『{primary_destination}』を旅程本文に明示し、その都市・エリア中心の行程へ修正してください。")
+
+    important_requirement_summary = build_generic_requirement_summary(planning_state)
+    fixed_signal_keywords = ["ライブ", "コンサート", "試合", "観劇", "予約", "開演", "開場", "開始", "集合", "チェックイン"]
+    if any(keyword in important_requirement_summary for keyword in fixed_signal_keywords):
+        if not any(keyword in draft_text for keyword in fixed_signal_keywords):
+            issues.append("相談メモ内の固定予定・イベント情報が旅程本文に反映されていません。")
+            repairs.append("相談メモ内の固定予定やイベントを旅程本文の具体的な時刻・訪問先として必ず反映してください。")
+            missing_requirements.append("固定予定・イベント情報")
+
+    is_valid = bool(data.get("is_valid", False)) and not issues
+    return {
+        "is_valid": is_valid,
+        "summary": str(data.get("summary", "")).strip() or ("条件整合OK" if is_valid else "条件との不整合あり"),
+        "issues": issues,
+        "repair_instructions": repairs,
+        "missing_requirements": missing_requirements,
+        "raw_response": raw,
+    }
+
+
+def rebuild_phase1_prompt_with_validation_feedback(base_prompt: str, report: Dict[str, object]) -> str:
+    issues = _normalize_issue_list(report.get("issues"))
+    repairs = _normalize_issue_list(report.get("repair_instructions"))
+    missing_requirements = _normalize_issue_list(report.get("missing_requirements"))
+    feedback_lines = [f"- {item}" for item in issues + repairs + missing_requirements if item]
+    feedback_text = "\n".join(dict.fromkeys(feedback_lines)) or "- 監査で不足が検出されました。条件との整合性を上げてください。"
+    return f"""{base_prompt}
+
+【再生成時の最重要修正指示】
+- 下記の監査結果を必ず反映して旅程を作り直してください。
+- 前置きやテーマだけで触れて、本文の行程に入れないことは禁止です。
+- 相談メモ内の固定予定・イベント・予約・日時付き予定は、本文の行程に具体的な時刻付きで必ず含めてください。
+- ユーザー条件にない別都市・別目的へ置き換えないでください。
+
+【監査結果】
+{feedback_text}
+""".strip()
+
+
+def generate_phase1_draft() -> None:
+    clear_logs()
+    resolved = resolve_planning_state()
+    prompt_text = build_phase1_request_text()
+    st.session_state.phase1_prompt_text = prompt_text
+    log_event("Phase1", f"LLM候補生成を開始。最終採用: {resolved['trip_days']}日 / {resolved['transport_style']} / {resolved['budget_style']}")
+
+    # --- 修正箇所: 生成直後に汎用バリデーションLLMを通し、不整合があれば1回だけ自動再生成 ---
+    draft, validation_report = generate_phase1_draft_with_validation()
+
+    caution = "※移動時間や所要時間は目安です。完成旅程では、実際の移動経路や実時間にあわせて調整して表示します。"
+    if caution not in draft:
+        draft = draft.rstrip() + "\n\n" + caution
+
+    st.session_state.phase1_validation_report = validation_report
+    if validation_report.get("is_valid"):
+        log_event("Phase1監査", validation_report.get("summary", "条件整合OK"))
+    else:
+        issues_text = " / ".join(_normalize_issue_list(validation_report.get("issues"))) or validation_report.get("summary", "監査で不整合が残っています")
+        log_event("Phase1監査", f"監査結果: {issues_text}", level="warning")
+
+    st.session_state.trip_plan_draft = draft
+    st.session_state.plan_approved = False
+    st.session_state.active_tab = "plan_review"
+
 def extract_trip_days_from_text(text: str) -> Optional[int]:
-    # --- 修正箇所 --- 会話内の日数表現を優先的に拾う
     text = str(text or "")
     if not text.strip():
         return None
@@ -317,51 +484,51 @@ def extract_trip_days_from_text(text: str) -> Optional[int]:
     return None
 
 
+
 def extract_primary_destination_from_text(text: str, departure_place: str = "", return_place: str = "") -> str:
-    # --- 修正箇所 --- 短文入力（例: 東京）や「東京日帰り」を主目的地として拾いやすくする
+    # --- 修正箇所: 地名抽出を一般化し、人数やイベント語を目的地と誤認しにくくする ---
     raw_text = str(text or "").strip()
     if not raw_text:
         return ""
 
     cleaned = re.sub(r"[、。,.!！?？]", " ", raw_text)
-    compact = re.sub(r"\s+", "", raw_text)
-    patterns = [
-        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:へ|に)\s*行きたい",
-        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:旅行|観光|散策|滞在)",
-        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:日帰り|\d+\s*泊(?:\s*\d+\s*日)?)",
+    candidates: List[str] = []
+    priority_patterns = [
+        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*に\s*(?:行く|行きたい|向かう|泊まる|滞在|遠征)",
+        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*へ\s*(?:行く|行きたい|向かう)",
+        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*で\s*(?:ライブ|コンサート|試合|観劇|イベント)",
+        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:日帰り|\d+\s*泊|\d+\s*日)",
     ]
-    candidates = []
-    for pattern in patterns:
+    for pattern in priority_patterns:
         for match in re.finditer(pattern, cleaned):
             candidate = str(match.group(1) or "").strip(" 　")
             if candidate:
                 candidates.append(candidate)
 
-    if not candidates:
-        simple = re.match(r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})(?:日帰り|\d+\s*泊)", compact)
-        if simple:
-            candidates.append(str(simple.group(1)).strip())
+    compact = re.sub(r"\s+", "", raw_text)
+    if not candidates and re.fullmatch(r"[一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20}", compact):
+        candidates.append(compact)
 
     exclusions = {
         str(departure_place or "").strip(),
         str(return_place or "").strip(),
         "旅行", "観光", "グルメ", "温泉", "ホテル", "泊", "日", "日帰り",
         "電車", "徒歩", "タクシー", "レンタカー", "普通", "節約", "贅沢",
+        "ライブ", "コンサート", "試合", "観劇", "イベント", "開演", "開場", "開始",
     }
-    filtered = []
+
+    filtered: List[str] = []
     for candidate in candidates:
         candidate = re.sub(r"(日帰り|\d+\s*泊.*|\d+\s*日.*)$", "", candidate).strip(" 　")
-        if candidate and candidate not in exclusions:
-            filtered.append(candidate)
+        if not candidate or candidate in exclusions:
+            continue
+        if re.fullmatch(r"\d+人", candidate) or candidate.endswith("人"):
+            continue
+        if any(token in candidate for token in ["開演", "開場", "開始", "コンサート", "ライブ", "試合"]):
+            continue
+        filtered.append(candidate)
 
-    if filtered:
-        return filtered[0]
-
-    if re.fullmatch(r"[一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20}", compact):
-        if compact not in exclusions:
-            return compact
-    return ""
-
+    return filtered[0] if filtered else ""
 
 def has_trip_days_signal(planning_state: Dict) -> bool:
     notes = planning_state.get("conversation_notes", []) + planning_state.get("revision_requests", [])
@@ -371,13 +538,13 @@ def has_trip_days_signal(planning_state: Dict) -> bool:
 
 
 def build_next_advisor_message(planning_state: Dict) -> str:
-    # --- 修正箇所 --- 不足項目ベースで次の会話を返す
     primary_destination = safe_text(planning_state.get("primary_destination"), "")
     if not primary_destination:
         return "目的地がまだ分かっていません。どこへ行きたいですか？ 例: 東京 / 金沢 / 温泉地"
     if not has_trip_days_signal(planning_state):
         return f"{primary_destination}方面ですね。旅行日数は何日くらいにしますか？ 例: 日帰り / 1泊2日 / 2泊3日"
-    return "ありがとうございます。条件がだいたい揃いました。上の確認内容で問題なければ、このまま旅行案を作成できます。"
+    return f"{primary_destination}方面で進められます。他に希望があればそのまま入力してください。問題なければ『旅行案を作成』を押してください。"
+
 
 
 def should_offer_confirmation(planning_state: Dict) -> bool:
@@ -521,6 +688,7 @@ def reset_all() -> None:
     st.session_state.advisor_done = False
     st.session_state.pending_confirmation = None
     st.session_state.phase1_prompt_text = ""
+    st.session_state.phase1_validation_report = None
     st.session_state.trip_plan_draft = None
     st.session_state.trip_plan = None
     st.session_state.df_phase2 = None
@@ -873,6 +1041,7 @@ def build_phase1_request_text() -> str:
     notes_text = " / ".join(s["conversation_notes"]) if s["conversation_notes"] else "特になし"
     revisions_text = " / ".join(s["revision_requests"]) if s["revision_requests"] else "なし"
     primary_destination = safe_text(s.get("primary_destination"), "未指定")
+    requirement_summary = build_generic_requirement_summary(s)
     hotel_instruction = "ホテル（宿泊先）は必ず含めてください。" if s["hotel_required"] else "ホテルは必須ではありません。"
 
     text = f"""
@@ -896,11 +1065,13 @@ def build_phase1_request_text() -> str:
 - 予算感: {s["budget_style"]}
 - 相談メモ: {notes_text}
 - 追加の修正希望: {revisions_text}
+- 重要な要望・固定予定: {requirement_summary}
 
 【旅程の作り方】
-- 主目的地が指定されている場合は、その都市・エリアを旅の中心として最優先してください。
-- 主目的地が「東京」なら、金沢や他都市へ勝手に置き換えないでください。ユーザー入力の地名を優先してください。
+- 主目的地が指定されている場合は、その都市・エリアを旅の中心として優先してください。
 - ユーザーの希望内容から、旅行の主目的地・主エリア・体験内容を自然に決めてください。
+- 相談メモ内の固定予定・イベント・予約・日時付き予定・人数条件など、重要な要望は旅程本文の具体的な行程として必ず反映してください。
+- テーマや前置きだけで触れて、本文の行程に入れないことは禁止です。
 - Day 1, Day 2 のように日別に分けてください。
 - 各日の時刻、訪問先、目的、滞在時間の目安がわかる形にしてください。
 - {hotel_instruction}
@@ -917,7 +1088,6 @@ def build_phase1_request_text() -> str:
 3. 最後の一文として、上記の注意書きをそのまま必ず入れる
 """
     return text.strip()
-
 
 def generate_phase1_draft() -> None:
     clear_logs()
@@ -1641,15 +1811,13 @@ with tabs[0]:
                 )
                 st.rerun()
 
-            # --- 修正箇所 --- 固定質問の順送りではなく、不足項目ベースで確認と質問を行う
-            resolved_state = resolve_planning_state()
             confirmation_payload = None if st.session_state.get("pending_confirmation") else build_confirmation_payload_from_state(user_message)
             if confirmation_payload:
                 st.session_state.pending_confirmation = confirmation_payload
                 append_chat("assistant", confirmation_payload["message"])
                 st.rerun()
 
-            next_message = build_next_advisor_message(resolved_state)
+            next_message = build_next_advisor_message(resolve_planning_state())
             append_chat("assistant", next_message)
             st.rerun()
 
@@ -1723,6 +1891,29 @@ with tabs[1]:
         with st.expander("Phase1 に渡した最終プロンプトを見る", expanded=False):
             st.code(st.session_state.phase1_prompt_text, language="text")
 
+        # --- 修正箇所: 生成後の汎用バリデーション結果を確認できるよう表示 ---
+        validation_report = st.session_state.get("phase1_validation_report")
+        if validation_report:
+            with st.expander("Phase1 監査結果を見る", expanded=False):
+                st.write(f"監査要約: {validation_report.get('summary', '-')}")
+                if validation_report.get("repaired_once"):
+                    st.write("自動再生成: あり")
+                issues = _normalize_issue_list(validation_report.get("issues"))
+                repairs = _normalize_issue_list(validation_report.get("repair_instructions"))
+                missing = _normalize_issue_list(validation_report.get("missing_requirements"))
+                if issues:
+                    st.write("不整合:")
+                    for item in issues:
+                        st.write(f"- {item}")
+                if repairs:
+                    st.write("修正指示:")
+                    for item in repairs:
+                        st.write(f"- {item}")
+                if missing:
+                    st.write("不足要件:")
+                    for item in missing:
+                        st.write(f"- {item}")
+
         st.divider()
         st.markdown("### この案への追加修正")
 
@@ -1764,6 +1955,7 @@ with tabs[1]:
         with c3:
             if st.button("🗑️ 下書きを破棄", use_container_width=True):
                 st.session_state.trip_plan_draft = None
+                st.session_state.phase1_validation_report = None
                 st.session_state.trip_plan = None
                 st.session_state.df_phase2 = None
                 st.session_state.df_phase3 = None
