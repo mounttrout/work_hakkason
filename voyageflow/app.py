@@ -1,3 +1,11 @@
+# 【バージョン名】VoyageFlow app_hearing_recovery_v2
+# 【制作日】2026-04-10
+# 【修正内容】
+# - 旅行相談の固定質問順送りを、目的地の有無に応じた聞き直しフローへ局所修正
+# - 目的地が取れた場合は確認文、取れない場合は質問文、さらに曖昧なら誘導質問へ分岐
+# - update_planning_state_from_user_text が session_state のコピーだけを更新していた不具合を修正
+# - CSS / 既存タブ構成 / Streamlit key 名は変更しない
+
 import html
 import os
 import sys
@@ -184,6 +192,123 @@ def extract_trip_days_from_text(text: str) -> Optional[int]:
     if match:
         return int(match.group(1))
     return None
+
+
+# =========================================================
+# 会話聞き直し（局所復旧）
+# =========================================================
+DESTINATION_STOPWORDS = {
+    "旅行", "観光", "グルメ", "温泉", "自然", "都市", "海", "山", "国内", "海外", "どこか", "どこ", "未定", "未指定",
+    "のんびり", "ゆっくり", "体験", "食べ歩き", "散歩", "旅", "方面", "あたり", "周辺", "近場", "日帰り"
+}
+
+
+def normalize_destination_candidate(text: str) -> str:
+    candidate = str(text or "").strip()
+    candidate = re.sub(r"^(?:へ|に|で|を|から|まで)+", "", candidate)
+    candidate = re.sub(r"(?:へ|に|で|を|から|まで|方面|周辺|あたり)$", "", candidate)
+    candidate = re.sub(r"[、。,.!！?？].*$", "", candidate)
+    candidate = candidate.strip(" 　")
+    return candidate
+
+
+def extract_destination_from_text(text: str, departure_place: str = "", return_place: str = "") -> Optional[str]:
+    source = str(text or "")
+    if not source.strip():
+        return None
+
+    patterns = [
+        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:へ|に)\s*(?:行きたい|行く|旅行|行って|行こう)",
+        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:で|へ|に)\s*\d+\s*泊\s*\d+\s*日",
+        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:で|へ|に)\s*\d+\s*日",
+        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:旅行|観光|食べ歩き|散策|満喫|滞在)",
+        r"([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:メイン|中心)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, source)
+        if m:
+            candidate = normalize_destination_candidate(m.group(1))
+            if candidate and candidate not in {departure_place, return_place} and candidate not in DESTINATION_STOPWORDS:
+                return candidate
+
+    m = re.search(r"から\s*([一-龥ぁ-んァ-ンA-Za-z0-9ー・\-]{1,20})\s*(?:へ|に)", source)
+    if m:
+        candidate = normalize_destination_candidate(m.group(1))
+        if candidate and candidate not in {departure_place, return_place} and candidate not in DESTINATION_STOPWORDS:
+            return candidate
+
+    loose = re.findall(r"([一-龥]{2,10}|[A-Za-z][A-Za-z\-]{2,20})", source)
+    for raw in loose:
+        candidate = normalize_destination_candidate(raw)
+        if candidate and candidate not in {departure_place, return_place} and candidate not in DESTINATION_STOPWORDS:
+            return candidate
+    return None
+
+
+def infer_destination_from_conversation() -> Optional[str]:
+    planning_state = st.session_state.planning_state
+    departure_place = safe_text(planning_state.get("departure_place"), "")
+    return_place = safe_text(planning_state.get("return_place"), "")
+    notes = list(planning_state.get("conversation_notes", []))
+    for text in reversed(notes):
+        candidate = extract_destination_from_text(text, departure_place=departure_place, return_place=return_place)
+        if candidate:
+            return candidate
+    return None
+
+
+def infer_trip_days_from_conversation() -> Optional[int]:
+    planning_state = st.session_state.planning_state
+    notes = list(planning_state.get("conversation_notes", []))
+    for text in reversed(notes):
+        days = extract_trip_days_from_text(text)
+        if days:
+            return days
+    return None
+
+
+def build_adaptive_advisor_reply(user_text: str) -> str:
+    destination = infer_destination_from_conversation()
+    trip_days = infer_trip_days_from_conversation()
+    idx = int(st.session_state.get("advisor_question_index", 0))
+
+    if st.session_state.get("advisor_done"):
+        return "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。"
+
+    if not destination:
+        if idx == 0:
+            st.session_state.advisor_question_index = 1
+            return "目的地がまだ分かりません。どこへ行きたいですか？ 例: 東京 / 京都 / 金沢"
+        st.session_state.advisor_question_index = 2
+        return "まだ目的地を決めきれていないようです。都市 / 自然 / 温泉 ならどれに近いですか？"
+
+    st.session_state.resolved_conditions = {
+        **st.session_state.get("resolved_conditions", {}),
+        "destination_candidate": destination,
+    }
+
+    if idx == 0:
+        st.session_state.advisor_question_index = 1
+        if trip_days:
+            return f"{destination}方面で{trip_days}日くらいの旅ですね？ 合っていれば、どんな過ごし方にしたいか教えてください。例: のんびり / グルメ / 体験型"
+        return f"{destination}方面で考えていきますね。旅行日数は何日くらいにしますか？ 例: 日帰り / 1泊2日 / 2泊3日"
+
+    if idx == 1:
+        st.session_state.advisor_question_index = 2
+        if trip_days:
+            return "ありがとうございます。移動はどうしたいですか？ 例: 電車メイン / 歩きを減らしたい / タクシーも使いたい / レンタカー"
+        return f"{destination}方面ですね。旅行日数は何日くらいにしますか？ 例: 日帰り / 1泊2日 / 2泊3日"
+
+    if idx == 2:
+        st.session_state.advisor_question_index = 3
+        return "予算感はどうしますか？ 例: 節約 / 普通 / 少し贅沢"
+
+    if idx == 3:
+        st.session_state.advisor_question_index = 4
+        return "ホテルは必須ですか？ また、駅近・温泉・安さ重視など希望があれば教えてください。"
+
+    st.session_state.advisor_done = True
+    return "ありがとうございます。条件がだいたい揃いました。『旅行案を作成』を押すと、まず自由記述の旅程案を作ります。"
 
 
 def resolve_planning_state() -> Dict:
@@ -572,7 +697,8 @@ def append_chat(role: str, content: str) -> None:
 
 
 def update_planning_state_from_user_text(user_text: str) -> None:
-    s = resolve_planning_state()
+    # --- 修正: resolve_planning_state() のコピーではなく、session_state の正本を更新する ---
+    s = st.session_state.planning_state
     text = user_text.strip()
 
     if "徒歩" in text:
@@ -596,10 +722,25 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     elif "ホテル" in text or "宿" in text:
         s["hotel_required"] = True
 
-    s["conversation_notes"].append(text)
+    if text:
+        s["conversation_notes"].append(text)
+
     inferred_days = extract_trip_days_from_text(text)
     if inferred_days:
         log_event("会話解析", f"会話から旅行日数候補を検出: {inferred_days}日")
+        s["trip_days"] = inferred_days
+
+    destination = extract_destination_from_text(
+        text,
+        departure_place=safe_text(s.get("departure_place"), ""),
+        return_place=safe_text(s.get("return_place"), ""),
+    )
+    if destination:
+        log_event("会話解析", f"会話から目的地候補を検出: {destination}")
+        st.session_state.resolved_conditions = {
+            **st.session_state.get("resolved_conditions", {}),
+            "destination_candidate": destination,
+        }
 
     if st.session_state.advisor_done and text:
         s["revision_requests"].append(text)
@@ -844,6 +985,9 @@ def render_planning_summary() -> None:
     c6.metric("予算感", s["budget_style"])
 
     st.caption(f"ホテル必須: {'あり' if s['hotel_required'] else 'なし'}")
+    destination_candidate = st.session_state.get("resolved_conditions", {}).get("destination_candidate")
+    if destination_candidate:
+        st.caption(f"会話から推測した目的地: {destination_candidate}")
 
     if s["conversation_notes"]:
         st.markdown("**相談メモ**")
@@ -860,8 +1004,8 @@ def render_chat_history() -> None:
     st.markdown("### 旅行相談")
     if not st.session_state.chat_history:
         st.info("まず条件を少しずつ決めていきましょう。")
-        first_q = conversation_advisor_questions()[0]
-        append_chat("assistant", first_q)
+        # --- 修正: 固定質問の順送りではなく、最初は自由入力を促す案内に変更 ---
+        append_chat("assistant", "行きたい場所や雰囲気が決まっていれば、そのまま自然文で教えてください。まだ曖昧でも大丈夫です。")
 
     for item in st.session_state.chat_history:
         if item["role"] == "user":
@@ -1224,24 +1368,9 @@ with tabs[0]:
             append_chat("user", user_message)
             update_planning_state_from_user_text(user_message)
 
-            questions = conversation_advisor_questions()
-            idx = st.session_state.advisor_question_index
-
-            if not st.session_state.advisor_done:
-                if idx + 1 < len(questions):
-                    st.session_state.advisor_question_index += 1
-                    append_chat("assistant", questions[st.session_state.advisor_question_index])
-                else:
-                    st.session_state.advisor_done = True
-                    append_chat(
-                        "assistant",
-                        "ありがとうございます。条件がだいたい揃いました。『旅行案を作成』を押すと、まず自由記述の旅程案を作ります。"
-                    )
-            else:
-                append_chat(
-                    "assistant",
-                    "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。"
-                )
+            # --- 修正: 固定質問の順送りではなく、目的地の有無に応じて確認 or 質問へ切り替える ---
+            advisor_reply = build_adaptive_advisor_reply(user_message)
+            append_chat("assistant", advisor_reply)
             st.rerun()
 
         st.divider()
