@@ -643,6 +643,59 @@ def build_confirmation_payload(user_text: str) -> Optional[Dict[str, str]]:
     }
 
 
+
+
+# --- 修正箇所: state から確認ペイロードを作る関数を追加（NameError対策） ---
+def build_confirmation_payload_from_state() -> Optional[Dict[str, str]]:
+    planning_state = dict(st.session_state.get("planning_state", {}))
+    notes = planning_state.get("conversation_notes", []) or []
+    latest_text = notes[-1] if notes else ""
+
+    destination = safe_text(planning_state.get("primary_destination"), "")
+    trip_days = planning_state.get("trip_days")
+    departure_place = safe_text(planning_state.get("departure_place"), "-")
+
+    # 会話から取れる追加情報を軽く補完
+    event = extract_event_purpose_from_text(latest_text) if "extract_event_purpose_from_text" in globals() else ""
+    event_date = extract_event_date_from_text(latest_text) if "extract_event_date_from_text" in globals() else ""
+    people = extract_people_count_from_text(latest_text) if "extract_people_count_from_text" in globals() else ""
+    duration = None
+    try:
+        if isinstance(trip_days, int) and trip_days > 0:
+            duration = "日帰り" if trip_days == 1 else f"{trip_days-1}泊{trip_days}日"
+    except Exception:
+        duration = None
+
+    summary_parts = []
+    if event_date:
+        summary_parts.append(f"{event_date}に")
+    if destination:
+        summary_parts.append(f"{destination}へ行き")
+    if event:
+        summary_parts.append(f"目的は{event}")
+    if duration:
+        summary_parts.append(duration)
+    if people:
+        summary_parts.append(f"{people}でのご予定")
+
+    if not summary_parts:
+        if not destination and not trip_days:
+            return None
+        message = (
+            f"確認です。旅の概要は、{destination or '未確定'}方面、"
+            f"{trip_days or '-'}日間、出発地は「{departure_place}」という理解でよいですか？"
+        )
+    else:
+        summary = "、".join(summary_parts)
+        message = f"確認です。旅の概要は、{summary}、出発地は「{departure_place}」という理解でよいですか？"
+
+    return {
+        "primary_destination": destination,
+        "trip_days": str(trip_days) if trip_days else "",
+        "message": message,
+        "source_text": latest_text,
+    }
+
 def apply_confirmation_payload(payload: Dict[str, str]) -> None:
     if not payload:
         return
