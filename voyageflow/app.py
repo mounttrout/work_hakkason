@@ -21,16 +21,16 @@ from maps.places_api import PlacesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.0-ambiguity-hearing
+# 【バージョン名】VoyageFlow v6.2-overview-summary-fix
 # 【制作日】2026-04-11
 # 【修正内容】
-# - 旅行相談フェーズに「曖昧性検出 → 1問だけ確認」を追加
-# - 会話返答をLLMで自然化（ただし旅程案は作らせない）
-# - 固定予定・日時付き要件をPhase1プロンプトへ強く渡す
+# - 旅行相談の確認文を「主な目的地」ではなく「旅の概要」要約に変更
+# - 日付・目的地・旅の目的・人数・宿泊条件を分解して自然な概要文を生成
+# - 「5/16嵐のコンサートに京都に行く」のような入力で目的地が崩れる問題を抑制
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.0-ambiguity-hearing"
+APP_VERSION_NAME = "v6.2-overview-summary-fix"
 APP_UPDATED_DATE = "2026-04-11"
 
 
@@ -391,19 +391,51 @@ def extract_event_summary_from_text(text: str) -> Dict[str, str]:
     if people_match:
         summary["people_count"] = people_match.group(1)
 
+    cleaned = re.sub(r"\d{1,2}/\d{1,2}", "", raw)
+    cleaned = re.sub(r"\d{1,2}\s*時\s*(?:に)?\s*(開演|開始|集合)", "", cleaned)
     event_patterns = [
         r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]+(?:コンサート|ライブ|試合|観劇|イベント|会議|打ち合わせ|展示会|結婚式))",
-        r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]+)\s*に行く",
     ]
     for pattern in event_patterns:
-        match = re.search(pattern, raw)
+        match = re.search(pattern, cleaned)
         if match:
-            candidate = str(match.group(1)).strip()
-            if candidate in {"京都", "大阪", "東京", "福井"}:
-                continue
-            summary["event_name"] = candidate
-            break
+            candidate = str(match.group(1)).strip(" 、。,.!！?？")
+            candidate = re.sub(r"^(?:に|へ|で)", "", candidate)
+            if candidate:
+                summary["event_name"] = candidate
+                break
     return summary
+
+def format_trip_days_label(trip_days: int) -> str:
+    trip_days = int(trip_days or 0)
+    if trip_days <= 0:
+        return ""
+    if trip_days == 1:
+        return "日帰り"
+    return f"{trip_days - 1}泊{trip_days}日"
+
+
+def build_trip_overview_from_state(planning_state: Dict[str, object]) -> str:
+    notes = planning_state.get("conversation_notes", []) + planning_state.get("revision_requests", [])
+    combined_text = " / ".join([str(note or "").strip() for note in notes if str(note or "").strip()])
+    event_summary = extract_event_summary_from_text(combined_text)
+    destination = safe_text(planning_state.get("primary_destination"), "")
+    trip_days = int(planning_state.get("trip_days", 0) or 0)
+    trip_days_label = format_trip_days_label(trip_days)
+
+    parts: List[str] = []
+    if event_summary.get("event_date"):
+        parts.append(f"{event_summary['event_date']}に")
+    if destination:
+        parts.append(f"{destination}へ行き")
+    if event_summary.get("event_name"):
+        parts.append(f"目的は{event_summary['event_name']}")
+    if trip_days_label:
+        parts.append(trip_days_label)
+    if event_summary.get("people_count"):
+        parts.append(f"{event_summary['people_count']}人でのご予定")
+
+    return "、".join(parts)
 
 
 def detect_ambiguities_from_context(user_text: str, planning_state: Dict[str, object]) -> List[Dict[str, str]]:
@@ -450,25 +482,44 @@ def get_missing_hearing_fields(planning_state: Dict[str, object]) -> List[str]:
     return missing
 
 
-def build_confirmation_payload_from_state() -> Optional[Dict[str, str]]:
-    planning_state = st.session_state.planning_state
-    destination = safe_text(planning_state.get("primary_destination"), "")
-    trip_days = int(planning_state.get("trip_days", 0) or 0)
-    if not destination or not trip_days:
+def build_confirmation_payload(user_text: str) -> Optional[Dict[str, str]]:
+    text = str(user_text or "").strip()
+    if not text:
         return None
+
+    planning_state = st.session_state.planning_state
+    destination = extract_primary_destination_from_text(
+        text,
+        planning_state.get("departure_place", ""),
+        planning_state.get("return_place", ""),
+    )
+    trip_days = extract_trip_days_from_text(text)
+
+    should_confirm = bool(destination or trip_days)
+    if not should_confirm:
+        return None
+
+    resolved_destination = destination or safe_text(planning_state.get("primary_destination"), "")
+    resolved_trip_days = trip_days or int(planning_state.get("trip_days", 2))
     departure_place = safe_text(planning_state.get("departure_place"), "-")
+
+    temp_state = dict(planning_state)
+    if resolved_destination:
+        temp_state["primary_destination"] = resolved_destination
+    temp_state["trip_days"] = resolved_trip_days
+    overview = build_trip_overview_from_state(temp_state)
+    fallback_overview = f"{resolved_destination}への{format_trip_days_label(resolved_trip_days)}のご予定"
+
     message = (
-        f"確認です。主な目的地は「{destination}」、"
-        f"旅行日数は「{trip_days}日」、"
+        f"確認です。旅の概要は「{overview or fallback_overview}」、"
         f"出発地は「{departure_place}」でよいですか？"
     )
     return {
-        "primary_destination": destination,
-        "trip_days": str(trip_days),
+        "primary_destination": resolved_destination,
+        "trip_days": str(resolved_trip_days),
         "message": message,
-        "source_text": "state",
+        "source_text": text,
     }
-
 
 def build_hearing_fallback_reply(known: Dict[str, str], ambiguities: List[Dict[str, str]], missing_fields: List[str]) -> str:
     destination = known.get("destination") or "ご予定"
@@ -1032,8 +1083,8 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     elif "ホテル" in text or "宿" in text:
         s["hotel_required"] = True
 
-    # --- 修正箇所: 「京都に行く」を優先し、人数語を目的地にしにくくする ---
-    travel_match = re.search(r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]{2,20})\s*(?:に|へ)行く", text)
+    # --- 修正箇所: 「京都に行く」を優先し、イベント名や人数語を目的地に混ぜにくくする ---
+    travel_match = re.search(r"([一-龥ァ-ヶA-Za-zー・]{2,20})\s*(?:に|へ)行く", text)
     primary_destination = ""
     if travel_match:
         primary_destination = str(travel_match.group(1)).strip()
@@ -1393,7 +1444,10 @@ def render_planning_summary() -> None:
     c6.metric("予算感", s["budget_style"])
 
     primary_destination = safe_text(s.get("primary_destination"), "未指定")
+    overview = build_trip_overview_from_state(s)
     st.caption(f"主目的地: {primary_destination} / ホテル必須: {'あり' if s['hotel_required'] else 'なし'}")
+    if overview:
+        st.caption(f"旅の概要: {overview}")
 
     if s["conversation_notes"]:
         st.markdown("**相談メモ**")
