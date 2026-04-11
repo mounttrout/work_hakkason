@@ -1,10 +1,12 @@
-# 【バージョン名】app_v4_20260410_phase1_validator_generic
-# 【制作日】2026-04-10
+# 【バージョン名】app_v20260411_phase1_validator_and_spot_edit_fix
+# 【制作日】2026-04-11
 # 【修正内容】
-# - Phase1生成後に汎用バリデーションLLMを追加し、条件との整合性を確認して必要時のみ自動再生成
-# - 固定イベント・予約・日時付き予定などを一般化してプロンプト上で必須反映するよう強化
-# - 目的地抽出で『3人』など人数語を除外し、『京都に行く』のような地名表現を優先
-# - 修正箇所には『# --- 修正箇所 ---』コメントを付与
+# 1. Phase1 に汎用バリデーションLLM（生成→監査→必要時のみ1回再生成）を追加
+# 2. 固定予定・日時付き要件・出発地/帰着地・主目的地・日数の整合性監査を追加
+# 3. 会話の聞き返しを固定質問順送りから不足項目ベースへ局所修正
+# 4. 目的地抽出を改善し、「3人」など人数語を目的地にしにくく修正
+# 5. 完成旅程のスポット編集を純粋なスポット行のみに限定
+# 6. スポット変更時の再構築ログと反映通知を追加
 
 import os
 import sys
@@ -167,12 +169,12 @@ def init_session_state() -> None:
         "pending_confirmation": None,
 
         "phase1_prompt_text": "",
-        "phase1_validation_report": None,
         "trip_plan_draft": None,
         "trip_plan": None,
         "df_phase2": None,
         "df_phase3": None,
         "plan_approved": False,
+        "phase1_validation_result": None,
 
         "execution_engine": None,
         "event_result": None,
@@ -196,6 +198,7 @@ def init_session_state() -> None:
         "hide_cancelled_plan": False,
         "hide_completed_execution": False,
         "hide_cancelled_execution": False,
+        "plan_edit_notice": "",
     }
 
     for key, value in defaults.items():
@@ -218,7 +221,149 @@ def safe_text(value, default: str = "-") -> str:
     return text if text else default
 
 
+# --- 修正箇所: Phase1監査・会話自然化・スポット編集制御の補助関数を追加 ---
+def safe_json_load(text: str) -> Dict:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                return {}
+    return {}
 
+
+def detect_fixed_requirement_lines(notes: List[str]) -> List[str]:
+    results: List[str] = []
+    keywords = ["開演", "開場", "予約", "ライブ", "コンサート", "試合", "観劇", "面接", "チェックイン", "便", "フライト", "集合", "イベント"]
+    for note in notes or []:
+        line = str(note or "").strip()
+        if not line:
+            continue
+        has_date = bool(re.search(r"\d{1,2}/\d{1,2}|\d{1,2}月\d{1,2}日", line))
+        has_time = bool(re.search(r"\d{1,2}:\d{2}|\d{1,2}時", line))
+        has_keyword = any(keyword in line for keyword in keywords)
+        if has_keyword or (has_date and has_time):
+            results.append(line)
+    return results[:8]
+
+
+def is_transport_like_activity(row_dict: Dict) -> bool:
+    purpose = safe_text(row_dict.get("purpose"), "").lower()
+    genre = safe_text(row_dict.get("genre"), "").lower()
+    destination = safe_text(row_dict.get("destination"), "")
+    transport_words = {"transport", "move", "transfer", "移動"}
+    if purpose in transport_words or genre in transport_words:
+        return True
+    if "→" in destination:
+        return True
+    return False
+
+
+def build_followup_question() -> str:
+    s = resolve_planning_state()
+    destination = safe_text(s.get("primary_destination"), "")
+    notes_text = " / ".join(s.get("conversation_notes", []))
+    trip_days = extract_trip_days_from_text(notes_text)
+    if not destination:
+        return "行き先がまだはっきりしていません。どこへ行きたいですか？"
+    if not trip_days:
+        return f"{destination}ですね。何日くらいのご予定でしょうか？ 例: 日帰り / 1泊2日 / 2泊3日"
+    if s.get("transport_style") == "自動（おすすめ）" and not any(k in notes_text for k in ["徒歩", "電車", "タクシー", "レンタカー", "車"]):
+        return f"{destination}ですね。移動はどうしたいですか？ 例: 電車メイン / 歩きを減らしたい / タクシーも使いたい"
+    if s.get("budget_style") == "普通" and not any(k in notes_text for k in ["節約", "普通", "贅沢", "高め", "安く"]):
+        return f"{destination}ですね。予算感はどうしますか？ 例: 節約 / 普通 / 少し贅沢"
+    return f"{destination}ですね。追加で入れたい要望があれば教えてください。なければこの条件で旅行案を作成できます。"
+
+
+def validate_phase1_plan_with_llm(prompt_text: str, draft_text: str, resolved_state: Dict) -> Dict:
+    notes = resolved_state.get("conversation_notes", []) + resolved_state.get("revision_requests", [])
+    fixed_requirements = detect_fixed_requirement_lines(notes)
+    validator_prompt = f"""
+あなたは旅行プランの監査担当です。以下の条件と旅程案を見て、条件との整合性を JSON で返してください。
+
+【チェック観点】
+- 主目的地
+- 旅行日数
+- 出発地 / 帰着地
+- 相談メモ内の固定予定・イベント・予約・日時付き要件
+- 前置きと本文の一致
+
+【旅行条件】
+- 出発地: {resolved_state.get('departure_place')}
+- 帰着地: {resolved_state.get('return_place')}
+- 旅行日数: {resolved_state.get('trip_days')}日
+- 主目的地: {resolved_state.get('primary_destination') or '未指定'}
+- 固定予定候補: {fixed_requirements or ['なし']}
+- 相談メモ: {notes or ['なし']}
+
+【Phase1旅程案】
+{draft_text}
+
+【出力JSON】
+{{
+  "is_valid": true or false,
+  "issues": ["問題点1", "問題点2"],
+  "repair_instructions": ["修正指示1", "修正指示2"],
+  "summary": "監査要約"
+}}
+JSONのみを返してください。
+""".strip()
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(validator_prompt, temperature=0.0)
+        parsed = safe_json_load(raw)
+    except Exception as exc:
+        log_event("Phase1監査", f"監査LLM呼び出し失敗: {exc}", level="warning")
+        parsed = {}
+
+    if not parsed:
+        parsed = {
+            "is_valid": True,
+            "issues": [],
+            "repair_instructions": [],
+            "summary": "監査JSONの解析に失敗したため、初回案をそのまま採用しました。",
+        }
+    parsed["fixed_requirements"] = fixed_requirements
+    return parsed
+
+
+def maybe_regenerate_phase1_draft(prompt_text: str, draft_text: str, validation_result: Dict) -> str:
+    if validation_result.get("is_valid", True):
+        return draft_text
+    repair_instructions = validation_result.get("repair_instructions", []) or validation_result.get("issues", [])
+    if not repair_instructions:
+        return draft_text
+    repair_text = "\n".join(f"- {item}" for item in repair_instructions)
+    retry_prompt = f"""
+以下の旅行案を、監査結果を反映して一度だけ修正してください。
+
+【元の生成条件】
+{prompt_text}
+
+【監査で見つかった問題】
+{repair_text}
+
+【現在の旅程案】
+{draft_text}
+
+【重要】
+- 指摘された問題を必ず直してください。
+- 条件に含まれる固定予定・イベント・予約・日時付き要件は本文の旅程内に必ず入れてください。
+- それ以外の条件は崩しすぎないでください。
+""".strip()
+    try:
+        log_event("Phase1監査", "監査結果を受けて1回だけ再生成します。")
+        generator = Phase1Generator(logger=log_event)
+        return generator.generate_trip_plan(retry_prompt, temperature=st.session_state.temperature)
+    except Exception as exc:
+        log_event("Phase1監査", f"再生成失敗: {exc}", level="warning")
+        return draft_text
 
 
 
@@ -296,180 +441,9 @@ def clear_logs() -> None:
     st.session_state.app_logs = []
 
 
-# --- 修正箇所: Phase1生成後の汎用バリデーションと自動再生成で使う共通関数 ---
-def _extract_json_block(text: str) -> str:
-    raw = str(text or "").strip()
-    if not raw:
-        return "{}"
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
-    if fenced:
-        return fenced.group(1)
-    plain = re.search(r"(\{.*\})", raw, flags=re.DOTALL)
-    if plain:
-        return plain.group(1)
-    return raw
-
-
-def _safe_json_loads(text: str) -> Dict[str, object]:
-    json_text = _extract_json_block(text)
-    try:
-        data = json.loads(json_text)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _normalize_issue_list(value: object) -> List[str]:
-    if isinstance(value, list):
-        return [str(x).strip() for x in value if str(x).strip()]
-    if isinstance(value, str) and value.strip():
-        return [value.strip()]
-    return []
-
-
-def build_generic_requirement_summary(planning_state: Dict) -> str:
-    notes = planning_state.get("conversation_notes", []) + planning_state.get("revision_requests", [])
-    compact_notes = [str(x).strip() for x in notes if str(x).strip()]
-    if not compact_notes:
-        return "特記事項なし"
-    important_lines: List[str] = []
-    keywords = ["時", "分", "/", "月", "日", "泊", "日帰り", "ライブ", "コンサート", "試合", "観劇", "舞台", "予約", "開演", "開場", "開始", "集合", "チェックイン", "チェックアウト", "会場", "飛行機", "新幹線", "終電", "打合せ", "面談", "イベント"]
-    for note in compact_notes:
-        if any(keyword in note for keyword in keywords):
-            important_lines.append(note)
-    if not important_lines:
-        important_lines = compact_notes[-3:]
-    return " / ".join(important_lines)
-
-
-def build_phase1_validation_prompt(planning_state: Dict, draft_text: str) -> str:
-    notes_text = " / ".join(planning_state.get("conversation_notes", [])) or "特になし"
-    revisions_text = " / ".join(planning_state.get("revision_requests", [])) or "なし"
-    requirement_summary = build_generic_requirement_summary(planning_state)
-    return f"""
-あなたは旅行プランの品質監査担当です。
-
-以下の『ユーザー条件』と『生成された旅行案』を読み、条件への整合性を厳格に確認してください。
-京都やコンサートのような特定事例に限定せず、一般の旅行相談として判断してください。
-
-【ユーザー条件】
-- 出発地: {safe_text(planning_state.get('departure_place'))}
-- 帰着地: {safe_text(planning_state.get('return_place'))}
-- 出発時間: {safe_text(planning_state.get('departure_time'))}
-- 旅行開始日: {safe_text(planning_state.get('start_date'))}
-- 旅行日数: {safe_text(planning_state.get('trip_days'))}日
-- 主目的地: {safe_text(planning_state.get('primary_destination'), '未指定')}
-- 移動スタイル: {safe_text(planning_state.get('transport_style'))}
-- 予算感: {safe_text(planning_state.get('budget_style'))}
-- 相談メモ: {notes_text}
-- 追加の修正希望: {revisions_text}
-- 重要な要望・固定予定: {requirement_summary}
-
-【生成された旅行案】
-{draft_text}
-
-【監査観点】
-1. 主目的地・旅行日数・出発地/帰着地が条件と矛盾していないか
-2. 相談メモ内の固定予定・イベント・予約・日時付き予定・人数条件など、重要要件が旅程から落ちていないか
-3. 本文に書いたテーマや前置きと、実際の行程内容が一致しているか
-4. 重要要件が曖昧なまま観光案に置き換わっていないか
-
-【出力形式】
-JSONのみを返してください。説明文は不要です。
-{{
-  "is_valid": true or false,
-  "summary": "監査結果の一文要約",
-  "issues": ["不整合1", "不整合2"],
-  "repair_instructions": ["修正指示1", "修正指示2"],
-  "missing_requirements": ["落ちている要件1"]
-}}
-
-重要: 問題が少しでもあれば is_valid は false にしてください。
-""".strip()
-
-
-def validate_phase1_draft_with_llm(planning_state: Dict, draft_text: str) -> Dict[str, object]:
-    validator = Phase1Generator(logger=log_event)
-    prompt = build_phase1_validation_prompt(planning_state, draft_text)
-    raw = validator.generate_trip_plan(prompt, temperature=0.0)
-    data = _safe_json_loads(raw)
-
-    issues = _normalize_issue_list(data.get("issues"))
-    repairs = _normalize_issue_list(data.get("repair_instructions"))
-    missing_requirements = _normalize_issue_list(data.get("missing_requirements"))
-
-    primary_destination = safe_text(planning_state.get("primary_destination"), "")
-    if primary_destination and primary_destination not in draft_text:
-        issues.append(f"主目的地『{primary_destination}』が旅程本文で明示されていません。")
-        repairs.append(f"主目的地『{primary_destination}』を旅程本文に明示し、その都市・エリア中心の行程へ修正してください。")
-
-    important_requirement_summary = build_generic_requirement_summary(planning_state)
-    fixed_signal_keywords = ["ライブ", "コンサート", "試合", "観劇", "予約", "開演", "開場", "開始", "集合", "チェックイン"]
-    if any(keyword in important_requirement_summary for keyword in fixed_signal_keywords):
-        if not any(keyword in draft_text for keyword in fixed_signal_keywords):
-            issues.append("相談メモ内の固定予定・イベント情報が旅程本文に反映されていません。")
-            repairs.append("相談メモ内の固定予定やイベントを旅程本文の具体的な時刻・訪問先として必ず反映してください。")
-            missing_requirements.append("固定予定・イベント情報")
-
-    is_valid = bool(data.get("is_valid", False)) and not issues
-    return {
-        "is_valid": is_valid,
-        "summary": str(data.get("summary", "")).strip() or ("条件整合OK" if is_valid else "条件との不整合あり"),
-        "issues": issues,
-        "repair_instructions": repairs,
-        "missing_requirements": missing_requirements,
-        "raw_response": raw,
-    }
-
-
-def rebuild_phase1_prompt_with_validation_feedback(base_prompt: str, report: Dict[str, object]) -> str:
-    issues = _normalize_issue_list(report.get("issues"))
-    repairs = _normalize_issue_list(report.get("repair_instructions"))
-    missing_requirements = _normalize_issue_list(report.get("missing_requirements"))
-    feedback_lines = [f"- {item}" for item in issues + repairs + missing_requirements if item]
-    feedback_text = "\n".join(dict.fromkeys(feedback_lines)) or "- 監査で不足が検出されました。条件との整合性を上げてください。"
-    return f"""{base_prompt}
-
-【再生成時の最重要修正指示】
-- 下記の監査結果を必ず反映して旅程を作り直してください。
-- 前置きやテーマだけで触れて、本文の行程に入れないことは禁止です。
-- 相談メモ内の固定予定・イベント・予約・日時付き予定は、本文の行程に具体的な時刻付きで必ず含めてください。
-- ユーザー条件にない別都市・別目的へ置き換えないでください。
-
-【監査結果】
-{feedback_text}
-""".strip()
-
-
-def generate_phase1_draft() -> None:
-    clear_logs()
-    resolved = resolve_planning_state()
-    prompt_text = build_phase1_request_text()
-    st.session_state.phase1_prompt_text = prompt_text
-    log_event("Phase1", f"LLM候補生成を開始。最終採用: {resolved['trip_days']}日 / {resolved['transport_style']} / {resolved['budget_style']}")
-
-    # --- 修正箇所: 生成直後に汎用バリデーションLLMを通し、不整合があれば1回だけ自動再生成 ---
-    draft, validation_report = generate_phase1_draft_with_validation()
-
-    caution = "※移動時間や所要時間は目安です。完成旅程では、実際の移動経路や実時間にあわせて調整して表示します。"
-    if caution not in draft:
-        draft = draft.rstrip() + "\n\n" + caution
-
-    st.session_state.phase1_validation_report = validation_report
-    if validation_report.get("is_valid"):
-        log_event("Phase1監査", validation_report.get("summary", "条件整合OK"))
-    else:
-        issues_text = " / ".join(_normalize_issue_list(validation_report.get("issues"))) or validation_report.get("summary", "監査で不整合が残っています")
-        log_event("Phase1監査", f"監査結果: {issues_text}", level="warning")
-
-    st.session_state.trip_plan_draft = draft
-    st.session_state.plan_approved = False
-    st.session_state.active_tab = "plan_review"
-
 def extract_trip_days_from_text(text: str) -> Optional[int]:
+    # --- 修正箇所: 日帰り・◯泊をより自然に扱う ---
     text = str(text or "")
-    if not text.strip():
-        return None
     if "日帰り" in text:
         return 1
     match = re.search(r"(\d+)\s*泊\s*(\d+)\s*日", text)
@@ -484,94 +458,68 @@ def extract_trip_days_from_text(text: str) -> Optional[int]:
     return None
 
 
-
 def extract_primary_destination_from_text(text: str, departure_place: str = "", return_place: str = "") -> str:
-    # --- 修正箇所: 地名抽出を一般化し、人数やイベント語を目的地と誤認しにくくする ---
+    # --- 修正箇所: 「京都に行く」を優先し、人数語などの誤検出を抑制 ---
     raw_text = str(text or "").strip()
     if not raw_text:
         return ""
 
     cleaned = re.sub(r"[、。,.!！?？]", " ", raw_text)
-    candidates: List[str] = []
-    priority_patterns = [
-        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*に\s*(?:行く|行きたい|向かう|泊まる|滞在|遠征)",
-        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*へ\s*(?:行く|行きたい|向かう)",
-        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*で\s*(?:ライブ|コンサート|試合|観劇|イベント)",
-        r"([一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20})\s*(?:日帰り|\d+\s*泊|\d+\s*日)",
-    ]
-    for pattern in priority_patterns:
-        for match in re.finditer(pattern, cleaned):
-            candidate = str(match.group(1) or "").strip(" 　")
-            if candidate:
-                candidates.append(candidate)
-
-    compact = re.sub(r"\s+", "", raw_text)
-    if not candidates and re.fullmatch(r"[一-龥ぁ-んァ-ヶA-Za-zA-Z0-9ー・]{2,20}", compact):
-        candidates.append(compact)
-
     exclusions = {
         str(departure_place or "").strip(),
         str(return_place or "").strip(),
-        "旅行", "観光", "グルメ", "温泉", "ホテル", "泊", "日", "日帰り",
-        "電車", "徒歩", "タクシー", "レンタカー", "普通", "節約", "贅沢",
-        "ライブ", "コンサート", "試合", "観劇", "イベント", "開演", "開場", "開始",
+        "旅行", "観光", "グルメ", "温泉", "ホテル", "泊", "日", "人", "3人", "2人", "4人", "5人",
+        "コンサート", "ライブ", "イベント", "開演", "開場", "予約"
     }
 
-    filtered: List[str] = []
-    for candidate in candidates:
-        candidate = re.sub(r"(日帰り|\d+\s*泊.*|\d+\s*日.*)$", "", candidate).strip(" 　")
-        if not candidate or candidate in exclusions:
-            continue
-        if re.fullmatch(r"\d+人", candidate) or candidate.endswith("人"):
-            continue
-        if any(token in candidate for token in ["開演", "開場", "開始", "コンサート", "ライブ", "試合"]):
-            continue
-        filtered.append(candidate)
+    strong_patterns = [
+        r"([一-龥ぁ-んァ-ヶA-Za-z]{2,20})\s*(?:に|へ)行く",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]{2,20})\s*(?:旅行|観光|散策|滞在)",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]{2,20})\s*で\s*(?:ライブ|コンサート|試合|観劇|イベント)",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]{2,20})\s*\d+\s*泊",
+    ]
+    for pattern in strong_patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            candidate = str(match.group(1) or "").strip(" 　")
+            if candidate and candidate not in exclusions and not re.search(r"\d+人", candidate):
+                return candidate
 
-    return filtered[0] if filtered else ""
+    simple = cleaned.strip()
+    if re.fullmatch(r"[一-龥ぁ-んァ-ヶA-Za-z]{2,20}", simple) and simple not in exclusions:
+        return simple
 
-def has_trip_days_signal(planning_state: Dict) -> bool:
-    notes = planning_state.get("conversation_notes", []) + planning_state.get("revision_requests", [])
-    text = " / ".join(str(x) for x in notes if x)
-    return extract_trip_days_from_text(text) is not None
-
-
-
-def build_next_advisor_message(planning_state: Dict) -> str:
-    primary_destination = safe_text(planning_state.get("primary_destination"), "")
-    if not primary_destination:
-        return "目的地がまだ分かっていません。どこへ行きたいですか？ 例: 東京 / 金沢 / 温泉地"
-    if not has_trip_days_signal(planning_state):
-        return f"{primary_destination}方面ですね。旅行日数は何日くらいにしますか？ 例: 日帰り / 1泊2日 / 2泊3日"
-    return f"{primary_destination}方面で進められます。他に希望があればそのまま入力してください。問題なければ『旅行案を作成』を押してください。"
+    return ""
 
 
-
-def should_offer_confirmation(planning_state: Dict) -> bool:
-    primary_destination = safe_text(planning_state.get("primary_destination"), "")
-    return bool(primary_destination) and has_trip_days_signal(planning_state)
-
-
-
-def build_confirmation_payload_from_state(source_text: str = "") -> Optional[Dict[str, str]]:
-    planning_state = resolve_planning_state()
-    if not should_offer_confirmation(planning_state):
+def build_confirmation_payload(user_text: str) -> Optional[Dict[str, str]]:
+    # --- 修正箇所: 目的地と日数がそろったときだけ確認に進める ---
+    text = str(user_text or "").strip()
+    if not text:
         return None
 
-    resolved_destination = safe_text(planning_state.get("primary_destination"), "")
-    resolved_trip_days = int(planning_state.get("trip_days", 2))
-    departure_place = safe_text(planning_state.get("departure_place"), "-")
+    planning_state = st.session_state.planning_state
+    destination = extract_primary_destination_from_text(
+        text,
+        planning_state.get("departure_place", ""),
+        planning_state.get("return_place", ""),
+    ) or safe_text(planning_state.get("primary_destination"), "")
+    trip_days = extract_trip_days_from_text(text) or extract_trip_days_from_text(" / ".join(planning_state.get("conversation_notes", [])))
 
+    if not destination or not trip_days:
+        return None
+
+    departure_place = safe_text(planning_state.get("departure_place"), "-")
     message = (
-        f"確認です。主な目的地は「{resolved_destination or '-'}」、"
-        f"旅行日数は「{resolved_trip_days}日」、"
+        f"確認です。主な目的地は「{destination}」、"
+        f"旅行日数は「{trip_days}日」、"
         f"出発地は「{departure_place}」でよいですか？ その他希望がなければ、この条件で計画します。"
     )
     return {
-        "primary_destination": resolved_destination,
-        "trip_days": str(resolved_trip_days),
+        "primary_destination": destination,
+        "trip_days": str(trip_days),
         "message": message,
-        "source_text": source_text,
+        "source_text": text,
     }
 
 
@@ -586,16 +534,6 @@ def apply_confirmation_payload(payload: Dict[str, str]) -> None:
     if str(trip_days).strip().isdigit():
         planning_state["trip_days"] = int(str(trip_days).strip())
     st.session_state.planning_state = planning_state
-
-
-def build_route_source_text(row_dict: Dict) -> str:
-    source = safe_text(row_dict.get("route_data_source"), "").lower()
-    departure_at = safe_text(row_dict.get("route_departure_at"), "")
-    if source == "google_routes_api":
-        if departure_at and departure_at != "-":
-            return f"移動時間: 実検索（Google Routes / {departure_at} 出発想定）"
-        return "移動時間: 実検索（Google Routes）"
-    return "移動時間: 推定値（フォールバック）"
 
 
 def resolve_planning_state() -> Dict:
@@ -688,12 +626,12 @@ def reset_all() -> None:
     st.session_state.advisor_done = False
     st.session_state.pending_confirmation = None
     st.session_state.phase1_prompt_text = ""
-    st.session_state.phase1_validation_report = None
     st.session_state.trip_plan_draft = None
     st.session_state.trip_plan = None
     st.session_state.df_phase2 = None
     st.session_state.df_phase3 = None
     st.session_state.plan_approved = False
+    st.session_state.phase1_validation_result = None
     st.session_state.execution_engine = None
     st.session_state.event_result = None
     st.session_state.show_delay_dialog = False
@@ -709,6 +647,7 @@ def reset_all() -> None:
     st.session_state.active_tab = "travel_consultation"
     st.session_state.app_logs = []
     st.session_state.resolved_conditions = {}
+    st.session_state.plan_edit_notice = ""
 
 
 def build_google_maps_search_url(place: str) -> str:
@@ -1041,7 +980,6 @@ def build_phase1_request_text() -> str:
     notes_text = " / ".join(s["conversation_notes"]) if s["conversation_notes"] else "特になし"
     revisions_text = " / ".join(s["revision_requests"]) if s["revision_requests"] else "なし"
     primary_destination = safe_text(s.get("primary_destination"), "未指定")
-    requirement_summary = build_generic_requirement_summary(s)
     hotel_instruction = "ホテル（宿泊先）は必ず含めてください。" if s["hotel_required"] else "ホテルは必須ではありません。"
 
     text = f"""
@@ -1065,13 +1003,10 @@ def build_phase1_request_text() -> str:
 - 予算感: {s["budget_style"]}
 - 相談メモ: {notes_text}
 - 追加の修正希望: {revisions_text}
-- 重要な要望・固定予定: {requirement_summary}
 
 【旅程の作り方】
 - 主目的地が指定されている場合は、その都市・エリアを旅の中心として優先してください。
 - ユーザーの希望内容から、旅行の主目的地・主エリア・体験内容を自然に決めてください。
-- 相談メモ内の固定予定・イベント・予約・日時付き予定・人数条件など、重要な要望は旅程本文の具体的な行程として必ず反映してください。
-- テーマや前置きだけで触れて、本文の行程に入れないことは禁止です。
 - Day 1, Day 2 のように日別に分けてください。
 - 各日の時刻、訪問先、目的、滞在時間の目安がわかる形にしてください。
 - {hotel_instruction}
@@ -1089,6 +1024,7 @@ def build_phase1_request_text() -> str:
 """
     return text.strip()
 
+
 def generate_phase1_draft() -> None:
     clear_logs()
     resolved = resolve_planning_state()
@@ -1099,7 +1035,13 @@ def generate_phase1_draft() -> None:
     generator = Phase1Generator(logger=log_event)
     draft = generator.generate_trip_plan(prompt_text, temperature=st.session_state.temperature)
 
-    # 念のため注意書きが無い場合は末尾に補完
+    # --- 修正箇所: 生成後に汎用バリデーションLLMで監査し、必要時のみ1回再生成 ---
+    validation_result = validate_phase1_plan_with_llm(prompt_text, draft, resolved)
+    if not validation_result.get("is_valid", True):
+        draft = maybe_regenerate_phase1_draft(prompt_text, draft, validation_result)
+        validation_result = validate_phase1_plan_with_llm(prompt_text, draft, resolved)
+    st.session_state.phase1_validation_result = validation_result
+
     caution = "※移動時間や所要時間は目安です。完成旅程では、実際の移動経路や実時間にあわせて調整して表示します。"
     if caution not in draft:
         draft = draft.rstrip() + "\n\n" + caution
@@ -1291,7 +1233,9 @@ def rebuild_final_itinerary_from_phase2(updated_df2: pd.DataFrame, reason: str) 
     st.session_state.df_phase2 = normalized_df2.reset_index(drop=True)
     st.session_state.df_phase3 = df3.reset_index(drop=True)
     st.session_state.execution_engine = ExecutionEngine(st.session_state.df_phase3)
-    log_event("完成旅程編集", reason)
+    preview_rows = st.session_state.df_phase3.head(5)[[c for c in ["day", "start_time", "destination", "purpose"] if c in st.session_state.df_phase3.columns]].to_dict("records")
+    log_event("完成旅程編集", f"{reason} / 再構築後先頭={preview_rows}")
+    st.session_state.plan_edit_notice = reason
     return {"message": reason}
 
 
@@ -1321,13 +1265,15 @@ def update_spot_in_plan(activity_position: int, new_destination: str, new_purpos
 
     target_idx = activity_idx[activity_position]
     updated_df2 = df2.copy()
+    before_name = safe_text(updated_df2.iloc[target_idx].get("destination"))
     updated_df2.at[target_idx, "destination"] = new_destination.strip()
     if str(new_purpose).strip():
         updated_df2.at[target_idx, "purpose"] = new_purpose.strip()
     if str(new_one_point).strip():
         updated_df2.at[target_idx, "one_point"] = new_one_point.strip()
 
-    return rebuild_final_itinerary_from_phase2(updated_df2, f"スポットを変更しました: {new_destination.strip()}")
+    log_event("完成旅程編集", f"スポット変更押下: idx={target_idx} / 変更前={before_name} / 変更後={new_destination.strip()}")
+    return rebuild_final_itinerary_from_phase2(updated_df2, f"スポットを変更しました: {before_name} → {new_destination.strip()} / 実行シミュレーションも再初期化しました")
 
 
 def run_mood_change_action(engine: ExecutionEngine, action: str, free_text: str = "") -> None:
@@ -1600,7 +1546,7 @@ def render_itinerary_cards(
                         st.markdown(f"<div class='vf-card-note'>差分: {note}</div>", unsafe_allow_html=True)
                     st.link_button("📍 Google Mapsで場所を見る", place_url, use_container_width=True)
 
-                    if transport_edit_scope == "plan" and absolute_idx is not None:
+                    if transport_edit_scope == "plan" and absolute_idx is not None and not is_transport_like_activity(row_dict):
                         activity_position = _activity_position_from_phase3(df, absolute_idx)
                         edit_key = f"plan_spot_edit_{absolute_idx}"
                         current_destination_text = safe_text(row_dict.get("destination"), "")
@@ -1802,23 +1748,19 @@ with tabs[0]:
         user_message = st.chat_input("希望や修正を自然文で入力してください")
         if user_message:
             append_chat("user", user_message)
+            confirmation_payload = None if st.session_state.get("pending_confirmation") else build_confirmation_payload(user_message)
             update_planning_state_from_user_text(user_message)
 
-            if st.session_state.get("advisor_done"):
-                append_chat(
-                    "assistant",
-                    "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。"
-                )
-                st.rerun()
-
-            confirmation_payload = None if st.session_state.get("pending_confirmation") else build_confirmation_payload_from_state(user_message)
             if confirmation_payload:
                 st.session_state.pending_confirmation = confirmation_payload
                 append_chat("assistant", confirmation_payload["message"])
                 st.rerun()
 
-            next_message = build_next_advisor_message(resolve_planning_state())
-            append_chat("assistant", next_message)
+            # --- 修正箇所: 固定質問順送りではなく不足項目ベースの自然な聞き返しへ変更 ---
+            if not st.session_state.advisor_done:
+                append_chat("assistant", build_followup_question())
+            else:
+                append_chat("assistant", "修正希望を受け取りました。『旅行案を再作成』を押すと、この内容を反映した案を作り直します。")
             st.rerun()
 
         pending_confirmation = st.session_state.get("pending_confirmation")
@@ -1886,33 +1828,14 @@ with tabs[1]:
 
         st.info("※移動時間や所要時間は目安です。完成旅程では、実際の移動経路や実時間にあわせて調整して表示します。")
 
+        if st.session_state.get("phase1_validation_result"):
+            with st.expander("Phase1監査結果", expanded=False):
+                st.json(st.session_state.get("phase1_validation_result"))
+
         render_mock_weather_panel(st.session_state.planning_state, context_label="plan")
 
         with st.expander("Phase1 に渡した最終プロンプトを見る", expanded=False):
             st.code(st.session_state.phase1_prompt_text, language="text")
-
-        # --- 修正箇所: 生成後の汎用バリデーション結果を確認できるよう表示 ---
-        validation_report = st.session_state.get("phase1_validation_report")
-        if validation_report:
-            with st.expander("Phase1 監査結果を見る", expanded=False):
-                st.write(f"監査要約: {validation_report.get('summary', '-')}")
-                if validation_report.get("repaired_once"):
-                    st.write("自動再生成: あり")
-                issues = _normalize_issue_list(validation_report.get("issues"))
-                repairs = _normalize_issue_list(validation_report.get("repair_instructions"))
-                missing = _normalize_issue_list(validation_report.get("missing_requirements"))
-                if issues:
-                    st.write("不整合:")
-                    for item in issues:
-                        st.write(f"- {item}")
-                if repairs:
-                    st.write("修正指示:")
-                    for item in repairs:
-                        st.write(f"- {item}")
-                if missing:
-                    st.write("不足要件:")
-                    for item in missing:
-                        st.write(f"- {item}")
 
         st.divider()
         st.markdown("### この案への追加修正")
@@ -1955,7 +1878,6 @@ with tabs[1]:
         with c3:
             if st.button("🗑️ 下書きを破棄", use_container_width=True):
                 st.session_state.trip_plan_draft = None
-                st.session_state.phase1_validation_report = None
                 st.session_state.trip_plan = None
                 st.session_state.df_phase2 = None
                 st.session_state.df_phase3 = None
@@ -1999,6 +1921,10 @@ with tabs[2]:
                 ] if col in st.session_state.df_phase2.columns
             ]
             st.dataframe(st.session_state.df_phase2[display_cols], use_container_width=True, height=320)
+
+        if st.session_state.get("plan_edit_notice"):
+            st.success(st.session_state.get("plan_edit_notice"))
+            st.session_state.plan_edit_notice = ""
 
         st.markdown("### 完成旅程タイムライン")
         render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
