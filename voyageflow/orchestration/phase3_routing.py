@@ -116,6 +116,21 @@ class Phase3Routing:
             )
         return df
 
+    def _resolve_route_coordinates(self, row: pd.Series) -> tuple[Optional[float], Optional[float], str]:
+        lat = row.get("latitude")
+        lng = row.get("longitude")
+        if not pd.isna(lat) and not pd.isna(lng):
+            return float(lat), float(lng), "existing"
+
+        destination = str(row.get("destination") or "").strip()
+        if not destination:
+            return None, None, "missing_destination"
+
+        coords = self.routes.geocode_place_name(destination)
+        if coords:
+            return float(coords[0]), float(coords[1]), "geocoded_by_name"
+        return None, None, "geocode_failed"
+
     def _insert_transport_steps(self, df: pd.DataFrame) -> pd.DataFrame:
         new_rows = []
         for idx in range(len(df)):
@@ -138,10 +153,8 @@ class Phase3Routing:
                 )
                 continue
 
-            origin_lat = current_row["latitude"]
-            origin_lng = current_row["longitude"]
-            dest_lat = next_row["latitude"]
-            dest_lng = next_row["longitude"]
+            origin_lat, origin_lng, origin_coord_source = self._resolve_route_coordinates(current_row)
+            dest_lat, dest_lng, dest_coord_source = self._resolve_route_coordinates(next_row)
             current_end_time = str(current_row["end_time"])
             route_polyline = None
             route_info = None
@@ -150,13 +163,13 @@ class Phase3Routing:
             route_departure_at = f"{current_row['date']} {current_end_time}"
             departure_dt = self._build_departure_datetime(str(current_row["date"]), current_end_time)
 
-            if pd.isna(origin_lat) or pd.isna(origin_lng) or pd.isna(dest_lat) or pd.isna(dest_lng):
-                distance_km = 1.0
+            if origin_lat is None or origin_lng is None or dest_lat is None or dest_lng is None:
+                distance_km = self.routes.compute_distance((35.681236, 139.767125), (35.6895, 139.6917)) or 5.0
                 travel_duration = self._fallback_duration_minutes(str(transport_mode), distance_km)
                 route_data_source = "fallback_missing_coordinates"
-                route_debug_reason = "Places APIで座標取得できず"
+                route_debug_reason = f"座標取得不可 origin={origin_coord_source} dest={dest_coord_source}"
                 self._log(
-                    f"座標不足のためフォールバック移動を作成: {current_row['destination']} → {next_row['destination']} / origin=({origin_lat},{origin_lng}) dest=({dest_lat},{dest_lng})",
+                    f"座標不足のためフォールバック移動を作成: {current_row['destination']} → {next_row['destination']} / origin_source={origin_coord_source} dest_source={dest_coord_source}",
                     level="warning",
                 )
             else:
@@ -174,10 +187,10 @@ class Phase3Routing:
                         f"Routes API取得成功: {current_row['destination']} → {next_row['destination']} / mode={transport_mode} / duration={travel_duration}分 / departure={route_departure_at}"
                     )
                 else:
-                    distance_km = self.routes.compute_distance((origin_lat, origin_lng), (dest_lat, dest_lng)) or 1.0
+                    distance_km = self.routes.compute_distance((origin_lat, origin_lng), (dest_lat, dest_lng)) or 5.0
                     travel_duration = self._fallback_duration_minutes(str(transport_mode), distance_km)
                     route_data_source = "fallback_routes_unavailable"
-                    route_debug_reason = "Routes APIで経路取得できず"
+                    route_debug_reason = f"Routes API未取得 / 直線距離={distance_km:.2f}km"
                     self._log(
                         f"Routes API未取得のためフォールバック移動を作成: {current_row['destination']} → {next_row['destination']} / mode={transport_mode} / distance={distance_km:.2f}km / departure={route_departure_at}",
                         level="warning",

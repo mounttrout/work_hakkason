@@ -9,6 +9,7 @@ import json
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
+from maps.places_api import PlacesAPI
 
 load_dotenv()
 
@@ -37,7 +38,14 @@ class RoutesAPI:
             api_key: Google API キー（デフォルト: MAPS_API_KEY 環境変数）
         """
         self.api_key = api_key or os.getenv("MAPS_API_KEY")
-        if not self.api_key:
+        self.places = None
+        self._geocode_cache: Dict[str, Tuple[float, float]] = {}
+        if self.api_key:
+            try:
+                self.places = PlacesAPI(self.api_key)
+            except Exception:
+                self.places = None
+        else:
             raise ValueError("MAPS_API_KEY 環境変数が設定されていません")
     
     def compute_route(self, origin: Tuple[float, float], destination: Tuple[float, float],
@@ -205,6 +213,29 @@ class RoutesAPI:
         
         return c * r
     
+    def geocode_place_name(self, place_name: str) -> Optional[Tuple[float, float]]:
+        key = str(place_name or "").strip()
+        if not key:
+            return None
+        if key in self._geocode_cache:
+            return self._geocode_cache[key]
+        if not self.places:
+            return None
+        try:
+            results = self.places.search_text(key, language="ja")
+            if not results:
+                return None
+            top = results[0]
+            lat = top.get("latitude")
+            lng = top.get("longitude")
+            if lat is None or lng is None:
+                return None
+            coords = (float(lat), float(lng))
+            self._geocode_cache[key] = coords
+            return coords
+        except Exception:
+            return None
+
     @staticmethod
     def _parse_duration(duration_str: str) -> int:
         """

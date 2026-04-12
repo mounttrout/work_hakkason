@@ -16,7 +16,7 @@ from orchestration.phase2_structuring import Phase2Structuring
 from orchestration.phase3_routing import Phase3Routing
 from orchestration.execution_engine import ExecutionEngine
 from utils.display_formatters import build_transport_display, clean_address, format_genre, format_purpose
-from utils.weather_mock import build_mock_weather_context
+from utils.weather_api import build_weather_context
 from maps.places_api import PlacesAPI
 
 
@@ -30,8 +30,8 @@ from maps.places_api import PlacesAPI
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2-overview-summary-fix"
-APP_UPDATED_DATE = "2026-04-11"
+APP_VERSION_NAME = "v6.5-routing-weather-api"
+APP_UPDATED_DATE = "2026-04-12"
 
 
 # =========================================================
@@ -97,13 +97,12 @@ st.markdown(
 )
 
 
-def render_mock_weather_panel(planning_state: Dict[str, object], context_label: str = "plan") -> None:
-    weather_context = build_mock_weather_context(planning_state)
-    caption_suffix = "※モック表示です。後で実天気APIに差し替え可能な形にしています。"
+def render_weather_panel(planning_state: Dict[str, object], context_label: str = "plan") -> None:
+    weather_context = build_weather_context(planning_state)
 
     with st.container():
         st.markdown("### 🌤️ 天候メモ")
-        st.caption(f"{weather_context['mode_label']} / {weather_context['date_range_label']} / {caption_suffix}")
+        st.caption(f"{weather_context['mode_label']} / {weather_context['date_range_label']}")
         st.info(f"**{weather_context['headline']}**\n\n{weather_context['summary']}")
 
         d1, d2 = st.columns(2)
@@ -119,11 +118,12 @@ def render_mock_weather_panel(planning_state: Dict[str, object], context_label: 
             st.write(f"- 差分メモ: {weather_context['gap_advice']}")
             if context_label == "execution":
                 st.write(f"- 実行中メモ: {weather_context['execution_hint']}")
+        st.caption("Weather data by Open-Meteo.com")
 
 
 
 def build_weather_event_detail(planning_state: Dict[str, object]) -> str:
-    weather_context = build_mock_weather_context(planning_state)
+    weather_context = build_weather_context(planning_state)
     summary = str(weather_context.get("summary", "") or "")
     gap_advice = str(weather_context.get("gap_advice", "") or "")
     execution_hint = str(weather_context.get("execution_hint", "") or "")
@@ -2043,7 +2043,7 @@ with tabs[1]:
 
         st.info("※移動時間や所要時間は目安です。完成旅程では、実際の移動経路や実時間にあわせて調整して表示します。")
 
-        render_mock_weather_panel(st.session_state.planning_state, context_label="plan")
+        render_weather_panel(st.session_state.planning_state, context_label="plan")
 
         with st.expander("Phase1 に渡した最終プロンプトを見る", expanded=False):
             st.code(st.session_state.phase1_prompt_text, language="text")
@@ -2202,7 +2202,7 @@ with tabs[3]:
                 st.progress(progress_pct / 100)
 
             st.divider()
-            render_mock_weather_panel(st.session_state.planning_state, context_label="execution")
+            render_weather_panel(st.session_state.planning_state, context_label="execution")
 
             st.divider()
             st.markdown("### ステップ操作")
@@ -2272,7 +2272,7 @@ with tabs[3]:
 
             if st.session_state.show_weather_dialog:
                 st.markdown("#### 🌥️ 天候不順の内容")
-                weather_context = build_mock_weather_context(st.session_state.planning_state)
+                weather_context = build_weather_context(st.session_state.planning_state)
                 st.info(
                     f"**現在の天候メモ連動**\n\n"
                     f"- 想定: {weather_context['summary']}\n"
