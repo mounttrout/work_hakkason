@@ -7,9 +7,8 @@ import os
 import requests
 import json
 from typing import Optional, Dict, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from maps.places_api import PlacesAPI
 
 load_dotenv()
 
@@ -38,16 +37,32 @@ class RoutesAPI:
             api_key: Google API キー（デフォルト: MAPS_API_KEY 環境変数）
         """
         self.api_key = api_key or os.getenv("MAPS_API_KEY")
-        self.places = None
-        self._geocode_cache: Dict[str, Tuple[float, float]] = {}
-        if self.api_key:
-            try:
-                self.places = PlacesAPI(self.api_key)
-            except Exception:
-                self.places = None
-        else:
+        if not self.api_key:
             raise ValueError("MAPS_API_KEY 環境変数が設定されていません")
     
+
+    # --- 修正箇所: 旅程上の出発日時を RFC3339 へ正規化 ---
+    @staticmethod
+    def _normalize_departure_time(departure_time: datetime) -> datetime:
+        """
+        旅程上の日時を RFC3339 へ変換できる timezone-aware datetime に寄せる。
+        naive datetime は、VOYAGEFLOW_TIMEZONE -> TZ -> システムローカル の順で補完する。
+        """
+        if departure_time.tzinfo is not None:
+            return departure_time
+
+        tz_name = os.getenv("VOYAGEFLOW_TIMEZONE") or os.getenv("TZ")
+        try:
+            tzinfo = ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo
+        except Exception:
+            tzinfo = datetime.now().astimezone().tzinfo or timezone.utc
+        return departure_time.replace(tzinfo=tzinfo)
+
+    @classmethod
+    def _format_rfc3339_departure_time(cls, departure_time: datetime) -> str:
+        aware_dt = cls._normalize_departure_time(departure_time)
+        return aware_dt.isoformat()
+
     def compute_route(self, origin: Tuple[float, float], destination: Tuple[float, float],
                      mode: str = "walk", departure_time: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
         """
@@ -95,7 +110,7 @@ class RoutesAPI:
         
         # 出発時刻の指定（TRANSITの場合推奨）
         if departure_time:
-            body["departureTime"] = departure_time.isoformat() + "Z"
+            body["departureTime"] = self._format_rfc3339_departure_time(departure_time)
         
         headers = {
             "Content-Type": "application/json",
@@ -213,29 +228,6 @@ class RoutesAPI:
         
         return c * r
     
-    def geocode_place_name(self, place_name: str) -> Optional[Tuple[float, float]]:
-        key = str(place_name or "").strip()
-        if not key:
-            return None
-        if key in self._geocode_cache:
-            return self._geocode_cache[key]
-        if not self.places:
-            return None
-        try:
-            results = self.places.search_text(key, language="ja")
-            if not results:
-                return None
-            top = results[0]
-            lat = top.get("latitude")
-            lng = top.get("longitude")
-            if lat is None or lng is None:
-                return None
-            coords = (float(lat), float(lng))
-            self._geocode_cache[key] = coords
-            return coords
-        except Exception:
-            return None
-
     @staticmethod
     def _parse_duration(duration_str: str) -> int:
         """
@@ -270,7 +262,13 @@ class RoutesAPI:
         return total_seconds
     
 
-    def build_google_maps_directions_url(self, origin_name: str, destination_name: str, mode: str = "walk") -> str:
+    def build_google_maps_directions_url(
+        self,
+        origin_name: str,
+        destination_name: str,
+        mode: str = "walk",
+        departure_time: Optional[datetime] = None,
+    ) -> str:
         import urllib.parse
         mode_map = {
             "walk": "walking",
@@ -282,13 +280,25 @@ class RoutesAPI:
             "bike": "bicycling",
         }
         travelmode = mode_map.get(str(mode).lower(), "walking")
-        return (
+        url = (
             "https://www.google.com/maps/dir/?api=1"
             f"&origin={urllib.parse.quote(str(origin_name))}"
             f"&destination={urllib.parse.quote(str(destination_name))}"
             f"&travelmode={travelmode}"
         )
 
+        # Google Maps 側のURL仕様で常に反映される保証はないが、
+        # 旅程上の出発時刻を付与して「すぐに出発」寄りの挙動を減らす。
+        if departure_time:
+            try:
+                aware_dt = self._normalize_departure_time(departure_time)
+                unix_ts = int(aware_dt.astimezone(timezone.utc).timestamp())
+                url += f"&departure_time={unix_ts}"
+            except Exception:
+                pass
+        return url
+
+    @staticmethod
     @staticmethod
     def format_route_result(route_info: Dict[str, Any]) -> str:
         """

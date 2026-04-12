@@ -116,21 +116,6 @@ class Phase3Routing:
             )
         return df
 
-    def _resolve_route_coordinates(self, row: pd.Series) -> tuple[Optional[float], Optional[float], str]:
-        lat = row.get("latitude")
-        lng = row.get("longitude")
-        if not pd.isna(lat) and not pd.isna(lng):
-            return float(lat), float(lng), "existing"
-
-        destination = str(row.get("destination") or "").strip()
-        if not destination:
-            return None, None, "missing_destination"
-
-        coords = self.routes.geocode_place_name(destination)
-        if coords:
-            return float(coords[0]), float(coords[1]), "geocoded_by_name"
-        return None, None, "geocode_failed"
-
     def _insert_transport_steps(self, df: pd.DataFrame) -> pd.DataFrame:
         new_rows = []
         for idx in range(len(df)):
@@ -153,8 +138,10 @@ class Phase3Routing:
                 )
                 continue
 
-            origin_lat, origin_lng, origin_coord_source = self._resolve_route_coordinates(current_row)
-            dest_lat, dest_lng, dest_coord_source = self._resolve_route_coordinates(next_row)
+            origin_lat = current_row["latitude"]
+            origin_lng = current_row["longitude"]
+            dest_lat = next_row["latitude"]
+            dest_lng = next_row["longitude"]
             current_end_time = str(current_row["end_time"])
             route_polyline = None
             route_info = None
@@ -163,13 +150,14 @@ class Phase3Routing:
             route_departure_at = f"{current_row['date']} {current_end_time}"
             departure_dt = self._build_departure_datetime(str(current_row["date"]), current_end_time)
 
-            if origin_lat is None or origin_lng is None or dest_lat is None or dest_lng is None:
-                distance_km = self.routes.compute_distance((35.681236, 139.767125), (35.6895, 139.6917)) or 5.0
+            if pd.isna(origin_lat) or pd.isna(origin_lng) or pd.isna(dest_lat) or pd.isna(dest_lng):
+                distance_km = 1.0
                 travel_duration = self._fallback_duration_minutes(str(transport_mode), distance_km)
                 route_data_source = "fallback_missing_coordinates"
-                route_debug_reason = f"座標取得不可 origin={origin_coord_source} dest={dest_coord_source}"
+                route_debug_reason = "座標不足のため距離ベース推定"
+                route_debug_reason = "Places APIで座標取得できず"
                 self._log(
-                    f"座標不足のためフォールバック移動を作成: {current_row['destination']} → {next_row['destination']} / origin_source={origin_coord_source} dest_source={dest_coord_source}",
+                    f"座標不足のためフォールバック移動を作成: {current_row['destination']} → {next_row['destination']} / origin=({origin_lat},{origin_lng}) dest=({dest_lat},{dest_lng})",
                     level="warning",
                 )
             else:
@@ -183,14 +171,16 @@ class Phase3Routing:
                     travel_duration = max(1, int(route_info.get("duration_minutes", 1)))
                     route_polyline = route_info.get("polyline")
                     route_data_source = "google_routes_api"
+                    route_debug_reason = "Google Routes API取得成功"
                     self._log(
                         f"Routes API取得成功: {current_row['destination']} → {next_row['destination']} / mode={transport_mode} / duration={travel_duration}分 / departure={route_departure_at}"
                     )
                 else:
-                    distance_km = self.routes.compute_distance((origin_lat, origin_lng), (dest_lat, dest_lng)) or 5.0
+                    distance_km = self.routes.compute_distance((origin_lat, origin_lng), (dest_lat, dest_lng)) or 1.0
                     travel_duration = self._fallback_duration_minutes(str(transport_mode), distance_km)
                     route_data_source = "fallback_routes_unavailable"
-                    route_debug_reason = f"Routes API未取得 / 直線距離={distance_km:.2f}km"
+                    route_debug_reason = "Routes API未取得のため距離ベース推定"
+                    route_debug_reason = "Routes APIで経路取得できず"
                     self._log(
                         f"Routes API未取得のためフォールバック移動を作成: {current_row['destination']} → {next_row['destination']} / mode={transport_mode} / distance={distance_km:.2f}km / departure={route_departure_at}",
                         level="warning",
@@ -202,6 +192,7 @@ class Phase3Routing:
                 str(current_row["destination"]),
                 str(next_row["destination"]),
                 str(transport_mode),
+                departure_time=departure_dt,
             )
             route_from = (route_info or {}).get("route_from") or str(current_row["destination"])
             route_to = (route_info or {}).get("route_to") or str(next_row["destination"])
@@ -234,6 +225,7 @@ class Phase3Routing:
                 "route_summary": route_summary,
                 "route_data_source": route_data_source,
                 "route_departure_at": route_departure_at,
+                "route_debug_reason": route_debug_reason,
                 "route_debug_reason": route_debug_reason,
             }
             new_rows.append(pd.Series(transport_step))
@@ -329,17 +321,43 @@ class Phase3Routing:
 
     @staticmethod
     def _fallback_duration_minutes(mode: str, distance_km: float) -> int:
+        """
+        Routes API が取れない場合でも極端に短い所要時間にならないようにする。
+        特に電車は待ち時間・乗換・駅構内移動を考慮して下限を強めに置く。
+        """
+        normalized_mode = str(mode or "").lower()
         speed_kmh = {
             "walk": 4.5,
-            "train": 25.0,
-            "car": 22.0,
-            "private_car": 22.0,
-            "rental_car": 22.0,
-            "taxi": 22.0,
+            "train": 28.0,
+            "car": 24.0,
+            "private_car": 24.0,
+            "rental_car": 24.0,
+            "taxi": 24.0,
             "bike": 12.0,
-        }.get(mode, 20.0)
-        return max(1, int((distance_km / speed_kmh) * 60))
+        }.get(normalized_mode, 20.0)
 
+        base_minutes = int((max(distance_km, 0.1) / speed_kmh) * 60)
+
+        minimum_minutes = {
+            "walk": 5,
+            "bike": 8,
+            "car": 15,
+            "private_car": 15,
+            "rental_car": 15,
+            "taxi": 15,
+            "train": 30,
+        }.get(normalized_mode, 10)
+
+        if normalized_mode == "train":
+            # 駅構内移動・待ち時間・乗換の最低バッファ
+            if distance_km >= 3:
+                base_minutes += 10
+            if distance_km >= 15:
+                base_minutes += 10
+
+        return max(minimum_minutes, base_minutes)
+
+    @staticmethod
     @staticmethod
     def _transport_mode_label(mode: str) -> str:
         return {
