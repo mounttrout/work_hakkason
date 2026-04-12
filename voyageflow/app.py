@@ -3,8 +3,6 @@ import sys
 import urllib.parse
 import re
 import html
-import io
-import contextlib
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
@@ -24,13 +22,12 @@ from maps.places_api import PlacesAPI
 
 # =========================================================
 # 【バージョン名】VoyageFlow v6.2.1-routes-diagnostic-button
-# 【制作日】2026-04-12
+# 【制作日】2026-04-11
 # 【修正内容】
 # - 旅行相談の確認文を「主な目的地」ではなく「旅の概要」要約に変更
 # - 日付・目的地・旅の目的・人数・宿泊条件を分解して自然な概要文を生成
 # - 「5/16嵐のコンサートに京都に行く」のような入力で目的地が崩れる問題を抑制
 # - 画面上部にアプリ名・バージョン名・更新日を表示
-# - サイドバーに Routes API 診断ボタンを追加（route_diagnostic.py 呼び出し）
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
 APP_VERSION_NAME = "v6.2.1-routes-diagnostic-button"
@@ -236,8 +233,6 @@ def format_phase1_preview_text(plan_text: str) -> str:
 
     import re
     import html
-import io
-import contextlib
 
     text = html.escape(plan_text)
 
@@ -1799,48 +1794,6 @@ def status_emoji(status: str) -> str:
     return mapping.get(status, "⏳")
 
 
-# --- 修正箇所: route_diagnostic.py を Streamlit から安全に呼ぶ補助関数 ---
-def run_route_diagnostic_from_sidebar(origin_name: str, destination_name: str, mode: str, departure_at: str) -> str:
-    """
-    route_diagnostic.py を app.py から呼び出して標準出力を返す。
-    app 本体の既存ロジックを壊さないよう、sys.argv を一時的に差し替えて実行する。
-    """
-    output_buffer = io.StringIO()
-    argv_backup = sys.argv[:]
-
-    try:
-        if not os.getenv("MAPS_API_KEY"):
-            secrets_key = None
-            try:
-                secrets_key = st.secrets.get("MAPS_API_KEY")
-            except Exception:
-                secrets_key = None
-            if secrets_key:
-                os.environ["MAPS_API_KEY"] = str(secrets_key)
-
-        import route_diagnostic
-        sys.argv = [
-            "route_diagnostic.py",
-            "--origin-name", str(origin_name),
-            "--destination-name", str(destination_name),
-            "--mode", str(mode),
-            "--departure", str(departure_at),
-        ]
-
-        with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(output_buffer):
-            try:
-                route_diagnostic.main()
-            except SystemExit as e:
-                print(f"[route_diagnostic] SystemExit: {e}")
-    except Exception as e:
-        print(f"[route_diagnostic] 実行エラー: {e}", file=output_buffer)
-    finally:
-        sys.argv = argv_backup
-
-    return output_buffer.getvalue().strip()
-
-
-
 # =========================================================
 # サイドバー
 # =========================================================
@@ -1856,31 +1809,60 @@ with st.sidebar:
     st.markdown("### VoyageFlow")
     st.caption("モデル: models/gemini-3.1-flash-lite-preview")
 
+    # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
+    with st.expander("🛠 Routes診断", expanded=False):
+        diag_origin = st.text_input("出発地", value="福井駅", key="routes_diag_origin")
+        diag_destination = st.text_input("到着地", value="東京駅", key="routes_diag_destination")
+        diag_mode = st.selectbox("移動手段", options=["train", "walk", "car", "taxi", "bike"], index=0, key="routes_diag_mode")
+        diag_departure = st.text_input("出発日時 (YYYY-MM-DD HH:MM)", value="2026-04-19 12:05", key="routes_diag_departure")
+
+        if st.button("🚨 Routes診断を実行", use_container_width=True, key="run_routes_diagnostic"):
+            try:
+                from route_diagnostic import geocode_place, build_body, ROUTES_URL
+                import requests
+                api_key = st.secrets.get("MAPS_API_KEY") or os.getenv("MAPS_API_KEY")
+                if not api_key:
+                    st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
+                else:
+                    origin = geocode_place(diag_origin, api_key)
+                    destination = geocode_place(diag_destination, api_key)
+                    st.write("geocode結果")
+                    st.json({"origin": origin, "destination": destination})
+                    if not origin or not destination:
+                        st.error("地名解決に失敗しました。駅名やスポット名を見直してください。")
+                    else:
+                        body = build_body(origin, destination, diag_mode, diag_departure)
+                        headers = {
+                            "Content-Type": "application/json",
+                            "X-Goog-Api-Key": api_key,
+                            "X-Goog-FieldMask": ",".join([
+                                "routes.duration",
+                                "routes.distanceMeters",
+                                "routes.polyline.encodedPolyline",
+                                "routes.legs.steps.navigationInstruction.instructions",
+                                "routes.legs.steps.transitDetails.headsign",
+                                "routes.legs.steps.transitDetails.transitLine.name",
+                                "routes.legs.steps.transitDetails.transitLine.nameShort",
+                                "routes.legs.steps.transitDetails.stopDetails.arrivalStop.name",
+                                "routes.legs.steps.transitDetails.stopDetails.departureStop.name",
+                            ]),
+                        }
+                        st.write("request body")
+                        st.json(body)
+                        response = requests.post(ROUTES_URL, json=body, headers=headers, timeout=20)
+                        st.write(f"HTTP status: {response.status_code}")
+                        try:
+                            data = response.json()
+                        except Exception:
+                            data = {"raw_text": response.text}
+                        st.write("response")
+                        st.json(data)
+            except Exception as e:
+                st.error(f"Routes診断エラー: {e}")
+
     if st.button("🔄 全リセット", use_container_width=True):
         reset_all()
         st.rerun()
-
-    st.divider()
-
-    # --- 修正箇所: Routes API の単体診断をサイドバーから実行 ---
-    with st.expander("🛠 Routes診断", expanded=False):
-        st.caption("route_diagnostic.py を呼び出して、Routes API がフォールバックへ落ちる理由を確認します。")
-        diagnostic_origin = st.text_input("出発地（診断用）", value="福井駅", key="route_diag_origin")
-        diagnostic_destination = st.text_input("到着地（診断用）", value="東京駅", key="route_diag_destination")
-        diagnostic_mode = st.selectbox("移動手段（診断用）", options=["train", "walk", "car", "taxi", "bike"], index=0, key="route_diag_mode")
-        diagnostic_departure = st.text_input("出発日時（YYYY-MM-DD HH:MM）", value="2026-04-19 12:05", key="route_diag_departure")
-
-        if st.button("🚨 Routes診断を実行", use_container_width=True, key="run_route_diagnostic_button"):
-            result_text = run_route_diagnostic_from_sidebar(
-                diagnostic_origin,
-                diagnostic_destination,
-                diagnostic_mode,
-                diagnostic_departure,
-            )
-            st.session_state["route_diagnostic_output"] = result_text or "出力はありませんでした。"
-
-        if st.session_state.get("route_diagnostic_output"):
-            st.code(st.session_state["route_diagnostic_output"], language="text")
 
 
 # =========================================================
