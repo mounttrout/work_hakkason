@@ -250,6 +250,45 @@ def parse_route_diagnostic_departure_iso(departure_text: str) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
 
 
+def build_route_diagnostic_body(origin: list[float], destination: list[float], mode: str, departure_text: str) -> Dict[str, object]:
+    travel_mode_map = {
+        "train": "TRANSIT",
+        "walk": "WALK",
+        "car": "DRIVE",
+        "taxi": "DRIVE",
+        "bike": "BICYCLE",
+    }
+    departure_iso = parse_route_diagnostic_departure_iso(departure_text)
+    body: Dict[str, object] = {
+        "origin": {
+            "location": {
+                "latLng": {
+                    "latitude": float(origin[0]),
+                    "longitude": float(origin[1]),
+                }
+            }
+        },
+        "destination": {
+            "location": {
+                "latLng": {
+                    "latitude": float(destination[0]),
+                    "longitude": float(destination[1]),
+                }
+            }
+        },
+        "travelMode": travel_mode_map.get(str(mode or "").lower(), "TRANSIT"),
+        "computeAlternativeRoutes": False,
+        "routeModifiers": {
+            "avoidTolls": False,
+            "avoidHighways": False,
+            "avoidFerries": False,
+        },
+    }
+    if departure_iso:
+        body["departureTime"] = departure_iso
+    return body
+
+
 
 def format_phase1_preview_text(plan_text: str) -> str:
     if not plan_text:
@@ -1842,7 +1881,7 @@ with st.sidebar:
 
         if st.button("🚨 Routes診断を実行", use_container_width=True, key="run_routes_diagnostic"):
             try:
-                from route_diagnostic import geocode_place, build_body, ROUTES_URL
+                from route_diagnostic import geocode_place, ROUTES_URL
                 import requests
                 api_key = st.secrets.get("MAPS_API_KEY") or os.getenv("MAPS_API_KEY")
                 if not api_key:
@@ -1852,7 +1891,8 @@ with st.sidebar:
                     destination_raw = str(diag_destination or "")
                     origin_clean = origin_raw.strip()
                     destination_clean = destination_raw.strip()
-                    departure_iso = parse_route_diagnostic_departure_iso(diag_departure)
+                    departure_raw = str(diag_departure or "").strip()
+                    departure_iso = parse_route_diagnostic_departure_iso(departure_raw)
 
                     st.write("geocode入力値")
                     st.json({
@@ -1861,7 +1901,8 @@ with st.sidebar:
                         "destination_raw": destination_raw,
                         "destination_clean": destination_clean,
                         "mode": diag_mode,
-                        "departure": departure_iso or str(diag_departure or ""),
+                        "departure_raw": departure_raw,
+                        "departure_iso": departure_iso or departure_raw,
                     })
 
                     origin = geocode_place(origin_clean, api_key)
@@ -1871,7 +1912,7 @@ with st.sidebar:
                     if not origin or not destination:
                         st.error("地名解決に失敗しました。まずは geocode入力値 の origin_clean / destination_clean が駅名やスポット名だけになっているか確認してください。")
                     else:
-                        body = build_body(origin, destination, diag_mode, departure_iso or str(diag_departure or ""))
+                        body = build_route_diagnostic_body(origin, destination, diag_mode, departure_raw)
                         headers = {
                             "Content-Type": "application/json",
                             "X-Goog-Api-Key": api_key,
