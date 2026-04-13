@@ -21,17 +21,16 @@ from maps.places_api import PlacesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.2-routes-diagnostic-geocode-input
+# 【バージョン名】VoyageFlow v6.2.1-routes-diagnostic-button
 # 【制作日】2026-04-11
 # 【修正内容】
 # - 旅行相談の確認文を「主な目的地」ではなく「旅の概要」要約に変更
 # - 日付・目的地・旅の目的・人数・宿泊条件を分解して自然な概要文を生成
 # - 「5/16嵐のコンサートに京都に行く」のような入力で目的地が崩れる問題を抑制
 # - 画面上部にアプリ名・バージョン名・更新日を表示
-# - Routes診断で geocode に渡す直前の入力値を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.2-routes-diagnostic-geocode-input"
+APP_VERSION_NAME = "v6.2.3-routes-timezone-fix"
 APP_UPDATED_DATE = "2026-04-13"
 
 
@@ -225,6 +224,30 @@ def safe_text(value, default: str = "-") -> str:
 
 
 
+
+
+def parse_route_diagnostic_departure_iso(departure_text: str) -> str:
+    value = str(departure_text or "").strip()
+    if not value:
+        return ""
+
+    # すでにタイムゾーン付き or UTC終端ならそのまま返す
+    if re.search(r"(Z|[+-]\d{2}:\d{2})$", value):
+        return value
+
+    dt = None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            break
+        except ValueError:
+            continue
+
+    if dt is None:
+        return value
+
+    # ユーザー前提は日本時間
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
 
 
 
@@ -1825,32 +1848,30 @@ with st.sidebar:
                 if not api_key:
                     st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
                 else:
-                    # --- 修正箇所: geocode に渡す直前の生文字列を見える化 ---
-                    diag_origin_raw = str(diag_origin or "")
-                    diag_destination_raw = str(diag_destination or "")
-                    diag_origin_clean = diag_origin_raw.strip()
-                    diag_destination_clean = diag_destination_raw.strip()
+                    origin_raw = str(diag_origin or "")
+                    destination_raw = str(diag_destination or "")
+                    origin_clean = origin_raw.strip()
+                    destination_clean = destination_raw.strip()
+                    departure_iso = parse_route_diagnostic_departure_iso(diag_departure)
 
                     st.write("geocode入力値")
                     st.json({
-                        "origin_raw": diag_origin_raw,
-                        "origin_clean": diag_origin_clean,
-                        "destination_raw": diag_destination_raw,
-                        "destination_clean": diag_destination_clean,
+                        "origin_raw": origin_raw,
+                        "origin_clean": origin_clean,
+                        "destination_raw": destination_raw,
+                        "destination_clean": destination_clean,
                         "mode": diag_mode,
-                        "departure": diag_departure,
+                        "departure": departure_iso or str(diag_departure or ""),
                     })
 
-                    origin = geocode_place(diag_origin_clean, api_key)
-                    destination = geocode_place(diag_destination_clean, api_key)
-
+                    origin = geocode_place(origin_clean, api_key)
+                    destination = geocode_place(destination_clean, api_key)
                     st.write("geocode結果")
                     st.json({"origin": origin, "destination": destination})
-
                     if not origin or not destination:
                         st.error("地名解決に失敗しました。まずは geocode入力値 の origin_clean / destination_clean が駅名やスポット名だけになっているか確認してください。")
                     else:
-                        body = build_body(origin, destination, diag_mode, diag_departure)
+                        body = build_body(origin, destination, diag_mode, departure_iso or str(diag_departure or ""))
                         headers = {
                             "Content-Type": "application/json",
                             "X-Goog-Api-Key": api_key,
