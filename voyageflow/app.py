@@ -1919,6 +1919,15 @@ with st.sidebar:
                             # 診断ではまずレスポンス全体を確認する
                             "X-Goog-FieldMask": "*",
                         }
+                        masked_headers = dict(headers)
+                        if masked_headers.get("X-Goog-Api-Key"):
+                            raw_key = str(masked_headers["X-Goog-Api-Key"])
+                            if len(raw_key) > 8:
+                                masked_headers["X-Goog-Api-Key"] = raw_key[:4] + "..." + raw_key[-4:]
+                            else:
+                                masked_headers["X-Goog-Api-Key"] = "***"
+                        st.write("request headers")
+                        st.json(masked_headers)
                         st.write("request body")
                         st.json(body)
                         response = requests.post(ROUTES_URL, json=body, headers=headers, timeout=20)
