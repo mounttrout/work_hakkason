@@ -18,6 +18,7 @@ from orchestration.execution_engine import ExecutionEngine
 from utils.display_formatters import build_transport_display, clean_address, format_genre, format_purpose
 from utils.weather_mock import build_mock_weather_context
 from maps.places_api import PlacesAPI
+from maps.routes_api import RoutesAPI
 
 
 # =========================================================
@@ -30,8 +31,8 @@ from maps.places_api import PlacesAPI
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.3-routes-timezone-fix"
-APP_UPDATED_DATE = "2026-04-13"
+APP_VERSION_NAME = "v6.2.4-routes-diagnostic-via-wrapper"
+APP_UPDATED_DATE = "2026-04-15"
 
 
 # =========================================================
@@ -1872,7 +1873,7 @@ with st.sidebar:
     st.markdown("### VoyageFlow")
     st.caption("モデル: models/gemini-3.1-flash-lite-preview")
 
-    # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
+    # --- 修正箇所: Routes診断は routes_api.py 経由で実行 ---
     with st.expander("🛠 Routes診断", expanded=False):
         diag_origin = st.text_input("出発地", value="福井駅", key="routes_diag_origin")
         diag_destination = st.text_input("到着地", value="東京駅", key="routes_diag_destination")
@@ -1881,8 +1882,8 @@ with st.sidebar:
 
         if st.button("🚨 Routes診断を実行", use_container_width=True, key="run_routes_diagnostic"):
             try:
-                from route_diagnostic import geocode_place, ROUTES_URL
-                import requests
+                from route_diagnostic import geocode_place
+
                 api_key = st.secrets.get("MAPS_API_KEY") or os.getenv("MAPS_API_KEY")
                 if not api_key:
                     st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
@@ -1892,7 +1893,18 @@ with st.sidebar:
                     origin_clean = origin_raw.strip()
                     destination_clean = destination_raw.strip()
                     departure_raw = str(diag_departure or "").strip()
-                    departure_iso = parse_route_diagnostic_departure_iso(departure_raw)
+                    departure_dt = None
+                    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+                        try:
+                            departure_dt = datetime.strptime(departure_raw, fmt)
+                            break
+                        except ValueError:
+                            continue
+
+                    routes_api = RoutesAPI(api_key=api_key)
+                    departure_iso_preview = ""
+                    if departure_dt and routes_api.should_include_departure_time(diag_mode, departure_dt, use_case="diagnostic"):
+                        departure_iso_preview = routes_api._format_rfc3339_departure_time(departure_dt)
 
                     st.write("geocode入力値")
                     st.json({
@@ -1902,7 +1914,7 @@ with st.sidebar:
                         "destination_clean": destination_clean,
                         "mode": diag_mode,
                         "departure_raw": departure_raw,
-                        "departure_iso": departure_iso or departure_raw,
+                        "departure_iso": departure_iso_preview or "<not_used>",
                     })
 
                     origin = geocode_place(origin_clean, api_key)
@@ -1912,13 +1924,14 @@ with st.sidebar:
                     if not origin or not destination:
                         st.error("地名解決に失敗しました。まずは geocode入力値 の origin_clean / destination_clean が駅名やスポット名だけになっているか確認してください。")
                     else:
-                        body = build_route_diagnostic_body(origin, destination, diag_mode, departure_raw)
-                        headers = {
-                            "Content-Type": "application/json",
-                            "X-Goog-Api-Key": api_key,
-                            # 診断ではまずレスポンス全体を確認する
-                            "X-Goog-FieldMask": "*",
-                        }
+                        body = routes_api.build_request_body(
+                            origin=(float(origin[0]), float(origin[1])),
+                            destination=(float(destination[0]), float(destination[1])),
+                            mode=diag_mode,
+                            departure_time=departure_dt,
+                            use_case="diagnostic",
+                        )
+                        headers = routes_api.build_headers()
                         masked_headers = dict(headers)
                         if masked_headers.get("X-Goog-Api-Key"):
                             raw_key = str(masked_headers["X-Goog-Api-Key"])
@@ -1930,7 +1943,8 @@ with st.sidebar:
                         st.json(masked_headers)
                         st.write("request body")
                         st.json(body)
-                        response = requests.post(ROUTES_URL, json=body, headers=headers, timeout=20)
+
+                        response = requests.post(routes_api.BASE_URL, json=body, headers=headers, timeout=20)
                         st.write(f"HTTP status: {response.status_code}")
                         st.write("response headers")
                         st.json(dict(response.headers))
