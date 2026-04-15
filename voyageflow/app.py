@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
+import requests
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -31,8 +32,8 @@ from maps.routes_api import RoutesAPI
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.4-routes-diagnostic-via-wrapper"
-APP_UPDATED_DATE = "2026-04-15"
+APP_VERSION_NAME = "v6.2.5-routes-diagnostic-via-wrapper"
+APP_UPDATED_DATE = "2026-04-14"
 
 
 # =========================================================
@@ -227,67 +228,32 @@ def safe_text(value, default: str = "-") -> str:
 
 
 
+def parse_route_diagnostic_departure_datetime(departure_text: str) -> Optional[datetime]:
+    value = str(departure_text or "").strip()
+    if not value:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def parse_route_diagnostic_departure_iso(departure_text: str) -> str:
     value = str(departure_text or "").strip()
     if not value:
         return ""
 
-    # すでにタイムゾーン付き or UTC終端ならそのまま返す
     if re.search(r"(Z|[+-]\d{2}:\d{2})$", value):
         return value
 
-    dt = None
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            dt = datetime.strptime(value, fmt)
-            break
-        except ValueError:
-            continue
-
+    dt = parse_route_diagnostic_departure_datetime(value)
     if dt is None:
         return value
 
-    # ユーザー前提は日本時間
     return dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
-
-
-def build_route_diagnostic_body(origin: list[float], destination: list[float], mode: str, departure_text: str) -> Dict[str, object]:
-    travel_mode_map = {
-        "train": "TRANSIT",
-        "walk": "WALK",
-        "car": "DRIVE",
-        "taxi": "DRIVE",
-        "bike": "BICYCLE",
-    }
-    departure_iso = parse_route_diagnostic_departure_iso(departure_text)
-    body: Dict[str, object] = {
-        "origin": {
-            "location": {
-                "latLng": {
-                    "latitude": float(origin[0]),
-                    "longitude": float(origin[1]),
-                }
-            }
-        },
-        "destination": {
-            "location": {
-                "latLng": {
-                    "latitude": float(destination[0]),
-                    "longitude": float(destination[1]),
-                }
-            }
-        },
-        "travelMode": travel_mode_map.get(str(mode or "").lower(), "TRANSIT"),
-        "computeAlternativeRoutes": False,
-        "routeModifiers": {
-            "avoidTolls": False,
-            "avoidHighways": False,
-            "avoidFerries": False,
-        },
-    }
-    if departure_iso:
-        body["departureTime"] = departure_iso
-    return body
 
 
 
@@ -1873,7 +1839,7 @@ with st.sidebar:
     st.markdown("### VoyageFlow")
     st.caption("モデル: models/gemini-3.1-flash-lite-preview")
 
-    # --- 修正箇所: Routes診断は routes_api.py 経由で実行 ---
+    # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
     with st.expander("🛠 Routes診断", expanded=False):
         diag_origin = st.text_input("出発地", value="福井駅", key="routes_diag_origin")
         diag_destination = st.text_input("到着地", value="東京駅", key="routes_diag_destination")
@@ -1893,18 +1859,15 @@ with st.sidebar:
                     origin_clean = origin_raw.strip()
                     destination_clean = destination_raw.strip()
                     departure_raw = str(diag_departure or "").strip()
-                    departure_dt = None
-                    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
-                        try:
-                            departure_dt = datetime.strptime(departure_raw, fmt)
-                            break
-                        except ValueError:
-                            continue
+                    departure_dt = parse_route_diagnostic_departure_datetime(departure_raw)
+                    departure_iso = parse_route_diagnostic_departure_iso(departure_raw)
 
-                    routes_api = RoutesAPI(api_key=api_key)
-                    departure_iso_preview = ""
-                    if departure_dt and routes_api.should_include_departure_time(diag_mode, departure_dt, use_case="diagnostic"):
-                        departure_iso_preview = routes_api._format_rfc3339_departure_time(departure_dt)
+                    routes_client = RoutesAPI(api_key=api_key)
+                    should_use_departure = routes_client.should_include_departure_time(
+                        mode=diag_mode,
+                        departure_time=departure_dt,
+                        use_case="diagnostic",
+                    )
 
                     st.write("geocode入力値")
                     st.json({
@@ -1914,24 +1877,26 @@ with st.sidebar:
                         "destination_clean": destination_clean,
                         "mode": diag_mode,
                         "departure_raw": departure_raw,
-                        "departure_iso": departure_iso_preview or "<not_used>",
+                        "departure_iso": departure_iso if should_use_departure else "<not_used>",
                     })
 
                     origin = geocode_place(origin_clean, api_key)
                     destination = geocode_place(destination_clean, api_key)
                     st.write("geocode結果")
                     st.json({"origin": origin, "destination": destination})
+
                     if not origin or not destination:
                         st.error("地名解決に失敗しました。まずは geocode入力値 の origin_clean / destination_clean が駅名やスポット名だけになっているか確認してください。")
                     else:
-                        body = routes_api.build_request_body(
+                        body = routes_client.build_request_body(
                             origin=(float(origin[0]), float(origin[1])),
                             destination=(float(destination[0]), float(destination[1])),
                             mode=diag_mode,
                             departure_time=departure_dt,
                             use_case="diagnostic",
                         )
-                        headers = routes_api.build_headers()
+                        headers = routes_client.build_headers()
+
                         masked_headers = dict(headers)
                         if masked_headers.get("X-Goog-Api-Key"):
                             raw_key = str(masked_headers["X-Goog-Api-Key"])
@@ -1939,21 +1904,24 @@ with st.sidebar:
                                 masked_headers["X-Goog-Api-Key"] = raw_key[:4] + "..." + raw_key[-4:]
                             else:
                                 masked_headers["X-Goog-Api-Key"] = "***"
+
                         st.write("request headers")
                         st.json(masked_headers)
                         st.write("request body")
                         st.json(body)
 
-                        response = requests.post(routes_api.BASE_URL, json=body, headers=headers, timeout=20)
+                        response = requests.post(routes_client.BASE_URL, json=body, headers=headers, timeout=20)
                         st.write(f"HTTP status: {response.status_code}")
                         st.write("response headers")
                         st.json(dict(response.headers))
                         st.write("response text")
                         st.code(response.text or "<empty response>", language="json")
+
                         try:
                             data = response.json() if response.text.strip() else {}
                         except Exception:
                             data = {"raw_text": response.text}
+
                         st.write("response")
                         st.json(data)
                         routes = data.get("routes") if isinstance(data, dict) else None

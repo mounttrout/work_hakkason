@@ -4,8 +4,8 @@ Google Routes API（移動時間、経路取得）のラッパー
 
 【改修方針】
 - departureTime は「今の時刻」ではなく、「その移動を開始する想定時刻」として扱う
-- ただし mode ごとに扱いを変える
-    - train / TRANSIT: departureTime を使う
+- mode ごとに departureTime の有無を制御する
+    - train / TRANSIT: 使う
     - car / taxi / walk / bike: 今回は送らない（TRAFFIC_UNAWARE エラー回避）
 - 用途ごとの整理
     - final_itinerary: 完成旅程
@@ -30,7 +30,6 @@ class RoutesAPI:
 
     BASE_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
-    # VoyageFlow内部の移動手段 → Google Routes API の travelMode
     TRANSPORT_MODES = {
         "walk": "WALK",
         "train": "TRANSIT",
@@ -41,16 +40,9 @@ class RoutesAPI:
         "bike": "BICYCLE",
     }
 
-    # departureTime を送ってよい mode
     DEPARTURE_TIME_ALLOWED_MODES = {"train"}
 
     def __init__(self, api_key: Optional[str] = None):
-        """
-        初期化
-
-        Args:
-            api_key: Google API キー（デフォルト: MAPS_API_KEY 環境変数）
-        """
         self.api_key = api_key or os.getenv("MAPS_API_KEY")
         if not self.api_key:
             raise ValueError("MAPS_API_KEY 環境変数が設定されていません")
@@ -61,14 +53,6 @@ class RoutesAPI:
 
     @staticmethod
     def _normalize_departure_time(departure_time: datetime) -> datetime:
-        """
-        naive datetime を timezone-aware に補完する。
-        優先順:
-        1. VOYAGEFLOW_TIMEZONE
-        2. TZ
-        3. システムローカル
-        4. UTC
-        """
         if departure_time.tzinfo is not None:
             return departure_time
 
@@ -92,25 +76,12 @@ class RoutesAPI:
         departure_time: Optional[datetime],
         use_case: str = "final_itinerary",
     ) -> bool:
-        """
-        departureTime をリクエストに含めるか判定する。
-
-        現在の設計:
-        - train のみ True
-        - それ以外は False
-        - use_case は将来拡張用に受ける
-        """
         normalized_mode = cls._normalize_mode(mode)
         if departure_time is None:
             return False
         if normalized_mode not in cls.DEPARTURE_TIME_ALLOWED_MODES:
             return False
-
-        # 将来ここで use_case ごとの振る舞いを変えられるように残す
-        if use_case in {"final_itinerary", "execution", "diagnostic"}:
-            return True
-
-        return False
+        return use_case in {"final_itinerary", "execution", "diagnostic"}
 
     def build_request_body(
         self,
@@ -120,16 +91,6 @@ class RoutesAPI:
         departure_time: Optional[datetime] = None,
         use_case: str = "final_itinerary",
     ) -> Dict[str, Any]:
-        """
-        computeRoutes 用の request body を組み立てる。
-
-        Args:
-            origin: 出発地点 (lat, lng)
-            destination: 到着地点 (lat, lng)
-            mode: 移動手段
-            departure_time: その移動を開始する想定時刻
-            use_case: final_itinerary / execution / diagnostic
-        """
         normalized_mode = self._normalize_mode(mode)
         travel_mode = self.TRANSPORT_MODES.get(normalized_mode, "WALK")
 
@@ -159,7 +120,6 @@ class RoutesAPI:
             },
         }
 
-        # departureTime は mode / 用途を見て必要なときだけ付与
         if self.should_include_departure_time(
             mode=normalized_mode,
             departure_time=departure_time,
@@ -170,10 +130,6 @@ class RoutesAPI:
         return body
 
     def build_headers(self) -> Dict[str, str]:
-        """
-        Routes API 用ヘッダー
-        まずは routes 全体を返させる。安定後に必要項目だけへ絞る。
-        """
         return {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": self.api_key,
@@ -188,21 +144,7 @@ class RoutesAPI:
         departure_time: Optional[datetime] = None,
         use_case: str = "final_itinerary",
     ) -> Optional[Dict[str, Any]]:
-        """
-        2点間の経路と移動時間を計算する。
-
-        Args:
-            origin: 出発地点 (lat, lng)
-            destination: 目的地点 (lat, lng)
-            mode: 移動手段 ("walk", "train", "car", "taxi", "bike")
-            departure_time: その移動を開始する想定時刻
-            use_case: final_itinerary / execution / diagnostic
-
-        Returns:
-            経路情報辞書、またはエラー時は None
-        """
         normalized_mode = self._normalize_mode(mode)
-
         body = self.build_request_body(
             origin=origin,
             destination=destination,
@@ -220,7 +162,6 @@ class RoutesAPI:
                 timeout=15,
             )
             response.raise_for_status()
-
             data = response.json()
 
             if not data.get("routes"):
@@ -233,12 +174,11 @@ class RoutesAPI:
                 return None
 
             route = data["routes"][0]
-
             duration_str = route.get("duration", "0s")
             duration_seconds = self._parse_duration(duration_str)
             distance_meters = route.get("distanceMeters", 0)
 
-            result = {
+            return {
                 "origin": origin,
                 "destination": destination,
                 "mode": normalized_mode,
@@ -251,8 +191,6 @@ class RoutesAPI:
                 "raw_route": route,
                 **self._extract_step_summary(route, normalized_mode),
             }
-            return result
-
         except requests.RequestException as e:
             response_text = ""
             try:
@@ -273,9 +211,6 @@ class RoutesAPI:
             return None
 
     def _extract_step_summary(self, route: Dict[str, Any], mode: str) -> Dict[str, Any]:
-        """
-        返ってきた routes[0] から、表示用の簡易要約を作る。
-        """
         legs = route.get("legs", []) or []
         steps = legs[0].get("steps", []) if legs else []
         first_transit = None
@@ -322,16 +257,6 @@ class RoutesAPI:
         }
 
     def compute_distance(self, origin: Tuple[float, float], destination: Tuple[float, float]) -> Optional[float]:
-        """
-        2点間の直線距離を計算（簡易版、緯度経度から）
-
-        Args:
-            origin: 出発地点 (lat, lng)
-            destination: 目的地点 (lat, lng)
-
-        Returns:
-            距離（km）
-        """
         from math import radians, cos, sin, asin, sqrt
 
         lon1, lat1 = origin[1], origin[0]
@@ -344,35 +269,24 @@ class RoutesAPI:
 
         a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
         c = 2 * asin(sqrt(a))
-        r = 6371  # km
+        r = 6371
 
         return c * r
 
     @staticmethod
     def _parse_duration(duration_str: str) -> int:
-        """
-        期間文字列を秒へ変換する。
-        例:
-        - "123s"
-        - "5m30s"
-        - "3h15m"
-        """
         import re
 
         total_seconds = 0
-
         hours_match = re.search(r"(\d+)h", duration_str)
         if hours_match:
             total_seconds += int(hours_match.group(1)) * 3600
-
         minutes_match = re.search(r"(\d+)m", duration_str)
         if minutes_match:
             total_seconds += int(minutes_match.group(1)) * 60
-
         seconds_match = re.search(r"(\d+)s", duration_str)
         if seconds_match:
             total_seconds += int(seconds_match.group(1))
-
         return total_seconds
 
     def build_google_maps_directions_url(
@@ -382,14 +296,9 @@ class RoutesAPI:
         mode: str = "walk",
         departure_time: Optional[datetime] = None,
     ) -> str:
-        """
-        Google Maps の経路URLを組み立てる。
-        Routes API とは別で、ユーザー確認用リンク。
-        """
         import urllib.parse
 
         normalized_mode = self._normalize_mode(mode)
-
         mode_map = {
             "walk": "walking",
             "train": "transit",
@@ -400,7 +309,6 @@ class RoutesAPI:
             "bike": "bicycling",
         }
         travelmode = mode_map.get(normalized_mode, "walking")
-
         url = (
             "https://www.google.com/maps/dir/?api=1"
             f"&origin={urllib.parse.quote(str(origin_name))}"
@@ -408,7 +316,6 @@ class RoutesAPI:
             f"&travelmode={travelmode}"
         )
 
-        # train のときだけ departure_time を付与
         if self.should_include_departure_time(
             mode=normalized_mode,
             departure_time=departure_time,
@@ -425,9 +332,6 @@ class RoutesAPI:
 
     @staticmethod
     def format_route_result(route_info: Dict[str, Any]) -> str:
-        """
-        経路情報を人間が読みやすい形式にフォーマット
-        """
         if not route_info:
             return "経路情報なし"
 
@@ -448,14 +352,11 @@ class RoutesAPI:
         return f"{mode_ja}: {distance:.1f}km, 約{int(duration)}分"
 
 
-# テスト用
 if __name__ == "__main__":
     routes = RoutesAPI()
-
     print("=== 経路計算テスト ===")
-    origin = (35.6762, 139.7674)       # 東京駅付近
-    destination = (35.7100, 139.8107)  # スカイツリー付近
-
+    origin = (35.6762, 139.7674)
+    destination = (35.7100, 139.8107)
     test_departure = datetime(2026, 4, 19, 12, 5)
 
     for mode in ["walk", "train", "car"]:
