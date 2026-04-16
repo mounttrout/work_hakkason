@@ -448,6 +448,21 @@ def _contains_international_signal(*texts: str) -> bool:
     return any(k in merged for k in keywords)
 
 
+
+
+def _row_value(row: pd.Series | Dict | None, key: str, default=None):
+    if row is None:
+        return default
+    try:
+        if isinstance(row, pd.Series):
+            value = row.get(key, default)
+        elif isinstance(row, dict):
+            value = row.get(key, default)
+        else:
+            value = getattr(row, key, default)
+        return default if value is None else value
+    except Exception:
+        return default
 def _contains_air_travel_signal(*texts: str) -> bool:
     merged = " ".join(str(t or "") for t in texts).lower()
     keywords = [
@@ -460,16 +475,16 @@ def _contains_air_travel_signal(*texts: str) -> bool:
 
 def _is_air_transport_context(transport_row: pd.Series | Dict, prev_row: pd.Series | Dict, next_row: pd.Series | Dict) -> bool:
     texts = [
-        safe_text((transport_row or {}).get("destination"), ""),
-        safe_text((transport_row or {}).get("purpose"), ""),
-        safe_text((transport_row or {}).get("genre"), ""),
-        safe_text((transport_row or {}).get("one_point"), ""),
-        safe_text((prev_row or {}).get("destination"), ""),
-        safe_text((prev_row or {}).get("purpose"), ""),
-        safe_text((prev_row or {}).get("one_point"), ""),
-        safe_text((next_row or {}).get("destination"), ""),
-        safe_text((next_row or {}).get("purpose"), ""),
-        safe_text((next_row or {}).get("one_point"), ""),
+        safe_text(_row_value(transport_row, "destination", ""), ""),
+        safe_text(_row_value(transport_row, "purpose", ""), ""),
+        safe_text(_row_value(transport_row, "genre", ""), ""),
+        safe_text(_row_value(transport_row, "one_point", ""), ""),
+        safe_text(_row_value(prev_row, "destination", ""), ""),
+        safe_text(_row_value(prev_row, "purpose", ""), ""),
+        safe_text(_row_value(prev_row, "one_point", ""), ""),
+        safe_text(_row_value(next_row, "destination", ""), ""),
+        safe_text(_row_value(next_row, "purpose", ""), ""),
+        safe_text(_row_value(next_row, "one_point", ""), ""),
     ]
     return _contains_air_travel_signal(*texts)
 
@@ -499,12 +514,12 @@ def _extract_minutes_from_text(*texts: str) -> Optional[int]:
 
 
 def _build_air_transport_estimate(prev_row: pd.Series | Dict, transport_row: pd.Series | Dict, next_row: pd.Series | Dict, departure_date: str, departure_time: str) -> Dict[str, object]:
-    prev_texts = [safe_text((prev_row or {}).get("destination"), ""), safe_text((prev_row or {}).get("purpose"), ""), safe_text((prev_row or {}).get("one_point"), "")]
-    transport_texts = [safe_text((transport_row or {}).get("destination"), ""), safe_text((transport_row or {}).get("purpose"), ""), safe_text((transport_row or {}).get("one_point"), "")]
-    next_texts = [safe_text((next_row or {}).get("destination"), ""), safe_text((next_row or {}).get("purpose"), ""), safe_text((next_row or {}).get("one_point"), "")]
+    prev_texts = [safe_text(_row_value(prev_row, "destination", ""), ""), safe_text(_row_value(prev_row, "purpose", ""), ""), safe_text(_row_value(prev_row, "one_point", ""), "")]
+    transport_texts = [safe_text(_row_value(transport_row, "destination", ""), ""), safe_text(_row_value(transport_row, "purpose", ""), ""), safe_text(_row_value(transport_row, "one_point", ""), "")]
+    next_texts = [safe_text(_row_value(next_row, "destination", ""), ""), safe_text(_row_value(next_row, "purpose", ""), ""), safe_text(_row_value(next_row, "one_point", ""), "")]
     minutes = _extract_minutes_from_text(*prev_texts, *transport_texts, *next_texts)
-    origin_name = safe_text((prev_row or {}).get("destination"), "出発空港")
-    destination_name = safe_text((next_row or {}).get("destination"), "到着空港")
+    origin_name = safe_text(_row_value(prev_row, "destination", "出発空港"), "出発空港")
+    destination_name = safe_text(_row_value(next_row, "destination", "到着空港"), "到着空港")
     if minutes is None:
         if _contains_international_signal(origin_name, destination_name, *transport_texts, *next_texts):
             minutes = 600
