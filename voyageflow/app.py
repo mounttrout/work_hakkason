@@ -3,11 +3,12 @@ import sys
 import urllib.parse
 import re
 import html
+import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
-import requests
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -32,8 +33,8 @@ from maps.routes_api import RoutesAPI
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.5-routes-diagnostic-via-wrapper"
-APP_UPDATED_DATE = "2026-04-14"
+APP_VERSION_NAME = "v6.2.6-llm-travel-time-fallback"
+APP_UPDATED_DATE = "2026-04-16"
 
 
 # =========================================================
@@ -228,32 +229,67 @@ def safe_text(value, default: str = "-") -> str:
 
 
 
-def parse_route_diagnostic_departure_datetime(departure_text: str) -> Optional[datetime]:
-    value = str(departure_text or "").strip()
-    if not value:
-        return None
-
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return None
-
-
 def parse_route_diagnostic_departure_iso(departure_text: str) -> str:
     value = str(departure_text or "").strip()
     if not value:
         return ""
 
+    # すでにタイムゾーン付き or UTC終端ならそのまま返す
     if re.search(r"(Z|[+-]\d{2}:\d{2})$", value):
         return value
 
-    dt = parse_route_diagnostic_departure_datetime(value)
+    dt = None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            break
+        except ValueError:
+            continue
+
     if dt is None:
         return value
 
+    # ユーザー前提は日本時間
     return dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+
+
+def build_route_diagnostic_body(origin: list[float], destination: list[float], mode: str, departure_text: str) -> Dict[str, object]:
+    travel_mode_map = {
+        "train": "TRANSIT",
+        "walk": "WALK",
+        "car": "DRIVE",
+        "taxi": "DRIVE",
+        "bike": "BICYCLE",
+    }
+    departure_iso = parse_route_diagnostic_departure_iso(departure_text)
+    body: Dict[str, object] = {
+        "origin": {
+            "location": {
+                "latLng": {
+                    "latitude": float(origin[0]),
+                    "longitude": float(origin[1]),
+                }
+            }
+        },
+        "destination": {
+            "location": {
+                "latLng": {
+                    "latitude": float(destination[0]),
+                    "longitude": float(destination[1]),
+                }
+            }
+        },
+        "travelMode": travel_mode_map.get(str(mode or "").lower(), "TRANSIT"),
+        "computeAlternativeRoutes": False,
+        "routeModifiers": {
+            "avoidTolls": False,
+            "avoidHighways": False,
+            "avoidFerries": False,
+        },
+    }
+    if departure_iso:
+        body["departureTime"] = departure_iso
+    return body
 
 
 
@@ -329,6 +365,249 @@ def log_event(stage: str, message: str, level: str = "info") -> None:
 
 def clear_logs() -> None:
     st.session_state.app_logs = []
+
+
+def _safe_json_extract(text: str) -> Optional[Dict[str, object]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    from math import radians, sin, cos, asin, sqrt
+    lon1, lat1, lon2, lat2 = map(radians, [lng1, lat1, lng2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * asin(sqrt(a))
+    return 6371 * c
+
+
+def _estimate_minutes_from_distance(distance_km: float, mode: str) -> int:
+    mode_key = str(mode or "walk").lower()
+    km = max(float(distance_km or 0), 0.1)
+
+    if mode_key in {"walk", "walking", "徒歩"}:
+        return max(5, int(round((km / 4.5) * 60)))
+
+    if mode_key in {"bike", "bicycle", "自転車"}:
+        return max(3, int(round((km / 15.0) * 60)))
+
+    if mode_key in {"train", "transit", "電車"}:
+        if km < 3:
+            return max(8, int(round((km / 18.0) * 60)) + 5)
+        if km < 30:
+            return max(12, int(round((km / 30.0) * 60)) + 8)
+        if km < 120:
+            return max(25, int(round((km / 70.0) * 60)) + 12)
+        return max(60, int(round((km / 160.0) * 60)) + 15)
+
+    if km < 5:
+        speed = 22.0
+    elif km < 30:
+        speed = 35.0
+    else:
+        speed = 60.0
+    return max(5, int(round((km / speed) * 60)))
+
+
+def _add_minutes_to_clock(start_time: str, minutes: int) -> str:
+    value = str(start_time or "").strip()
+    if not value:
+        return start_time
+    try:
+        base = datetime.strptime(value, "%H:%M")
+        return (base + timedelta(minutes=int(minutes))).strftime("%H:%M")
+    except Exception:
+        return start_time
+
+
+def _llm_transport_duration_estimate(
+    origin_name: str,
+    destination_name: str,
+    mode: str,
+    departure_date: str,
+    departure_time: str,
+    distance_km: float,
+    origin_lat: float,
+    origin_lng: float,
+    destination_lat: float,
+    destination_lng: float,
+) -> Optional[Dict[str, object]]:
+    prompt = f"""
+あなたは旅行アプリの移動時間推定補助です。
+
+次の移動について、一般的に妥当な『概算移動時間』だけを保守的に推定してください。
+不確実なら minutes を null にしてください。
+
+【重要ルール】
+- 路線名・道路名・乗換回数などを、確信がないのに捏造しない
+- 断定しすぎず、一般的な目安として答える
+- minutes は整数
+- confidence は high / medium / low のいずれか
+- JSON だけを返す
+
+【入力】
+- 出発地名: {origin_name}
+- 到着地名: {destination_name}
+- 移動手段の想定: {mode}
+- 出発予定日: {departure_date}
+- 出発予定時刻: {departure_time}
+- 直線距離km: {distance_km:.2f}
+- 出発地座標: {origin_lat}, {origin_lng}
+- 到着地座標: {destination_lat}, {destination_lng}
+
+【出力JSON形式】
+{{
+  "minutes": 25,
+  "confidence": "medium",
+  "reason": "都市部の主要駅間として一般的な移動時間の目安"
+}}
+
+minutes を出せない場合:
+{{
+  "minutes": null,
+  "confidence": "low",
+  "reason": "情報不足で妥当な概算を出せない"
+}}
+""".strip()
+
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.1).strip()
+        data = _safe_json_extract(raw)
+        if not data:
+            return None
+        minutes = data.get("minutes")
+        confidence = str(data.get("confidence", "")).lower().strip()
+        reason = str(data.get("reason", "")).strip()
+        if minutes is None:
+            return None
+        minutes = int(minutes)
+        if minutes <= 0 or minutes > 24 * 60:
+            return None
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "medium"
+        return {"minutes": minutes, "confidence": confidence, "reason": reason}
+    except Exception as e:
+        log_event("移動時間推定", f"LLM概算フォールバック: {e}", level="warning")
+        return None
+
+
+@contextmanager
+def _disable_live_routes_api_for_phase3():
+    original = None
+    try:
+        import maps.routes_api as routes_api_module
+        original = getattr(routes_api_module.RoutesAPI, "compute_route", None)
+        if original is not None:
+            def _disabled_compute_route(self, origin, destination, mode="walk", departure_time=None, use_case="final_itinerary"):
+                return None
+            routes_api_module.RoutesAPI.compute_route = _disabled_compute_route
+        yield
+    except Exception:
+        yield
+    finally:
+        try:
+            if original is not None:
+                import maps.routes_api as routes_api_module
+                routes_api_module.RoutesAPI.compute_route = original
+        except Exception:
+            pass
+
+
+def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[str, object], use_case: str = "final_itinerary") -> pd.DataFrame:
+    if df is None or df.empty or "is_transport" not in df.columns:
+        return df
+
+    enriched = df.copy().reset_index(drop=True)
+    for idx in enriched.index[enriched["is_transport"] == True].tolist():
+        prev_row, next_row = _find_transport_context_rows(enriched, idx)
+        if prev_row is None or next_row is None:
+            continue
+
+        origin_name = safe_text(prev_row.get("destination"), "出発地")
+        destination_name = safe_text(next_row.get("destination"), "目的地")
+
+        origin_lat = prev_row.get("latitude")
+        origin_lng = prev_row.get("longitude")
+        destination_lat = next_row.get("latitude")
+        destination_lng = next_row.get("longitude")
+        if any(pd.isna(v) for v in [origin_lat, origin_lng, destination_lat, destination_lng]):
+            continue
+
+        try:
+            distance_km = _haversine_km(float(origin_lat), float(origin_lng), float(destination_lat), float(destination_lng))
+        except Exception:
+            continue
+
+        mode = safe_text(enriched.at[idx, "transport_mode"], "").lower()
+        if not mode or mode == "-":
+            preferred = safe_text(planning_state.get("transport_style"), "自動（おすすめ）")
+            mode = {
+                "徒歩メイン": "walk",
+                "電車メイン": "train",
+                "タクシー": "taxi",
+                "レンタカー": "car",
+            }.get(preferred, "car" if distance_km >= 1.0 else "walk")
+            enriched.at[idx, "transport_mode"] = mode
+
+        departure_date = safe_text(enriched.at[idx, "date"], safe_text(planning_state.get("start_date"), ""))
+        departure_time = safe_text(enriched.at[idx, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
+
+        llm_result = _llm_transport_duration_estimate(
+            origin_name=origin_name,
+            destination_name=destination_name,
+            mode=mode,
+            departure_date=departure_date,
+            departure_time=departure_time,
+            distance_km=distance_km,
+            origin_lat=float(origin_lat),
+            origin_lng=float(origin_lng),
+            destination_lat=float(destination_lat),
+            destination_lng=float(destination_lng),
+        )
+
+        if llm_result and llm_result.get("minutes"):
+            minutes = int(llm_result["minutes"])
+            label = f"約{minutes}分"
+            enriched.at[idx, "route_data_source"] = "llm_estimate"
+            enriched.at[idx, "estimated_duration_label"] = label
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+            enriched.at[idx, "duration_minutes"] = minutes
+            enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+            enriched.at[idx, "route_line_simple"] = f"{origin_name} → {destination_name} / {label}"
+            enriched.at[idx, "route_from"] = origin_name
+            enriched.at[idx, "route_to"] = destination_name
+            reason = str(llm_result.get("reason", "")).strip()
+            if reason:
+                enriched.at[idx, "one_point"] = reason[:120]
+        else:
+            minutes = _estimate_minutes_from_distance(distance_km, mode)
+            label = f"約{minutes}分（推測）"
+            enriched.at[idx, "route_data_source"] = "distance_estimate"
+            enriched.at[idx, "estimated_duration_label"] = label
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+            enriched.at[idx, "duration_minutes"] = minutes
+            enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+            enriched.at[idx, "route_line_simple"] = f"{origin_name} → {destination_name} / {label}"
+            enriched.at[idx, "route_from"] = origin_name
+            enriched.at[idx, "route_to"] = destination_name
+
+    return enriched
 
 
 
@@ -742,6 +1021,13 @@ def apply_confirmation_payload(payload: Dict[str, str]) -> None:
 def build_route_source_text(row_dict: Dict) -> str:
     source = safe_text(row_dict.get("route_data_source"), "").lower()
     departure_at = safe_text(row_dict.get("route_departure_at"), "")
+    duration_label = safe_text(row_dict.get("estimated_duration_label"), "")
+    if source == "llm_estimate":
+        if departure_at and departure_at != "-":
+            return f"移動時間: LLM概算 {duration_label} / {departure_at} 出発想定"
+        return f"移動時間: LLM概算 {duration_label}"
+    if source == "distance_estimate":
+        return f"移動時間: {duration_label or '距離ベース推定（推測）'}"
     if source == "google_routes_api":
         if departure_at and departure_at != "-":
             return f"移動時間: 実検索（Google Routes / {departure_at} 出発想定）"
@@ -1084,9 +1370,11 @@ def apply_execution_replan_preview() -> None:
     df2_new = normalize_phase2_dataframe(df2_new, replanning_state)
 
     router = Phase3Routing(logger=log_event)
-    df3_new = router.insert_routes(df2_new, user_request=draft, transport_preference=replanning_state["transport_style"])
+    with _disable_live_routes_api_for_phase3():
+        df3_new = router.insert_routes(df2_new, user_request=draft, transport_preference=replanning_state["transport_style"])
     if df3_new is None or df3_new.empty:
         raise ValueError("組み直し案から完成旅程を作れませんでした。")
+    df3_new = enrich_transport_rows_with_estimates(df3_new, replanning_state, use_case="execution")
 
     engine.replace_future_plan(df3_new, reason=st.session_state.get("replan_preview_request", "自由組み直しを反映"))
     st.session_state.df_phase3 = engine.get_updated_dataframe()
@@ -1284,9 +1572,11 @@ def approve_and_build_phase2_phase3() -> None:
 
     log_event("Phase3", f"移動経路挿入を開始。transport_style={s['transport_style']}")
     router = Phase3Routing(logger=log_event)
-    df3 = router.insert_routes(df2, user_request=build_phase1_request_text(), transport_preference=s["transport_style"])
+    with _disable_live_routes_api_for_phase3():
+        df3 = router.insert_routes(df2, user_request=build_phase1_request_text(), transport_preference=s["transport_style"])
     if df3 is None or df3.empty:
         raise ValueError("フェーズ3で最終旅程表を生成できませんでした。")
+    df3 = enrich_transport_rows_with_estimates(df3, s, use_case="final_itinerary")
 
     gap_messages = inspect_transport_step_gaps(df3)
     if gap_messages:
@@ -1438,13 +1728,15 @@ def rebuild_final_itinerary_from_phase2(updated_df2: pd.DataFrame, reason: str) 
     normalized_df2 = normalize_phase2_dataframe(updated_df2.copy(), st.session_state.planning_state)
     router = Phase3Routing(logger=log_event)
     request_text = st.session_state.trip_plan or st.session_state.trip_plan_draft or build_phase1_request_text()
-    df3 = router.insert_routes(
-        normalized_df2,
-        user_request=request_text,
-        transport_preference=st.session_state.planning_state["transport_style"],
-    )
+    with _disable_live_routes_api_for_phase3():
+        df3 = router.insert_routes(
+            normalized_df2,
+            user_request=request_text,
+            transport_preference=st.session_state.planning_state["transport_style"],
+        )
     if df3 is None or df3.empty:
         raise ValueError("完成旅程の再構築に失敗しました。")
+    df3 = enrich_transport_rows_with_estimates(df3, st.session_state.planning_state, use_case="final_itinerary")
 
     st.session_state.df_phase2 = normalized_df2.reset_index(drop=True)
     st.session_state.df_phase3 = df3.reset_index(drop=True)
@@ -1848,8 +2140,8 @@ with st.sidebar:
 
         if st.button("🚨 Routes診断を実行", use_container_width=True, key="run_routes_diagnostic"):
             try:
-                from route_diagnostic import geocode_place
-
+                from route_diagnostic import geocode_place, ROUTES_URL
+                import requests
                 api_key = st.secrets.get("MAPS_API_KEY") or os.getenv("MAPS_API_KEY")
                 if not api_key:
                     st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
@@ -1859,15 +2151,7 @@ with st.sidebar:
                     origin_clean = origin_raw.strip()
                     destination_clean = destination_raw.strip()
                     departure_raw = str(diag_departure or "").strip()
-                    departure_dt = parse_route_diagnostic_departure_datetime(departure_raw)
                     departure_iso = parse_route_diagnostic_departure_iso(departure_raw)
-
-                    routes_client = RoutesAPI(api_key=api_key)
-                    should_use_departure = routes_client.should_include_departure_time(
-                        mode=diag_mode,
-                        departure_time=departure_dt,
-                        use_case="diagnostic",
-                    )
 
                     st.write("geocode入力値")
                     st.json({
@@ -1877,26 +2161,23 @@ with st.sidebar:
                         "destination_clean": destination_clean,
                         "mode": diag_mode,
                         "departure_raw": departure_raw,
-                        "departure_iso": departure_iso if should_use_departure else "<not_used>",
+                        "departure_iso": departure_iso or departure_raw,
                     })
 
                     origin = geocode_place(origin_clean, api_key)
                     destination = geocode_place(destination_clean, api_key)
                     st.write("geocode結果")
                     st.json({"origin": origin, "destination": destination})
-
                     if not origin or not destination:
                         st.error("地名解決に失敗しました。まずは geocode入力値 の origin_clean / destination_clean が駅名やスポット名だけになっているか確認してください。")
                     else:
-                        body = routes_client.build_request_body(
-                            origin=(float(origin[0]), float(origin[1])),
-                            destination=(float(destination[0]), float(destination[1])),
-                            mode=diag_mode,
-                            departure_time=departure_dt,
-                            use_case="diagnostic",
-                        )
-                        headers = routes_client.build_headers()
-
+                        body = build_route_diagnostic_body(origin, destination, diag_mode, departure_raw)
+                        headers = {
+                            "Content-Type": "application/json",
+                            "X-Goog-Api-Key": api_key,
+                            # 診断ではまずレスポンス全体を確認する
+                            "X-Goog-FieldMask": "*",
+                        }
                         masked_headers = dict(headers)
                         if masked_headers.get("X-Goog-Api-Key"):
                             raw_key = str(masked_headers["X-Goog-Api-Key"])
@@ -1904,24 +2185,20 @@ with st.sidebar:
                                 masked_headers["X-Goog-Api-Key"] = raw_key[:4] + "..." + raw_key[-4:]
                             else:
                                 masked_headers["X-Goog-Api-Key"] = "***"
-
                         st.write("request headers")
                         st.json(masked_headers)
                         st.write("request body")
                         st.json(body)
-
-                        response = requests.post(routes_client.BASE_URL, json=body, headers=headers, timeout=20)
+                        response = requests.post(ROUTES_URL, json=body, headers=headers, timeout=20)
                         st.write(f"HTTP status: {response.status_code}")
                         st.write("response headers")
                         st.json(dict(response.headers))
                         st.write("response text")
                         st.code(response.text or "<empty response>", language="json")
-
                         try:
                             data = response.json() if response.text.strip() else {}
                         except Exception:
                             data = {"raw_text": response.text}
-
                         st.write("response")
                         st.json(data)
                         routes = data.get("routes") if isinstance(data, dict) else None
