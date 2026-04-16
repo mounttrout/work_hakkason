@@ -413,15 +413,121 @@ def _estimate_minutes_from_distance(distance_km: float, mode: str) -> int:
             return max(12, int(round((km / 30.0) * 60)) + 8)
         if km < 120:
             return max(25, int(round((km / 70.0) * 60)) + 12)
-        return max(60, int(round((km / 160.0) * 60)) + 15)
+        if km < 250:
+            return max(75, int(round((km / 110.0) * 60)) + 20)
+        if km < 600:
+            return max(130, int(round((km / 140.0) * 60)) + 30)
+        return max(240, int(round((km / 180.0) * 60)) + 45)
 
     if km < 5:
         speed = 22.0
     elif km < 30:
         speed = 35.0
+    elif km < 120:
+        speed = 55.0
+    elif km < 300:
+        speed = 70.0
     else:
-        speed = 60.0
+        speed = 80.0
     return max(5, int(round((km / speed) * 60)))
+
+
+def _contains_international_signal(*texts: str) -> bool:
+    merged = " ".join(str(t or "") for t in texts).lower()
+    keywords = [
+        "international", "airport", "airports", "空港", "国際", "海外", "渡航",
+        "france", "paris", "london", "new york", "los angeles", "seoul", "taipei",
+        "beijing", "shanghai", "hong kong", "bangkok", "singapore", "rome", "milan",
+        "sydney", "hawaii", "honolulu", "guam", "berlin", "madrid", "vancouver",
+        "パリ", "ロンドン", "ニューヨーク", "ロサンゼルス", "ソウル", "台北", "北京",
+        "上海", "香港", "バンコク", "シンガポール", "ローマ", "ミラノ", "シドニー",
+        "ハワイ", "ホノルル", "グアム", "ベルリン", "マドリード", "バンクーバー",
+        "frankfurt", "amsterdam", "dubai", "istanbul", "san francisco", "toronto",
+        "フランクフルト", "アムステルダム", "ドバイ", "イスタンブール", "トロント",
+    ]
+    return any(k in merged for k in keywords)
+
+
+def _validate_llm_minutes(distance_km: float, mode: str, minutes: int, origin_name: str, destination_name: str) -> bool:
+    mode_key = str(mode or "walk").lower()
+    km = max(float(distance_km or 0), 0.1)
+    m = int(minutes)
+    if m <= 0 or m > 24 * 60:
+        return False
+
+    if _contains_international_signal(origin_name, destination_name):
+        return False
+
+    if mode_key in {"walk", "walking", "徒歩"}:
+        minimum = max(5, int((km / 7.0) * 60))
+        maximum = max(minimum, int((km / 2.0) * 60) + 30)
+    elif mode_key in {"bike", "bicycle", "自転車"}:
+        minimum = max(3, int((km / 25.0) * 60))
+        maximum = max(minimum, int((km / 8.0) * 60) + 20)
+    elif mode_key in {"train", "transit", "電車"}:
+        if km < 5:
+            minimum, maximum = 8, 45
+        elif km < 50:
+            minimum, maximum = 15, 90
+        elif km < 150:
+            minimum, maximum = 35, 150
+        elif km < 350:
+            minimum, maximum = 90, 300
+        elif km < 700:
+            minimum, maximum = 150, 480
+        else:
+            minimum, maximum = 240, 900
+    else:
+        if km < 5:
+            minimum, maximum = 5, 40
+        elif km < 50:
+            minimum, maximum = 10, 120
+        elif km < 150:
+            minimum, maximum = 45, 240
+        elif km < 350:
+            minimum, maximum = 120, 420
+        else:
+            minimum, maximum = 180, 900
+
+    return minimum <= m <= maximum
+
+
+def _build_safe_distance_fallback(distance_km: float, mode: str, origin_name: str, destination_name: str) -> Dict[str, object]:
+    mode_key = str(mode or "walk").lower()
+    km = max(float(distance_km or 0), 0.1)
+    international_like = _contains_international_signal(origin_name, destination_name)
+
+    if international_like:
+        if mode_key in {"train", "transit", "電車"}:
+            return {"minutes": 480, "label": "約6〜10時間（推測）", "source": "distance_estimate", "note": "国際・航空を含む可能性があるため概算です"}
+        return {"minutes": 720, "label": "約8〜14時間（推測）", "source": "distance_estimate", "note": "国際・航空を含む可能性があるため概算です"}
+
+    if mode_key in {"train", "transit", "電車"}:
+        if km < 5:
+            minutes = _estimate_minutes_from_distance(km, mode_key)
+            return {"minutes": minutes, "label": f"約{minutes}分（推測）", "source": "distance_estimate", "note": "近距離の電車移動を距離ベースで推定"}
+        if km < 50:
+            lo, hi = 20, 70
+        elif km < 150:
+            lo, hi = 45, 120
+        elif km < 350:
+            lo, hi = 120, 240
+        elif km < 700:
+            lo, hi = 180, 420
+        else:
+            lo, hi = 300, 720
+        return {"minutes": int(round((lo + hi) / 2)), "label": f"約{lo}〜{hi}分（推測）", "source": "distance_estimate", "note": "長距離の鉄道移動を距離帯ベースで推定"}
+
+    if mode_key in {"walk", "walking", "徒歩"} and km > 20:
+        lo, hi = 240, 999
+        return {"minutes": 360, "label": "長距離移動のため要確認（推測表示）", "source": "distance_estimate", "note": "徒歩としては現実的でない長距離のため要確認"}
+
+    minutes = _estimate_minutes_from_distance(km, mode_key)
+    if km >= 150 and mode_key in {"car", "drive", "private_car", "rental_car", "taxi", "driving"}:
+        lo = max(90, int(round(minutes * 0.8)))
+        hi = int(round(minutes * 1.35))
+        return {"minutes": int(round((lo + hi) / 2)), "label": f"約{lo}〜{hi}分（推測）", "source": "distance_estimate", "note": "長距離の道路移動を距離帯ベースで推定"}
+    return {"minutes": minutes, "label": f"約{minutes}分（推測）", "source": "distance_estimate", "note": "距離ベース推定"}
 
 
 def _add_minutes_to_clock(start_time: str, minutes: int) -> str:
@@ -451,7 +557,7 @@ def _llm_transport_duration_estimate(
 あなたは旅行アプリの移動時間推定補助です。
 
 次の移動について、一般的に妥当な『概算移動時間』だけを保守的に推定してください。
-不確実なら minutes を null にしてください。
+不確実なら minutes を null にしてください。長距離は過小評価しないでください。
 
 【重要ルール】
 - 路線名・道路名・乗換回数などを、確信がないのに捏造しない
@@ -459,6 +565,8 @@ def _llm_transport_duration_estimate(
 - minutes は整数
 - confidence は high / medium / low のいずれか
 - JSON だけを返す
+- 直線距離が長い場合に、都市内移動のような過小な minutes を出さない
+- 出せない場合は minutes を null にする
 
 【入力】
 - 出発地名: {origin_name}
@@ -581,7 +689,13 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             destination_lng=float(destination_lng),
         )
 
-        if llm_result and llm_result.get("minutes"):
+        if llm_result and llm_result.get("minutes") and _validate_llm_minutes(
+            distance_km=distance_km,
+            mode=mode,
+            minutes=int(llm_result["minutes"]),
+            origin_name=origin_name,
+            destination_name=destination_name,
+        ):
             minutes = int(llm_result["minutes"])
             label = f"約{minutes}分"
             enriched.at[idx, "route_data_source"] = "llm_estimate"
@@ -596,9 +710,12 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             if reason:
                 enriched.at[idx, "one_point"] = reason[:120]
         else:
-            minutes = _estimate_minutes_from_distance(distance_km, mode)
-            label = f"約{minutes}分（推測）"
-            enriched.at[idx, "route_data_source"] = "distance_estimate"
+            if llm_result and llm_result.get("minutes"):
+                log_event("移動時間推定", f"LLM概算を棄却: {origin_name} → {destination_name} / {llm_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+            fallback = _build_safe_distance_fallback(distance_km, mode, origin_name, destination_name)
+            minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
+            label = str(fallback.get("label", f"約{minutes}分（推測）"))
+            enriched.at[idx, "route_data_source"] = str(fallback.get("source", "distance_estimate"))
             enriched.at[idx, "estimated_duration_label"] = label
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             enriched.at[idx, "duration_minutes"] = minutes
@@ -606,6 +723,9 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             enriched.at[idx, "route_line_simple"] = f"{origin_name} → {destination_name} / {label}"
             enriched.at[idx, "route_from"] = origin_name
             enriched.at[idx, "route_to"] = destination_name
+            note = str(fallback.get("note", "")).strip()
+            if note:
+                enriched.at[idx, "one_point"] = note[:120]
 
     return enriched
 
