@@ -448,6 +448,89 @@ def _contains_international_signal(*texts: str) -> bool:
     return any(k in merged for k in keywords)
 
 
+def _contains_air_travel_signal(*texts: str) -> bool:
+    merged = " ".join(str(t or "") for t in texts).lower()
+    keywords = [
+        "航空", "航空便", "フライト", "搭乗", "出国", "入国", "経由", "乗り継ぎ", "チェックイン",
+        "空港", "airport", "flight", "boarding", "terminal", "layover", "transit", "transfer",
+        "kmq", "hnd", "nrt", "kix", "itm", "sin", "icn", "tpe", "lax", "jfk", "cdg", "lhr",
+    ]
+    return any(k in merged for k in keywords)
+
+
+def _is_air_transport_context(transport_row: pd.Series | Dict, prev_row: pd.Series | Dict, next_row: pd.Series | Dict) -> bool:
+    texts = [
+        safe_text((transport_row or {}).get("destination"), ""),
+        safe_text((transport_row or {}).get("purpose"), ""),
+        safe_text((transport_row or {}).get("genre"), ""),
+        safe_text((transport_row or {}).get("one_point"), ""),
+        safe_text((prev_row or {}).get("destination"), ""),
+        safe_text((prev_row or {}).get("purpose"), ""),
+        safe_text((prev_row or {}).get("one_point"), ""),
+        safe_text((next_row or {}).get("destination"), ""),
+        safe_text((next_row or {}).get("purpose"), ""),
+        safe_text((next_row or {}).get("one_point"), ""),
+    ]
+    return _contains_air_travel_signal(*texts)
+
+
+def _extract_minutes_from_text(*texts: str) -> Optional[int]:
+    merged = " ".join(str(t or "") for t in texts)
+    if not merged.strip():
+        return None
+    patterns = [
+        r"(\d+)\s*分",
+        r"🕒\s*(\d+)\s*分",
+        r"約\s*(\d+)\s*分",
+        r"(\d+)\s*時間\s*(\d+)\s*分",
+        r"約\s*(\d+)\s*時間\s*(\d+)\s*分",
+        r"(\d+)\s*時間",
+        r"約\s*(\d+)\s*時間",
+    ]
+    import re as _re
+    for pat in patterns:
+        m = _re.search(pat, merged)
+        if not m:
+            continue
+        if len(m.groups()) == 2:
+            return int(m.group(1))*60 + int(m.group(2))
+        return int(m.group(1)) * (60 if "時間" in pat and "分" not in pat else 1)
+    return None
+
+
+def _build_air_transport_estimate(prev_row: pd.Series | Dict, transport_row: pd.Series | Dict, next_row: pd.Series | Dict, departure_date: str, departure_time: str) -> Dict[str, object]:
+    prev_texts = [safe_text((prev_row or {}).get("destination"), ""), safe_text((prev_row or {}).get("purpose"), ""), safe_text((prev_row or {}).get("one_point"), "")]
+    transport_texts = [safe_text((transport_row or {}).get("destination"), ""), safe_text((transport_row or {}).get("purpose"), ""), safe_text((transport_row or {}).get("one_point"), "")]
+    next_texts = [safe_text((next_row or {}).get("destination"), ""), safe_text((next_row or {}).get("purpose"), ""), safe_text((next_row or {}).get("one_point"), "")]
+    minutes = _extract_minutes_from_text(*prev_texts, *transport_texts, *next_texts)
+    origin_name = safe_text((prev_row or {}).get("destination"), "出発空港")
+    destination_name = safe_text((next_row or {}).get("destination"), "到着空港")
+    if minutes is None:
+        if _contains_international_signal(origin_name, destination_name, *transport_texts, *next_texts):
+            minutes = 600
+            label = "約8〜12時間（推測）"
+            note = "国際・航空を含む可能性があるため概算です"
+        else:
+            minutes = 180
+            label = "約2〜4時間（推測）"
+            note = "航空移動を含む可能性があるため概算です"
+        source = "air_distance_estimate"
+    else:
+        label = f"約{minutes}分"
+        note = "プラン確認の航空移動時間を保持"
+        source = "air_plan_preserved"
+    return {
+        "minutes": minutes,
+        "label": label,
+        "source": source,
+        "note": note,
+        "route_from": origin_name,
+        "route_to": destination_name,
+        "route_line_simple": f"{origin_name} → {destination_name} / ✈️ {label}",
+        "route_departure_at": f"{departure_date} {departure_time}".strip(),
+        "transport_mode": "air",
+    }
+
 def _validate_llm_minutes(distance_km: float, mode: str, minutes: int, origin_name: str, destination_name: str) -> bool:
     mode_key = str(mode or "walk").lower()
     km = max(float(distance_km or 0), 0.1)
@@ -675,6 +758,23 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
 
         departure_date = safe_text(enriched.at[idx, "date"], safe_text(planning_state.get("start_date"), ""))
         departure_time = safe_text(enriched.at[idx, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
+
+        if _is_air_transport_context(enriched.iloc[idx], prev_row, next_row):
+            air = _build_air_transport_estimate(prev_row, enriched.iloc[idx], next_row, departure_date, departure_time)
+            minutes = int(air.get("minutes", 180))
+            enriched.at[idx, "route_data_source"] = str(air.get("source", "air_plan_preserved"))
+            enriched.at[idx, "estimated_duration_label"] = str(air.get("label", f"約{minutes}分"))
+            enriched.at[idx, "route_departure_at"] = str(air.get("route_departure_at", f"{departure_date} {departure_time}".strip()))
+            enriched.at[idx, "duration_minutes"] = minutes
+            enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+            enriched.at[idx, "route_line_simple"] = str(air.get("route_line_simple", f"{origin_name} → {destination_name} / ✈️ 約{minutes}分"))
+            enriched.at[idx, "route_from"] = str(air.get("route_from", origin_name))
+            enriched.at[idx, "route_to"] = str(air.get("route_to", destination_name))
+            enriched.at[idx, "transport_mode"] = str(air.get("transport_mode", "air"))
+            note = str(air.get("note", "")).strip()
+            if note:
+                enriched.at[idx, "one_point"] = note[:120]
+            continue
 
         llm_result = _llm_transport_duration_estimate(
             origin_name=origin_name,
@@ -1142,16 +1242,20 @@ def build_route_source_text(row_dict: Dict) -> str:
     source = safe_text(row_dict.get("route_data_source"), "").lower()
     departure_at = safe_text(row_dict.get("route_departure_at"), "")
     duration_label = safe_text(row_dict.get("estimated_duration_label"), "")
-    if source == "llm_estimate":
-        if departure_at and departure_at != "-":
-            return f"移動時間: LLM概算 {duration_label} / {departure_at} 出発想定"
-        return f"移動時間: LLM概算 {duration_label}"
-    if source == "distance_estimate":
-        return f"移動時間: {duration_label or '距離ベース推定（推測）'}"
     if source == "google_routes_api":
         if departure_at and departure_at != "-":
             return f"移動時間: 実検索（Google Routes / {departure_at} 出発想定）"
         return "移動時間: 実検索（Google Routes）"
+    if source == "llm_estimate":
+        if departure_at and departure_at != "-":
+            return f"移動時間: LLM概算 {duration_label} / {departure_at} 出発想定"
+        return f"移動時間: LLM概算 {duration_label}"
+    if source in {"air_plan_preserved", "air_distance_estimate"}:
+        if departure_at and departure_at != "-":
+            return f"移動時間: ✈️ {duration_label} / {departure_at} 出発想定"
+        return f"移動時間: ✈️ {duration_label}"
+    if duration_label and duration_label != "-":
+        return f"移動時間: {duration_label}"
     return "移動時間: 推定値（フォールバック）"
 
 
