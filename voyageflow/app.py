@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
+import requests
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -33,8 +34,8 @@ from maps.routes_api import RoutesAPI
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.6-llm-travel-time-fallback"
-APP_UPDATED_DATE = "2026-04-16"
+APP_VERSION_NAME = "v6.2.10-ground-estimate-weather-api"
+APP_UPDATED_DATE = "2026-04-17"
 
 
 # =========================================================
@@ -100,13 +101,191 @@ st.markdown(
 )
 
 
+# =========================================================
+# 天候API（Open-Meteo） + モック fallback
+# =========================================================
+_WEATHER_CODE_LABELS = {
+    0: "快晴", 1: "晴れ", 2: "一部くもり", 3: "くもり",
+    45: "霧", 48: "着氷性の霧",
+    51: "弱い霧雨", 53: "霧雨", 55: "強い霧雨",
+    61: "弱い雨", 63: "雨", 65: "強い雨",
+    71: "弱い雪", 73: "雪", 75: "大雪",
+    80: "にわか雨", 81: "強いにわか雨", 82: "激しいにわか雨",
+    95: "雷雨", 96: "雷雨", 99: "激しい雷雨",
+}
+
+
+def _weather_code_label(code: int) -> str:
+    try:
+        return _WEATHER_CODE_LABELS.get(int(code), f"天気コード:{code}")
+    except Exception:
+        return "不明"
+
+
+@st.cache_data(ttl=60 * 60)
+def _weather_geocode(place_name: str) -> Optional[Dict[str, object]]:
+    query = str(place_name or "").strip()
+    if not query:
+        return None
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": query, "count": 1, "language": "ja", "format": "json"}
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("results") or []
+    if not results:
+        return None
+    row = results[0]
+    return {
+        "name": row.get("name") or query,
+        "latitude": row.get("latitude"),
+        "longitude": row.get("longitude"),
+        "country": row.get("country", ""),
+        "admin1": row.get("admin1", ""),
+        "timezone": row.get("timezone") or "Asia/Tokyo",
+    }
+
+
+@st.cache_data(ttl=60 * 30)
+def _weather_forecast_daily(lat: float, lng: float, timezone_name: str, start_date: str, end_date: str) -> Optional[Dict[str, object]]:
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lng,
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "timezone": timezone_name or "Asia/Tokyo",
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    resp = requests.get(url, params=params, timeout=12)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@st.cache_data(ttl=60 * 30)
+def _weather_forecast_hourly(lat: float, lng: float, timezone_name: str) -> Optional[Dict[str, object]]:
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lng,
+        "hourly": "temperature_2m,precipitation_probability,weather_code",
+        "forecast_days": 2,
+        "timezone": timezone_name or "Asia/Tokyo",
+    }
+    resp = requests.get(url, params=params, timeout=12)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _weather_line_for_day(day_data: Dict[str, object]) -> str:
+    label = _weather_code_label(day_data.get("weather_code", -1))
+    tmax = day_data.get("tmax")
+    tmin = day_data.get("tmin")
+    rain = day_data.get("precip")
+    temp_text = ""
+    if tmax is not None and tmin is not None:
+        temp_text = f" / {tmin:.0f}〜{tmax:.0f}℃"
+    rain_text = ""
+    if rain is not None:
+        rain_text = f" / 降水確率 {int(rain)}%"
+    return f"{day_data.get('date')}: {label}{temp_text}{rain_text}"
+
+
+def _build_live_weather_context(planning_state: Dict[str, object], context_label: str = "plan") -> Optional[Dict[str, object]]:
+    start_date_text = safe_text(planning_state.get("start_date"), "")
+    if not start_date_text:
+        return None
+    try:
+        start_date = datetime.strptime(start_date_text, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+    today = datetime.now().date()
+    day_offset = (start_date - today).days
+
+    # NOTE: Open-Meteoの無料forecastが安定する近未来だけAPI連携し、それ以外はモックへfallback
+    if day_offset < 0 or day_offset > 7:
+        return None
+
+    destination_name = safe_text(planning_state.get("primary_destination"), "") or safe_text(planning_state.get("return_place"), "")
+    departure_name = safe_text(planning_state.get("departure_place"), "")
+    if not destination_name:
+        return None
+
+    try:
+        dest_geo = _weather_geocode(destination_name)
+        dep_geo = _weather_geocode(departure_name) if departure_name else None
+        if not dest_geo or dest_geo.get("latitude") is None or dest_geo.get("longitude") is None:
+            return None
+
+        tz_name = str(dest_geo.get("timezone") or "Asia/Tokyo")
+        daily_raw = _weather_forecast_daily(float(dest_geo["latitude"]), float(dest_geo["longitude"]), tz_name, start_date_text, start_date_text)
+        daily = daily_raw.get("daily") or {}
+        if not daily or not daily.get("time"):
+            return None
+
+        row = {
+            "date": str(daily["time"][0]),
+            "weather_code": daily.get("weather_code", [None])[0],
+            "tmax": daily.get("temperature_2m_max", [None])[0],
+            "tmin": daily.get("temperature_2m_min", [None])[0],
+            "precip": daily.get("precipitation_probability_max", [None])[0],
+        }
+        detail_lines = [_weather_line_for_day(row)]
+        headline = f"{destination_name}の天気: {_weather_code_label(row['weather_code'])}"
+        summary = f"{row['date']} の {destination_name} は {_weather_code_label(row['weather_code'])}、{row['tmin']:.0f}〜{row['tmax']:.0f}℃、降水確率 {int(row['precip'])}% の見込みです。"
+
+        gap_advice = "出発地との大きな差はなさそうです。"
+        dep_label = departure_name or "出発地"
+        if dep_geo and dep_geo.get("latitude") is not None and dep_geo.get("longitude") is not None:
+            dep_daily_raw = _weather_forecast_daily(float(dep_geo["latitude"]), float(dep_geo["longitude"]), str(dep_geo.get("timezone") or tz_name), start_date_text, start_date_text)
+            dep_daily = dep_daily_raw.get("daily") or {}
+            if dep_daily and dep_daily.get("temperature_2m_max"):
+                dep_tmax = dep_daily.get("temperature_2m_max", [None])[0]
+                dep_tmin = dep_daily.get("temperature_2m_min", [None])[0]
+                if dep_tmax is not None and row['tmax'] is not None:
+                    diff = float(row['tmax']) - float(dep_tmax)
+                    if abs(diff) >= 4:
+                        direction = "暖かい" if diff > 0 else "涼しい"
+                        gap_advice = f"到着地は出発地より {abs(diff):.0f}℃ほど{direction}見込みです。服装を調整してください。"
+
+        packing = "折りたたみ傘があると安心です。" if int(row['precip'] or 0) >= 40 else "薄手の羽織りがあると安心です。"
+        execution_hint = "雨が強い場合は屋外スポットを後ろ倒しにする候補を提示します。" if int(row['precip'] or 0) >= 40 else "極端な天候変化がなければそのまま進行可能です。"
+        mode_label = "実天気API"
+        date_range_label = start_date_text
+
+        return {
+            "mode_label": mode_label,
+            "date_range_label": date_range_label,
+            "headline": headline,
+            "summary": summary,
+            "detail_lines": detail_lines,
+            "packing": packing,
+            "departure_label": dep_label,
+            "destination_label": destination_name,
+            "gap_advice": gap_advice,
+            "execution_hint": execution_hint,
+        }
+    except Exception as e:
+        log_event("天候API", f"実天気取得に失敗したためモックへfallback: {e}", level="warning")
+        return None
+
+
+def _get_weather_context(planning_state: Dict[str, object], context_label: str = "plan") -> Dict[str, object]:
+    live = _build_live_weather_context(planning_state, context_label=context_label)
+    if live:
+        return live
+    return build_mock_weather_context(planning_state)
+
+
 def render_mock_weather_panel(planning_state: Dict[str, object], context_label: str = "plan") -> None:
-    weather_context = build_mock_weather_context(planning_state)
-    caption_suffix = "※モック表示です。後で実天気APIに差し替え可能な形にしています。"
+    weather_context = _get_weather_context(planning_state, context_label=context_label)
+    mode_label = safe_text(weather_context.get("mode_label"), "モック")
+    caption_suffix = "※7日超の先日付やAPI失敗時はモックに自動fallbackします。"
 
     with st.container():
         st.markdown("### 🌤️ 天候メモ")
-        st.caption(f"{weather_context['mode_label']} / {weather_context['date_range_label']} / {caption_suffix}")
+        st.caption(f"{mode_label} / {weather_context['date_range_label']} / {caption_suffix}")
         st.info(f"**{weather_context['headline']}**\n\n{weather_context['summary']}")
 
         d1, d2 = st.columns(2)
@@ -126,7 +305,7 @@ def render_mock_weather_panel(planning_state: Dict[str, object], context_label: 
 
 
 def build_weather_event_detail(planning_state: Dict[str, object]) -> str:
-    weather_context = build_mock_weather_context(planning_state)
+    weather_context = _get_weather_context(planning_state, context_label="execution")
     summary = str(weather_context.get("summary", "") or "")
     gap_advice = str(weather_context.get("gap_advice", "") or "")
     execution_hint = str(weather_context.get("execution_hint", "") or "")
@@ -467,7 +646,7 @@ def _contains_air_travel_signal(*texts: str) -> bool:
     merged = " ".join(str(t or "") for t in texts).lower()
     keywords = [
         "航空", "航空便", "フライト", "搭乗", "出国", "入国", "経由", "乗り継ぎ", "チェックイン",
-        "空港", "airport", "flight", "boarding", "terminal", "layover", "transit", "transfer",
+        "空港", "airport", "flight", "boarding", "terminal", "layover",
         "kmq", "hnd", "nrt", "kix", "itm", "sin", "icn", "tpe", "lax", "jfk", "cdg", "lhr",
     ]
     return any(k in merged for k in keywords)
@@ -772,9 +951,17 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             enriched.at[idx, "estimated_duration_label"] = ""
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             existing_note = safe_text(enriched.at[idx, "one_point"], "")
-            safety_note = "未実装・未解決課題: 実移動時間は推測でしか出せず、飛行機を含むと壊れるため app.py では再計算していません。"
+            safety_note = "未実装・未解決課題: 実移動時間はまだ推測中心で、飛行機を含む移動は app.py では再計算しません。"
             if safety_note not in existing_note:
                 enriched.at[idx, "one_point"] = (existing_note + " / " + safety_note).strip(" /")[:180]
+            continue
+
+        # --- 新幹線や列車名そのものを目的地にした行は、既存行程の時間を保持する ---
+        rail_service_like = any(token in f"{origin_name} {destination_name}" for token in ["新幹線", "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "サンダーバード", "しらさぎ", "つるぎ"])
+        if rail_service_like:
+            enriched.at[idx, "route_data_source"] = "ground_estimate_unavailable"
+            enriched.at[idx, "estimated_duration_label"] = ""
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             continue
 
         origin_lat = prev_row.get("latitude")
@@ -783,7 +970,7 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
         destination_lng = next_row.get("longitude")
         if any(pd.isna(v) for v in [origin_lat, origin_lng, destination_lat, destination_lng]):
             enriched.at[idx, "route_data_source"] = "ground_estimate_unavailable"
-            enriched.at[idx, "estimated_duration_label"] = "位置情報不足のため要確認"
+            enriched.at[idx, "estimated_duration_label"] = ""
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             continue
 
@@ -796,14 +983,18 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             continue
 
         mode = safe_text(enriched.at[idx, "transport_mode"], "").lower()
+        preferred = safe_text(planning_state.get("transport_style"), "自動（おすすめ）")
         if not mode or mode == "-":
-            preferred = safe_text(planning_state.get("transport_style"), "自動（おすすめ）")
             mode = {
                 "徒歩メイン": "walk",
                 "電車メイン": "train",
                 "タクシー": "taxi",
                 "レンタカー": "car",
-            }.get(preferred, "car" if distance_km >= 1.0 else "walk")
+            }.get(preferred, "train" if distance_km >= 2.0 else "walk")
+            enriched.at[idx, "transport_mode"] = mode
+        elif mode in {"car", "private_car"} and preferred == "電車メイン":
+            # 表示だけでもユーザー意図に寄せる
+            mode = "train"
             enriched.at[idx, "transport_mode"] = mode
 
         llm_result = _llm_transport_duration_estimate(
@@ -833,7 +1024,7 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             enriched.at[idx, "duration_minutes"] = minutes
             enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-            enriched.at[idx, "route_line_simple"] = f"{origin_name} → {destination_name} / {label}"
+            enriched.at[idx, "route_line_simple"] = f"{label}"
             enriched.at[idx, "route_from"] = origin_name
             enriched.at[idx, "route_to"] = destination_name
             reason = str(llm_result.get("reason", "")).strip()
@@ -850,7 +1041,7 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             enriched.at[idx, "duration_minutes"] = minutes
             enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-            enriched.at[idx, "route_line_simple"] = f"{origin_name} → {destination_name} / {label}"
+            enriched.at[idx, "route_line_simple"] = f"{label}"
             enriched.at[idx, "route_from"] = origin_name
             enriched.at[idx, "route_to"] = destination_name
             note = str(fallback.get("note", "")).strip()
@@ -1281,12 +1472,24 @@ def build_route_source_text(row_dict: Dict) -> str:
             return f"移動時間: LLM概算 {duration_label} / {departure_at} 出発想定"
         return f"移動時間: LLM概算 {duration_label}"
     if source == "non_ground_skipped":
-        return "移動時間: 未実装・未解決課題のため未上書き（飛行機を含むと壊れるため app.py では再計算しない）"
+        return "移動時間: 既存行程の時間を保持（航空・空港系は app.py で再計算しない）"
     if source == "ground_estimate_unavailable":
-        return "移動時間: 位置情報不足のため要確認"
+        return "移動時間: 位置情報不足のため既存行程の時間を保持"
     if duration_label and duration_label != "-":
         return f"移動時間: {duration_label}"
     return "移動時間: 推定値（フォールバック）"
+
+
+def build_transport_display_safe(row_dict: Dict) -> str:
+    """表示用の重複除去。`電車 電車 30分` のような二重表現を防ぐ。"""
+    base = safe_text(build_transport_display(row_dict), "")
+    if not base:
+        return "移動"
+    base = re.sub(r"\s+", " ", base).strip()
+    base = re.sub(r"^(徒歩|電車|タクシー|レンタカー|自家用車|自転車)\s+\1\b", r"\1", base)
+    base = base.replace("電車 電車", "電車").replace("徒歩 徒歩", "徒歩").replace("タクシー タクシー", "タクシー")
+    base = base.replace("レンタカー レンタカー", "レンタカー").replace("自家用車 自家用車", "自家用車")
+    return base
 
 
 def resolve_planning_state() -> Dict:
@@ -2203,7 +2406,7 @@ def render_itinerary_cards(
 
                     note = safe_text(row_dict.get("modification_note"), "")
                     status_text = f"状態: {status_label}"
-                    transport_display = build_transport_display(row_dict)
+                    transport_display = build_transport_display_safe(row_dict)
                     route_source_text = build_route_source_text(row_dict)
                     body = f"""
 <div class="vf-card {card_class}">
