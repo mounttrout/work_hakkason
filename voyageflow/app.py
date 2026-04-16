@@ -736,6 +736,19 @@ def _disable_live_routes_api_for_phase3():
 
 
 def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[str, object], use_case: str = "final_itinerary") -> pd.DataFrame:
+    """
+    完成旅程の transport row に対して、必要最小限の推定値だけを付与する。
+
+    方針:
+    - 短距離の地上移動だけ app.py 側で LLM概算 / 距離推定を行う
+    - 航空・空港・国際移動は app.py 側では一切上書きしない
+      （未実装・未解決課題。Phase2/Phase3 側で構造保持すべき領域）
+
+    TODO:
+    - 実移動時間は現在まだ推測中心
+    - 飛行機を含む移動は構造化層で transport type を保持しないと安全に扱えない
+    - app.py 表示層での後付け推定は地上短距離のみで運用する
+    """
     if df is None or df.empty or "is_transport" not in df.columns:
         return df
 
@@ -748,16 +761,38 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
         origin_name = safe_text(prev_row.get("destination"), "出発地")
         destination_name = safe_text(next_row.get("destination"), "目的地")
 
+        departure_date = safe_text(enriched.at[idx, "date"], safe_text(planning_state.get("start_date"), ""))
+        departure_time = safe_text(enriched.at[idx, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
+
+        # --- 安全策: 航空・空港・国際移動は app.py で再計算しない ---
+        # ここを無理に上書きすると「電車30分」等の破綻が起きるため、
+        # 現時点では元の構造化結果を尊重してスキップする。
+        if _is_air_transport_context(enriched.iloc[idx], prev_row, next_row):
+            enriched.at[idx, "route_data_source"] = "non_ground_skipped"
+            enriched.at[idx, "estimated_duration_label"] = ""
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+            existing_note = safe_text(enriched.at[idx, "one_point"], "")
+            safety_note = "未実装・未解決課題: 実移動時間は推測でしか出せず、飛行機を含むと壊れるため app.py では再計算していません。"
+            if safety_note not in existing_note:
+                enriched.at[idx, "one_point"] = (existing_note + " / " + safety_note).strip(" /")[:180]
+            continue
+
         origin_lat = prev_row.get("latitude")
         origin_lng = prev_row.get("longitude")
         destination_lat = next_row.get("latitude")
         destination_lng = next_row.get("longitude")
         if any(pd.isna(v) for v in [origin_lat, origin_lng, destination_lat, destination_lng]):
+            enriched.at[idx, "route_data_source"] = "ground_estimate_unavailable"
+            enriched.at[idx, "estimated_duration_label"] = "位置情報不足のため要確認"
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             continue
 
         try:
             distance_km = _haversine_km(float(origin_lat), float(origin_lng), float(destination_lat), float(destination_lng))
         except Exception:
+            enriched.at[idx, "route_data_source"] = "ground_estimate_unavailable"
+            enriched.at[idx, "estimated_duration_label"] = "距離計算失敗のため要確認"
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             continue
 
         mode = safe_text(enriched.at[idx, "transport_mode"], "").lower()
@@ -770,26 +805,6 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
                 "レンタカー": "car",
             }.get(preferred, "car" if distance_km >= 1.0 else "walk")
             enriched.at[idx, "transport_mode"] = mode
-
-        departure_date = safe_text(enriched.at[idx, "date"], safe_text(planning_state.get("start_date"), ""))
-        departure_time = safe_text(enriched.at[idx, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
-
-        if _is_air_transport_context(enriched.iloc[idx], prev_row, next_row):
-            air = _build_air_transport_estimate(prev_row, enriched.iloc[idx], next_row, departure_date, departure_time)
-            minutes = int(air.get("minutes", 180))
-            enriched.at[idx, "route_data_source"] = str(air.get("source", "air_plan_preserved"))
-            enriched.at[idx, "estimated_duration_label"] = str(air.get("label", f"約{minutes}分"))
-            enriched.at[idx, "route_departure_at"] = str(air.get("route_departure_at", f"{departure_date} {departure_time}".strip()))
-            enriched.at[idx, "duration_minutes"] = minutes
-            enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-            enriched.at[idx, "route_line_simple"] = str(air.get("route_line_simple", f"{origin_name} → {destination_name} / ✈️ 約{minutes}分"))
-            enriched.at[idx, "route_from"] = str(air.get("route_from", origin_name))
-            enriched.at[idx, "route_to"] = str(air.get("route_to", destination_name))
-            enriched.at[idx, "transport_mode"] = str(air.get("transport_mode", "air"))
-            note = str(air.get("note", "")).strip()
-            if note:
-                enriched.at[idx, "one_point"] = note[:120]
-            continue
 
         llm_result = _llm_transport_duration_estimate(
             origin_name=origin_name,
@@ -1265,10 +1280,10 @@ def build_route_source_text(row_dict: Dict) -> str:
         if departure_at and departure_at != "-":
             return f"移動時間: LLM概算 {duration_label} / {departure_at} 出発想定"
         return f"移動時間: LLM概算 {duration_label}"
-    if source in {"air_plan_preserved", "air_distance_estimate"}:
-        if departure_at and departure_at != "-":
-            return f"移動時間: ✈️ {duration_label} / {departure_at} 出発想定"
-        return f"移動時間: ✈️ {duration_label}"
+    if source == "non_ground_skipped":
+        return "移動時間: 未実装・未解決課題のため未上書き（飛行機を含むと壊れるため app.py では再計算しない）"
+    if source == "ground_estimate_unavailable":
+        return "移動時間: 位置情報不足のため要確認"
     if duration_label and duration_label != "-":
         return f"移動時間: {duration_label}"
     return "移動時間: 推定値（フォールバック）"
