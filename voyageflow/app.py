@@ -25,16 +25,16 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.14-phase2-pair-route-experiment
+# 【バージョン名】VoyageFlow v6.2.15-sequential-llm-route-builder
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
-# - Phase2隣接ペアから移動区間を再構成する実験を app.py のみで追加
-# - transportっぽい行を正規化時に is_transport=True として補正
-# - Phase3では既存ルーターを使わず、Phase2再構成結果を最終旅程として採用
-# - 触った箇所には「修正箇所」コメントを付与
+# - Phase3の移動生成方針を変更し、Phase2の構造化データを順番どおりに解釈して隣接スポット間の移動カードを生成
+# - destination の意味解釈を増やさず、元の構造化データの各行をスポットとして尊重
+# - 移動時間は隣接スポットの自然文情報を LLM に渡して概算し、失敗時は既存時刻差分または保守的推定へフォールバック
+# - normalize_phase2_dataframe で既存 destination を不用意に上書きしないよう修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.14-phase2-pair-route-experiment"
+APP_VERSION_NAME = "v6.2.15-sequential-llm-route-builder"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -2168,219 +2168,216 @@ def generate_phase1_draft() -> None:
     st.session_state.active_tab = "plan_review"
 
 
-# =========================================================
-# 修正箇所: Phase2隣接ペアから移動区間を再構成する実験ロジック
-# =========================================================
-def _phase2_text_has_transport_signal(text: str) -> bool:
-    value = str(text or "").strip().lower()
-    if not value:
-        return False
-    keywords = [
-        "transport", "移動", "電車", "新幹線", "徒歩", "タクシー", "レンタカー", "バス", "flight", "train", "taxi",
-        "station", "駅", "空港", "airport", "かがやき", "のぞみ", "ひかり", "こだま", "サンダーバード", "しらさぎ", "つるぎ",
-    ]
-    return any(k in value for k in keywords)
+def _minutes_between_clock(start_time: str, end_time: str) -> Optional[int]:
+    try:
+        start = datetime.strptime(str(start_time).strip(), "%H:%M")
+        end = datetime.strptime(str(end_time).strip(), "%H:%M")
+        diff = int((end - start).total_seconds() // 60)
+        if diff < 0:
+            diff += 24 * 60
+        return diff
+    except Exception:
+        return None
 
 
-def _is_transport_like_phase2_row(row: pd.Series | Dict) -> bool:
-    purpose = safe_text(_row_value(row, "purpose", ""), "").lower()
-    genre = safe_text(_row_value(row, "genre", ""), "").lower()
-    destination = safe_text(_row_value(row, "destination", ""), "")
-    one_point = safe_text(_row_value(row, "one_point", ""), "")
-    if purpose == "transport":
-        return True
-    if genre in {"transport", "train", "taxi", "walk", "bus", "flight"}:
-        return True
-    if genre == "station" and _phase2_text_has_transport_signal(destination):
-        return True
-    return _phase2_text_has_transport_signal(destination) or _phase2_text_has_transport_signal(one_point)
-
-
-def _infer_transport_mode_for_experiment(row: pd.Series | Dict, planning_state: Dict[str, object]) -> str:
-    text = " ".join([
-        safe_text(_row_value(row, "purpose", ""), ""),
-        safe_text(_row_value(row, "genre", ""), ""),
-        safe_text(_row_value(row, "destination", ""), ""),
-        safe_text(_row_value(row, "one_point", ""), ""),
-    ]).lower()
-    if any(token in text for token in ["徒歩", "walk"]):
-        return "walk"
-    if any(token in text for token in ["タクシー", "taxi"]):
-        return "taxi"
-    if any(token in text for token in ["レンタカー", "car", "drive"]):
-        return "car"
-    if any(token in text for token in ["飛行機", "航空", "flight", "airport", "空港"]):
-        return "air"
-    if any(token in text for token in ["新幹線", "電車", "train", "station", "駅", "かがやき", "のぞみ", "ひかり", "こだま"]):
-        return "train"
-
-    preferred = safe_text(planning_state.get("transport_style"), "自動（おすすめ）")
-    return {
+def _infer_mode_from_transport_style(transport_style: str) -> str:
+    mapping = {
         "徒歩メイン": "walk",
         "電車メイン": "train",
         "タクシー": "taxi",
         "レンタカー": "car",
-    }.get(preferred, "train")
+    }
+    return mapping.get(str(transport_style or "").strip(), "train")
 
 
-def _shift_time_columns_same_day(df: pd.DataFrame, start_index: int, day_value: int, delta_minutes: int) -> pd.DataFrame:
-    if delta_minutes == 0:
-        return df
-    for idx in range(start_index, len(df)):
-        if int(df.at[idx, "day"]) != int(day_value):
-            break
-        df.at[idx, "start_time"] = _add_minutes_to_clock(safe_text(df.at[idx, "start_time"], ""), delta_minutes)
-        df.at[idx, "end_time"] = _add_minutes_to_clock(safe_text(df.at[idx, "end_time"], ""), delta_minutes)
-    return df
+def _llm_transport_duration_from_sequence(
+    origin_name: str,
+    destination_name: str,
+    departure_date: str,
+    departure_time: str,
+    transport_style: str,
+    current_purpose: str,
+    next_purpose: str,
+    current_note: str,
+    next_note: str,
+) -> Optional[Dict[str, object]]:
+    # --- 修正箇所: destination の意味解釈を増やさず、隣接スポットの自然文だけを LLM に渡す ---
+    prompt = f"""
+あなたは旅行プランの移動時間推定補助です。
+
+次の2地点は、構造化データ上で連続して並ぶスポットです。
+地点名の意味解釈を増やしすぎず、一般的に現実的な移動時間だけを保守的に推定してください。
+
+【重要ルール】
+- JSON だけを返す
+- 路線名・停車駅・乗換回数などを、確信がないのに捏造しない
+- minutes は整数
+- confidence は high / medium / low
+- 不確実なら minutes は null
+- 日本国内の一般的な旅行として、過小評価しない
+
+【入力】
+- 出発地点: {origin_name}
+- 到着地点: {destination_name}
+- 出発予定日: {departure_date}
+- 出発予定時刻: {departure_time}
+- ユーザーの移動希望: {transport_style}
+- 出発地点の目的: {current_purpose}
+- 到着地点の目的: {next_purpose}
+- 出発地点メモ: {current_note}
+- 到着地点メモ: {next_note}
+
+【出力JSON形式】
+{{
+  "minutes": 170,
+  "confidence": "medium",
+  "reason": "一般的な都市間移動の概算",
+  "mode": "train"
+}}
+
+minutes を出せない場合:
+{{
+  "minutes": null,
+  "confidence": "low",
+  "reason": "情報不足で妥当な概算を出せない",
+  "mode": "train"
+}}
+""".strip()
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.1).strip()
+        data = _safe_json_extract(raw)
+        if not data:
+            return None
+        minutes = data.get("minutes")
+        if minutes is None:
+            return None
+        minutes = int(minutes)
+        if minutes <= 0 or minutes > 24 * 60:
+            return None
+        mode = str(data.get("mode", "") or "").strip().lower()
+        if mode not in {"walk", "train", "taxi", "car", "private_car", "bike"}:
+            mode = _infer_mode_from_transport_style(transport_style)
+        confidence = str(data.get("confidence", "medium") or "medium").strip().lower()
+        reason = str(data.get("reason", "") or "").strip()
+        return {"minutes": minutes, "mode": mode, "confidence": confidence, "reason": reason}
+    except Exception as e:
+        log_event("移動時間推定", f"隣接スポットLLM概算フォールバック: {e}", level="warning")
+        return None
 
 
-def rebuild_transport_from_phase2_pairs(df: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
-    """
-    修正箇所: Phase2構造化データの隣接行から移動を再構成する実験。
-    - transportっぽい行を移動カードとして扱う
-    - 現在行 destination を移動元、次行 destination を移動先にする
-    - 移動終了時刻で次スポット start_time を上書きし、同日後続をスライドする
-    """
-    if df is None or df.empty:
-        return df
+def _fallback_transport_estimate_from_sequence(
+    current_row: pd.Series,
+    next_row: pd.Series,
+    planning_state: Dict[str, object],
+) -> Dict[str, object]:
+    mode = _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）"))
+    existing_gap = _minutes_between_clock(current_row.get("end_time"), next_row.get("start_time"))
+    if existing_gap is not None and 5 <= existing_gap <= 12 * 60:
+        minutes = existing_gap
+        label = f"約{minutes}分"
+        source = "existing_time_gap"
+        note = "構造化データ上の時刻差分を採用"
+    else:
+        default_map = {"walk": 20, "train": 30, "taxi": 25, "car": 30, "private_car": 30, "bike": 20}
+        minutes = default_map.get(mode, 30)
+        label = f"約{minutes}分（推測）"
+        source = "sequence_fallback"
+        note = "隣接スポットの順序から保守的に推定"
+    return {"minutes": minutes, "mode": mode, "label": label, "source": source, "note": note}
 
-    rebuilt = df.copy().reset_index(drop=True)
-    for col, default in {
-        "route_from": "",
-        "route_to": "",
-        "route_data_source": "",
-        "estimated_duration_label": "",
-        "route_line_simple": "",
-        "route_departure_at": "",
-    }.items():
-        if col not in rebuilt.columns:
-            rebuilt[col] = default
 
-    i = 0
-    while i < len(rebuilt):
-        row = rebuilt.iloc[i]
-        if not bool(rebuilt.at[i, "is_transport"]):
-            i += 1
+def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    # --- 修正箇所: Phase2 の destination を順番どおりに使い、隣接スポット間の移動カードを生成 ---
+    if df2 is None or df2.empty:
+        return df2
+
+    source_df = df2.copy().reset_index(drop=True)
+    rows: List[Dict[str, object]] = []
+
+    for idx in range(len(source_df)):
+        current = source_df.iloc[idx].copy()
+        current_dict = current.to_dict()
+        current_dict["is_transport"] = False
+        current_dict["route_from"] = safe_text(current_dict.get("route_from"), "")
+        current_dict["route_to"] = safe_text(current_dict.get("route_to"), "")
+        current_dict["route_url"] = safe_text(current_dict.get("route_url"), "")
+        current_dict["route_data_source"] = safe_text(current_dict.get("route_data_source"), "")
+        current_dict["estimated_duration_label"] = safe_text(current_dict.get("estimated_duration_label"), "")
+        rows.append(current_dict)
+
+        if idx >= len(source_df) - 1:
             continue
 
-        day_value = int(rebuilt.at[i, "day"])
-        next_idx = None
-        for j in range(i + 1, len(rebuilt)):
-            if int(rebuilt.at[j, "day"]) != day_value:
-                break
-            if not bool(rebuilt.at[j, "is_transport"]):
-                next_idx = j
-                break
-        if next_idx is None:
-            i += 1
+        nxt = source_df.iloc[idx + 1]
+        if int(current.get("day", 1) or 1) != int(nxt.get("day", 1) or 1):
             continue
 
-        from_place = safe_text(rebuilt.at[i, "destination"], planning_state.get("departure_place", "出発地"))
-        to_place = safe_text(rebuilt.at[next_idx, "destination"], "目的地")
-        mode = _infer_transport_mode_for_experiment(rebuilt.iloc[i], planning_state)
+        origin_name = safe_text(current.get("destination"), "")
+        destination_name = safe_text(nxt.get("destination"), "")
+        if not origin_name or not destination_name:
+            continue
 
-        departure_date = safe_text(rebuilt.at[i, "date"], safe_text(planning_state.get("start_date"), ""))
-        departure_time = safe_text(rebuilt.at[i, "end_time"], "")
-        if departure_time in {"", "-"}:
-            departure_time = safe_text(rebuilt.at[i, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
+        departure_time = safe_text(current.get("end_time"), safe_text(current.get("start_time"), planning_state.get("departure_time", "09:00")))
+        departure_date = safe_text(current.get("date"), safe_text(planning_state.get("start_date"), ""))
 
-        origin_lat = rebuilt.at[i, "latitude"] if "latitude" in rebuilt.columns else None
-        origin_lng = rebuilt.at[i, "longitude"] if "longitude" in rebuilt.columns else None
-        destination_lat = rebuilt.at[next_idx, "latitude"] if "latitude" in rebuilt.columns else None
-        destination_lng = rebuilt.at[next_idx, "longitude"] if "longitude" in rebuilt.columns else None
+        llm_result = _llm_transport_duration_from_sequence(
+            origin_name=origin_name,
+            destination_name=destination_name,
+            departure_date=departure_date,
+            departure_time=departure_time,
+            transport_style=safe_text(planning_state.get("transport_style"), "自動（おすすめ）"),
+            current_purpose=safe_text(current.get("purpose"), ""),
+            next_purpose=safe_text(nxt.get("purpose"), ""),
+            current_note=safe_text(current.get("one_point"), ""),
+            next_note=safe_text(nxt.get("one_point"), ""),
+        )
 
-        estimate = None
-        if not any(pd.isna(v) for v in [origin_lat, origin_lng, destination_lat, destination_lng]):
-            try:
-                routes_api = get_routes_api()
-                if routes_api is not None and mode != "air":
-                    route = routes_api.compute_route(
-                        (float(origin_lat), float(origin_lng)),
-                        (float(destination_lat), float(destination_lng)),
-                        mode=mode,
-                        departure_time=f"{departure_date} {departure_time}".strip(),
-                        use_case="final_itinerary",
-                    )
-                    if route:
-                        minutes = int(route.get("duration_minutes") or 0)
-                        if minutes > 0:
-                            estimate = {
-                                "minutes": minutes,
-                                "label": f"約{minutes}分",
-                                "source": "routes_api",
-                                "note": safe_text(route.get("summary"), "Maps推定"),
-                            }
-            except Exception as e:
-                log_event("Phase3実験", f"RoutesAPI取得失敗: {from_place} → {to_place} / {e}", level="warning")
+        if llm_result:
+            transport_minutes = int(llm_result["minutes"])
+            transport_mode = str(llm_result.get("mode", _infer_mode_from_transport_style(planning_state.get("transport_style", ""))))
+            duration_label = f"約{transport_minutes}分"
+            route_source = "llm_sequence_estimate"
+            one_point = safe_text(llm_result.get("reason"), "")
+        else:
+            fallback = _fallback_transport_estimate_from_sequence(current, nxt, planning_state)
+            transport_minutes = int(fallback["minutes"])
+            transport_mode = str(fallback["mode"])
+            duration_label = str(fallback["label"])
+            route_source = str(fallback["source"])
+            one_point = str(fallback["note"])
 
-            if estimate is None:
-                try:
-                    distance_km = _haversine_km(float(origin_lat), float(origin_lng), float(destination_lat), float(destination_lng))
-                    llm_result = None
-                    if mode != "air":
-                        llm_result = _llm_transport_duration_estimate(
-                            origin_name=from_place,
-                            destination_name=to_place,
-                            mode=mode,
-                            departure_date=departure_date,
-                            departure_time=departure_time,
-                            distance_km=distance_km,
-                            origin_lat=float(origin_lat),
-                            origin_lng=float(origin_lng),
-                            destination_lat=float(destination_lat),
-                            destination_lng=float(destination_lng),
-                        )
-                    if llm_result and llm_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(llm_result["minutes"]), from_place, to_place):
-                        minutes = int(llm_result["minutes"])
-                        estimate = {
-                            "minutes": minutes,
-                            "label": f"約{minutes}分",
-                            "source": "llm_estimate",
-                            "note": safe_text(llm_result.get("reason"), "LLM概算"),
-                        }
-                    else:
-                        fallback = _build_safe_distance_fallback(distance_km, mode, from_place, to_place)
-                        estimate = {
-                            "minutes": int(fallback.get("minutes") or 30),
-                            "label": safe_text(fallback.get("label"), "推定"),
-                            "source": safe_text(fallback.get("source"), "distance_estimate"),
-                            "note": safe_text(fallback.get("note"), "距離ベース推定"),
-                        }
-                except Exception as e:
-                    log_event("Phase3実験", f"距離推定失敗: {from_place} → {to_place} / {e}", level="warning")
+        arrival_time = _add_minutes_to_clock(departure_time, transport_minutes)
+        route_url = build_google_maps_dir_url(origin_name, destination_name, transport_mode)
+        transport_row = {
+            "day": int(current.get("day", 1) or 1),
+            "sequence": float(current.get("sequence", idx + 1) or idx + 1) + 0.5,
+            "date": departure_date,
+            "start_time": departure_time,
+            "end_time": arrival_time,
+            "destination": f"{origin_name} → {destination_name}",
+            "purpose": "transport",
+            "genre": "transport",
+            "duration_minutes": transport_minutes,
+            "is_transport": True,
+            "transport_mode": transport_mode,
+            "one_point": one_point,
+            "address": "",
+            "route_from": origin_name,
+            "route_to": destination_name,
+            "route_url": route_url,
+            "route_data_source": route_source,
+            "estimated_duration_label": duration_label,
+            "route_departure_at": f"{departure_date} {departure_time}".strip(),
+        }
+        rows.append(transport_row)
 
-        if estimate is None:
-            estimate = {"minutes": 30, "label": "推定値（フォールバック）", "source": "fallback_default", "note": "情報不足のため暫定30分"}
+    df3 = pd.DataFrame(rows)
+    if "day" in df3.columns and "sequence" in df3.columns:
+        df3 = df3.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+        df3["sequence"] = df3.groupby("day").cumcount() + 1
 
-        original_next_start = safe_text(rebuilt.at[next_idx, "start_time"], departure_time)
-        new_end_time = _add_minutes_to_clock(departure_time, int(estimate["minutes"]))
-        delta_minutes = 0
-        try:
-            old_dt = datetime.strptime(original_next_start, "%H:%M")
-            new_dt = datetime.strptime(new_end_time, "%H:%M")
-            delta_minutes = int((new_dt - old_dt).total_seconds() // 60)
-        except Exception:
-            delta_minutes = 0
-
-        rebuilt.at[i, "transport_mode"] = mode
-        rebuilt.at[i, "route_from"] = from_place
-        rebuilt.at[i, "route_to"] = to_place
-        rebuilt.at[i, "route_data_source"] = estimate["source"]
-        rebuilt.at[i, "estimated_duration_label"] = estimate["label"]
-        rebuilt.at[i, "route_line_simple"] = f"{from_place} → {to_place}"
-        rebuilt.at[i, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
-        rebuilt.at[i, "duration_minutes"] = int(estimate["minutes"])
-        rebuilt.at[i, "start_time"] = departure_time
-        rebuilt.at[i, "end_time"] = new_end_time
-        rebuilt.at[i, "one_point"] = safe_text(estimate["note"], "")
-
-        rebuilt.at[next_idx, "start_time"] = new_end_time
-        rebuilt = _shift_time_columns_same_day(rebuilt, next_idx + 1, day_value, delta_minutes)
-
-        log_event("Phase3実験", f"移動再構成: {from_place} → {to_place} / {estimate['label']} / {estimate['source']}")
-        i = next_idx + 1
-
-    return rebuilt
+    return df3
 
 
 def approve_and_build_phase2_phase3() -> None:
@@ -2398,14 +2395,11 @@ def approve_and_build_phase2_phase3() -> None:
 
     df2 = normalize_phase2_dataframe(df2, s)
 
-    # =========================================================
-    # 修正箇所: 今回の実験では Phase3 の既存ルーターを使わず、
-    # Phase2隣接ペアから移動区間を再構成した結果を最終旅程として採用
-    # =========================================================
-    log_event("Phase3実験", "Phase2隣接ペアから移動区間を再構成します。")
-    df3 = rebuild_transport_from_phase2_pairs(df2, s)
+    # --- 修正箇所: Phase3 は destination の意味を増やさず、構造化データの順番だけで移動カードを生成 ---
+    log_event("Phase3", f"順番ベースの移動カード生成を開始。transport_style={s['transport_style']}")
+    df3 = build_phase3_from_sequential_destinations(df2, s)
     if df3 is None or df3.empty:
-        raise ValueError("フェーズ3実験で最終旅程表を生成できませんでした。")
+        raise ValueError("フェーズ3で最終旅程表を生成できませんでした。")
 
     gap_messages = inspect_transport_step_gaps(df3)
     if gap_messages:
@@ -2423,9 +2417,7 @@ def approve_and_build_phase2_phase3() -> None:
 
 
 def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
-    # =========================================================
-    # 修正箇所: transportっぽい行を先に補正して、出発地上書きの誤爆を減らす
-    # =========================================================
+    # --- 修正箇所: Phase2の構造化結果を優先し、destination をむやみに上書きしない ---
     df = df.copy().reset_index(drop=True)
 
     required_cols = {
@@ -2444,10 +2436,9 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
         "address": "",
         "route_from": "",
         "route_to": "",
+        "route_url": "",
         "route_data_source": "",
         "estimated_duration_label": "",
-        "route_line_simple": "",
-        "route_departure_at": "",
     }
     for col, default in required_cols.items():
         if col not in df.columns:
@@ -2457,50 +2448,23 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
     day_mapping = {old: idx + 1 for idx, old in enumerate(unique_days)}
     df["day"] = df["day"].map(day_mapping).fillna(1).astype(int)
 
-    for idx in df.index.tolist():
-        if _is_transport_like_phase2_row(df.iloc[idx]):
-            df.at[idx, "is_transport"] = True
-            if safe_text(df.at[idx, "purpose"], "") in {"", "-", "activity"}:
-                df.at[idx, "purpose"] = "transport"
-            if safe_text(df.at[idx, "transport_mode"], "") in {"", "-", "None"}:
-                df.at[idx, "transport_mode"] = _infer_transport_mode_for_experiment(df.iloc[idx], planning_state)
-
     activity_idx = df.index[df["is_transport"] == False].tolist()  # noqa: E712
     if activity_idx:
         first_idx = activity_idx[0]
-        if not safe_text(df.at[first_idx, "destination"], ""):
+        if safe_text(df.at[first_idx, "destination"], "") in {"", "-"}:
             df.at[first_idx, "destination"] = planning_state["departure_place"]
-        df.at[first_idx, "start_time"] = safe_text(df.at[first_idx, "start_time"], planning_state["departure_time"])
+        if safe_text(df.at[first_idx, "start_time"], "") in {"", "-"}:
+            df.at[first_idx, "start_time"] = planning_state["departure_time"]
 
     if activity_idx:
         last_idx = activity_idx[-1]
-        if planning_state["return_place"] and not bool(df.at[last_idx, "is_transport"]):
-            if safe_text(df.at[last_idx, "destination"], "") in {"", "-"}:
-                df.at[last_idx, "destination"] = planning_state["return_place"]
+        if planning_state.get("return_place") and safe_text(df.at[last_idx, "destination"], "") in {"", "-"}:
+            df.at[last_idx, "destination"] = planning_state["return_place"]
 
     if planning_state["hotel_required"]:
         has_hotel = df["destination"].astype(str).str.contains("ホテル|hotel|宿", case=False, na=False).any()
         if not has_hotel:
             insert_hotel_row(df)
-
-    preferred = planning_state["transport_style"]
-    if preferred == "徒歩メイン":
-        preferred_mode = "walk"
-    elif preferred == "電車メイン":
-        preferred_mode = "train"
-    elif preferred == "タクシー":
-        preferred_mode = "taxi"
-    elif preferred == "レンタカー":
-        preferred_mode = "car"
-    else:
-        preferred_mode = None
-
-    if preferred_mode and "is_transport" in df.columns:
-        transport_idx = df.index[df["is_transport"] == True].tolist()  # noqa: E712
-        for idx in transport_idx:
-            current_mode = safe_text(df.at[idx, "transport_mode"], "")
-            if current_mode in {"", "-", "None", "nan"}:
-                df.at[idx, "transport_mode"] = preferred_mode
 
     return df.reset_index(drop=True)
 
