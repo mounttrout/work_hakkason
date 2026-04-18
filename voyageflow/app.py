@@ -1887,8 +1887,12 @@ def current_position_label_from_engine(engine: ExecutionEngine) -> str:
     idx = min(int(getattr(engine, "current_step", 0)), len(df) - 1)
     row = df.iloc[idx]
     destination = safe_text(row.get("destination"))
-    if bool(row.get("is_transport", False)) and "→" in destination:
-        return destination.split("→", 1)[1].strip()
+    if bool(row.get("is_transport", False)):
+        route_to = safe_text(row.get("route_to"), "")
+        if route_to not in {"", "-"}:
+            return route_to
+        if "→" in destination:
+            return destination.split("→", 1)[1].strip()
     return destination
 
 
@@ -2189,6 +2193,7 @@ def approve_and_build_phase2_phase3() -> None:
         df3 = router.insert_routes(df2, user_request=build_phase1_request_text(), transport_preference=s["transport_style"])
     if df3 is None or df3.empty:
         raise ValueError("フェーズ3で最終旅程表を生成できませんでした。")
+    df3 = _normalize_phase3_transport_rows(df3, s)
     df3 = enrich_transport_rows_with_estimates(df3, s, use_case="final_itinerary")
 
     gap_messages = inspect_transport_step_gaps(df3)
@@ -2204,6 +2209,202 @@ def approve_and_build_phase2_phase3() -> None:
     st.session_state.execution_engine = ExecutionEngine(df3)
     st.session_state.plan_approved = True
     st.session_state.active_tab = "final_itinerary"
+
+
+def _normalize_place_name_for_compare(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"（.*?）|\(.*?\)", "", text)
+    text = re.sub(r"JR", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(jr|地下鉄|メトロ|東京メトロ|都営)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", "", text)
+    return text.lower()
+
+
+def _contains_transport_service_marker(*texts: str) -> bool:
+    merged = " ".join(str(t or "") for t in texts).lower()
+    if not merged.strip():
+        return False
+    service_tokens = [
+        "新幹線", "特急", "急行", "快速", "各停", "在来線", "北陸新幹線",
+        "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "つるぎ",
+        "サンダーバード", "しらさぎ", "成田エクスプレス", "ロマンスカー",
+        "rail", "train", "transit", "express", "liner", "line",
+    ]
+    return any(token in merged for token in service_tokens)
+
+
+def _looks_like_transport_service_destination(destination: str) -> bool:
+    value = str(destination or "").strip()
+    if not value:
+        return False
+    if "→" in value or "->" in value:
+        return True
+    if _contains_transport_service_marker(value):
+        return True
+    if re.search(r"（.*?(新幹線|特急|急行|快速|line|train|rail|transit).*?）", value, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\(.*?(train|rail|transit|line).*?\)", value, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+TRANSPORT_GENRE_KEYS = {"transport", "train", "taxi", "walk", "walking", "bus", "flight", "air", "car", "rental_car", "private_car", "bike", "bicycle"}
+TRANSPORT_PURPOSE_KEYS = {"transport", "move", "transit", "transfer"}
+TRANSPORT_SIGNAL_WORDS = [
+    "新幹線", "電車", "列車", "地下鉄", "バス", "徒歩", "タクシー", "レンタカー", "自家用車",
+    "flight", "airport", "rail", "train", "transit", "bus", "walk", "taxi", "uber", "go",
+    "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "サンダーバード", "しらさぎ", "つるぎ",
+]
+
+
+def _infer_transport_mode_from_text(*texts: str) -> Optional[str]:
+    merged = " ".join(str(t or "") for t in texts).lower()
+    if not merged.strip():
+        return None
+    if any(token in merged for token in ["taxi", "タクシー", "uber", "go ", "didi"]):
+        return "taxi"
+    if any(token in merged for token in ["walk", "徒歩", "散歩"]):
+        return "walk"
+    if any(token in merged for token in ["bike", "bicycle", "自転車"]):
+        return "bike"
+    if any(token in merged for token in ["rental_car", "レンタカー"]):
+        return "rental_car"
+    if any(token in merged for token in ["car", "drive", "driving", "自家用車", "車"]):
+        return "car"
+    if any(token in merged for token in ["flight", "air", "航空", "飛行機", "空港"]):
+        return "air"
+    if any(token in merged for token in ["train", "transit", "rail", "新幹線", "電車", "列車", "地下鉄", "駅", "かがやき", "のぞみ", "ひかり"]):
+        return "train"
+    return None
+
+
+
+def _strip_transport_service_name(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    station_match = re.search(r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]+駅)", value)
+    airport_match = re.search(r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]+空港)", value)
+    if station_match:
+        return station_match.group(1)
+    if airport_match:
+        return airport_match.group(1)
+    value = re.sub(r"（.*?）|\(.*?\)", "", value).strip()
+    return value
+
+
+
+def _is_transport_like_row(row: pd.Series | Dict) -> bool:
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    purpose = safe_text(_row_value(row, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(row, "genre", ""), "").lower()
+    one_point = safe_text(_row_value(row, "one_point", ""), "")
+    if bool(_row_value(row, "is_transport", False)):
+        return True
+    if purpose in TRANSPORT_PURPOSE_KEYS:
+        return True
+    if genre in TRANSPORT_GENRE_KEYS:
+        return True
+    if purpose in {"departure", "arrival"} and _looks_like_transport_service_destination(destination):
+        return True
+    merged = f"{destination} {purpose} {genre} {one_point}".lower()
+    if "→" in destination or "->" in destination:
+        return True
+    if any(word.lower() in merged for word in TRANSPORT_SIGNAL_WORDS):
+        if purpose not in {"departure", "arrival"}:
+            return True
+    return False
+
+
+
+def _apply_transport_row_normalization(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
+    normalized = df.copy().reset_index(drop=True)
+    for idx in normalized.index:
+        row = normalized.iloc[idx]
+        if _is_transport_like_row(row):
+            normalized.at[idx, "is_transport"] = True
+            inferred_mode = _infer_transport_mode_from_text(
+                normalized.at[idx, "transport_mode"],
+                normalized.at[idx, "genre"],
+                normalized.at[idx, "purpose"],
+                normalized.at[idx, "destination"],
+                normalized.at[idx, "one_point"],
+            )
+            if inferred_mode and safe_text(normalized.at[idx, "transport_mode"], "") in {"", "-", "None"}:
+                normalized.at[idx, "transport_mode"] = inferred_mode
+            if inferred_mode == "train":
+                normalized.at[idx, "genre"] = "train"
+            elif inferred_mode == "taxi":
+                normalized.at[idx, "genre"] = "taxi"
+            elif inferred_mode == "walk":
+                normalized.at[idx, "genre"] = "walk"
+            normalized.at[idx, "purpose"] = "transport"
+        else:
+            cleaned_destination = _strip_transport_service_name(safe_text(normalized.at[idx, "destination"], ""))
+            if cleaned_destination:
+                normalized.at[idx, "destination"] = cleaned_destination
+
+    # 出発地・到着地の表記揺れを人間の見た目に寄せてそろえる
+    departure_norm = _normalize_place_name_for_compare(planning_state.get("departure_place", ""))
+    return_norm = _normalize_place_name_for_compare(planning_state.get("return_place", ""))
+    for idx in normalized.index:
+        if bool(normalized.at[idx, "is_transport"]):
+            continue
+        destination = safe_text(normalized.at[idx, "destination"], "")
+        compare_key = _normalize_place_name_for_compare(destination)
+        if departure_norm and compare_key == departure_norm:
+            normalized.at[idx, "destination"] = planning_state["departure_place"]
+        elif return_norm and compare_key == return_norm:
+            normalized.at[idx, "destination"] = planning_state["return_place"]
+    return normalized
+
+
+
+def _populate_transport_context_columns(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = df.copy().reset_index(drop=True)
+    for idx in enriched.index:
+        if not bool(enriched.at[idx, "is_transport"]):
+            continue
+        prev_row, next_row = _find_transport_context_rows(enriched, idx)
+        if prev_row is None or next_row is None:
+            continue
+        origin_name = safe_text(prev_row.get("destination"), "出発地")
+        destination_name = safe_text(next_row.get("destination"), "目的地")
+        enriched.at[idx, "route_from"] = origin_name
+        enriched.at[idx, "route_to"] = destination_name
+        if safe_text(enriched.at[idx, "route_line_simple"], "") in {"", "-"}:
+            enriched.at[idx, "route_line_simple"] = f"{origin_name} → {destination_name}"
+    return enriched
+
+
+def _normalize_phase3_transport_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    normalized = df.copy().reset_index(drop=True)
+    normalized = _apply_transport_row_normalization(normalized, planning_state)
+    normalized = _populate_transport_context_columns(normalized)
+
+    for idx in normalized.index:
+        if not bool(normalized.at[idx, "is_transport"]):
+            continue
+        transport_destination = safe_text(normalized.at[idx, "destination"], "")
+        if _looks_like_transport_service_destination(transport_destination):
+            cleaned_label = _strip_transport_service_name(transport_destination)
+            if cleaned_label:
+                normalized.at[idx, "destination"] = cleaned_label
+
+        prev_row, next_row = _find_transport_context_rows(normalized, idx)
+        if prev_row is None or next_row is None:
+            continue
+        origin_name = safe_text(prev_row.get("destination"), "出発地")
+        destination_name = safe_text(next_row.get("destination"), "目的地")
+        normalized.at[idx, "route_from"] = origin_name
+        normalized.at[idx, "route_to"] = destination_name
+        normalized.at[idx, "route_line_simple"] = f"{origin_name} → {destination_name}"
+    return normalized.reset_index(drop=True)
+
 
 
 def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
@@ -2223,6 +2424,9 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
         "transport_mode": None,
         "one_point": "",
         "address": "",
+        "route_from": "",
+        "route_to": "",
+        "route_line_simple": "",
     }
     for col, default in required_cols.items():
         if col not in df.columns:
@@ -2232,16 +2436,22 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
     day_mapping = {old: idx + 1 for idx, old in enumerate(unique_days)}
     df["day"] = df["day"].map(day_mapping).fillna(1).astype(int)
 
+    df = _apply_transport_row_normalization(df, planning_state)
+
     activity_idx = df.index[df["is_transport"] == False].tolist()  # noqa: E712
     if activity_idx:
         first_idx = activity_idx[0]
-        df.at[first_idx, "destination"] = planning_state["departure_place"]
+        first_destination = safe_text(df.at[first_idx, "destination"], "")
+        if not first_destination or _normalize_place_name_for_compare(first_destination) == _normalize_place_name_for_compare(planning_state["departure_place"]):
+            df.at[first_idx, "destination"] = planning_state["departure_place"]
         df.at[first_idx, "start_time"] = planning_state["departure_time"]
 
     if activity_idx:
         last_idx = activity_idx[-1]
         if planning_state["return_place"]:
-            df.at[last_idx, "destination"] = planning_state["return_place"]
+            last_destination = safe_text(df.at[last_idx, "destination"], "")
+            if not last_destination or _normalize_place_name_for_compare(last_destination) == _normalize_place_name_for_compare(planning_state["return_place"]):
+                df.at[last_idx, "destination"] = planning_state["return_place"]
 
     if planning_state["hotel_required"]:
         has_hotel = df["destination"].astype(str).str.contains("ホテル|hotel|宿", case=False, na=False).any()
@@ -2263,8 +2473,10 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
     if preferred_mode and "is_transport" in df.columns:
         transport_idx = df.index[df["is_transport"] == True].tolist()  # noqa: E712
         for idx in transport_idx:
-            df.at[idx, "transport_mode"] = preferred_mode
+            if safe_text(df.at[idx, "transport_mode"], "") in {"", "-", "None"} or preferred_mode == "train":
+                df.at[idx, "transport_mode"] = preferred_mode
 
+    df = _populate_transport_context_columns(df)
     return df.reset_index(drop=True)
 
 
@@ -2349,6 +2561,7 @@ def rebuild_final_itinerary_from_phase2(updated_df2: pd.DataFrame, reason: str) 
         )
     if df3 is None or df3.empty:
         raise ValueError("完成旅程の再構築に失敗しました。")
+    df3 = _normalize_phase3_transport_rows(df3, st.session_state.planning_state)
     df3 = enrich_transport_rows_with_estimates(df3, st.session_state.planning_state, use_case="final_itinerary")
 
     st.session_state.df_phase2 = normalized_df2.reset_index(drop=True)
@@ -2546,11 +2759,15 @@ def render_itinerary_cards(
                 card_class, status_label = get_card_style(row_dict, current_step, absolute_idx)
 
                 if is_transport:
+                    origin = safe_text(row_dict.get("route_from"), "")
+                    destination = safe_text(row_dict.get("route_to"), "")
                     destination_text = safe_text(row_dict.get("destination"))
-                    if "→" in destination_text:
-                        origin, destination = [part.strip() for part in destination_text.split("→", 1)]
-                    else:
-                        origin, destination = "現在地", destination_text
+                    if (not origin or origin == "-") or (not destination or destination == "-"):
+                        if "→" in destination_text:
+                            origin, destination = [part.strip() for part in destination_text.split("→", 1)]
+                        else:
+                            origin = origin or "現在地"
+                            destination = destination or destination_text
 
                     route_url = safe_text(row_dict.get("route_url"), "")
                     if not route_url or route_url == "-":
@@ -2564,10 +2781,12 @@ def render_itinerary_cards(
                     status_text = f"状態: {status_label}"
                     transport_display = build_transport_display_safe(row_dict)
                     route_source_text = build_route_source_text(row_dict)
+                    route_section_text = f"区間: {origin} → {destination}" if origin and destination else "区間: 移動"
                     body = f"""
 <div class="vf-card {card_class}">
   <div><b>🚗 {safe_text(row_dict.get('start_time'))} - {safe_text(row_dict.get('end_time'))}{current_badge}</b></div>
   <div>{status_text}</div>
+  <div>{html.escape(route_section_text)}</div>
   <div>移動手段: {transport_display}</div>
   <div>{html.escape(route_source_text)}</div>
 </div>
