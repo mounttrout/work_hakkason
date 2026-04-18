@@ -34,8 +34,8 @@ from maps.routes_api import RoutesAPI
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.11-llm-duration-display-unified"
-APP_UPDATED_DATE = "2026-04-17"
+APP_VERSION_NAME = "v6.2.12-weather-evidence-human-links"
+APP_UPDATED_DATE = "2026-04-18"
 
 
 # =========================================================
