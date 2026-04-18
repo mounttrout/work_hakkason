@@ -103,6 +103,9 @@ st.markdown(
 
 # =========================================================
 # 天候API（Open-Meteo） + モック fallback
+# NOTE:
+# - ユーザーにはAPIの生JSONではなく、人が確認しやすい外部サイトへの日付連動リンクを見せる。
+# - API取得URLは開発者向けに折りたたみ表示へ残す。
 # =========================================================
 _WEATHER_CODE_LABELS = {
     0: "快晴", 1: "晴れ", 2: "一部くもり", 3: "くもり",
@@ -129,6 +132,19 @@ def _format_weather_fetch_time() -> str:
 def _build_open_meteo_api_url(base_url: str, params: Dict[str, object]) -> str:
     query = urllib.parse.urlencode(params, doseq=True)
     return f"{base_url}?{query}"
+
+
+def _build_human_weather_links(place_name: str, start_date_text: str, end_date_text: str) -> Dict[str, str]:
+    place = str(place_name or "").strip()
+    start_date = str(start_date_text or "").strip()
+    end_date = str(end_date_text or "").strip()
+    date_part = start_date if start_date == end_date else f"{start_date} {end_date}"
+    query = urllib.parse.quote(f"{place} 天気 {date_part}")
+    place_query = urllib.parse.quote(place)
+    return {
+        "google": f"https://www.google.com/search?q={query}",
+        "yahoo": f"https://weather.yahoo.co.jp/weather/search/?p={place_query}",
+    }
 
 
 def _guess_trip_end_date(planning_state: Dict[str, object], start_date_text: str) -> str:
@@ -255,6 +271,12 @@ def _build_mock_weather_context_with_reason(planning_state: Dict[str, object], r
     ctx["source_type"] = "mock"
     ctx["fetched_at"] = _format_weather_fetch_time()
     ctx["evidence_url"] = ""
+    ctx["api_evidence_url"] = ""
+    ctx["human_weather_links"] = _build_human_weather_links(
+        str(ctx.get("destination_label") or planning_state.get("primary_destination") or planning_state.get("return_place") or planning_state.get("departure_place") or ""),
+        str(ctx.get("date_range_label") or planning_state.get("start_date") or ""),
+        str(ctx.get("date_range_label") or planning_state.get("start_date") or ""),
+    )
     ctx["fallback_reason"] = reason
     return ctx
 
@@ -349,6 +371,7 @@ def _build_live_weather_context(planning_state: Dict[str, object], context_label
         execution_hint = "雨予報が強い日は屋外スポットの入替候補を提案できます。" if any(int(r.get('precip') or 0) >= 40 for r in rows) else "大きな雨予報がなければそのまま進行しやすい見込みです。"
 
         evidence_url = str(daily_raw.get("_evidence_url") or "")
+        human_weather_links = _build_human_weather_links(destination_name, start_date_text, end_date_text)
         return {
             "mode_label": "実予報",
             "source_name": "Open-Meteo",
@@ -363,7 +386,9 @@ def _build_live_weather_context(planning_state: Dict[str, object], context_label
             "gap_advice": gap_advice,
             "execution_hint": execution_hint,
             "fetched_at": _format_weather_fetch_time(),
-            "evidence_url": evidence_url,
+            "evidence_url": human_weather_links.get("google", ""),
+            "api_evidence_url": evidence_url,
+            "human_weather_links": human_weather_links,
             "fallback_reason": "",
         }
     except Exception as e:
