@@ -122,6 +122,75 @@ def _weather_code_label(code: int) -> str:
         return "不明"
 
 
+def _format_weather_fetch_time() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _build_open_meteo_api_url(base_url: str, params: Dict[str, object]) -> str:
+    query = urllib.parse.urlencode(params, doseq=True)
+    return f"{base_url}?{query}"
+
+
+def _guess_trip_end_date(planning_state: Dict[str, object], start_date_text: str) -> str:
+    try:
+        start_date = datetime.strptime(start_date_text, "%Y-%m-%d").date()
+    except Exception:
+        return start_date_text
+    trip_days = max(1, int(planning_state.get("trip_days", 1) or 1))
+    end_date = start_date + timedelta(days=trip_days - 1)
+    return end_date.strftime("%Y-%m-%d")
+
+
+def _looks_like_weather_target(value: str, departure_name: str, return_name: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text in {str(departure_name or '').strip(), str(return_name or '').strip()}:
+        return False
+    lowered = text.lower()
+    blocked = [
+        "hotel", "ホテル", "宿", "空港", "airport", "station", "駅", "新幹線", "かがやき",
+        "到着", "出発", "移動", "flight", "フライト", "航空便", "搭乗", "チェックイン"
+    ]
+    return not any(token in lowered for token in blocked)
+
+
+def _infer_weather_target_place(planning_state: Dict[str, object]) -> str:
+    primary_destination = safe_text(planning_state.get("primary_destination"), "")
+    departure_name = safe_text(planning_state.get("departure_place"), "")
+    return_name = safe_text(planning_state.get("return_place"), "")
+    if _looks_like_weather_target(primary_destination, departure_name, return_name):
+        return primary_destination
+
+    for key in ("df_phase3", "df_phase2"):
+        df = st.session_state.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            candidates = []
+            for _, row in df.iterrows():
+                if bool(row.get("is_transport", False)):
+                    continue
+                destination = safe_text(row.get("destination"), "")
+                if _looks_like_weather_target(destination, departure_name, return_name):
+                    candidates.append(destination)
+            if candidates:
+                # 最頻出の目的地を採用
+                return pd.Series(candidates).value_counts().index[0]
+
+    for text_value in [st.session_state.get("trip_plan_draft"), st.session_state.get("trip_plan")]:
+        text = str(text_value or "")
+        if not text.strip():
+            continue
+        patterns = [
+            r"札幌", r"東京", r"大阪", r"京都", r"名古屋", r"福岡", r"仙台", r"那覇", r"函館", r"小樽"
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(0)
+
+    return primary_destination or return_name or departure_name
+
+
 @st.cache_data(ttl=60 * 60)
 def _weather_geocode(place_name: str) -> Optional[Dict[str, object]]:
     query = str(place_name or "").strip()
@@ -143,6 +212,7 @@ def _weather_geocode(place_name: str) -> Optional[Dict[str, object]]:
         "country": row.get("country", ""),
         "admin1": row.get("admin1", ""),
         "timezone": row.get("timezone") or "Asia/Tokyo",
+        "evidence_url": _build_open_meteo_api_url(url, params),
     }
 
 
@@ -159,22 +229,9 @@ def _weather_forecast_daily(lat: float, lng: float, timezone_name: str, start_da
     }
     resp = requests.get(url, params=params, timeout=12)
     resp.raise_for_status()
-    return resp.json()
-
-
-@st.cache_data(ttl=60 * 30)
-def _weather_forecast_hourly(lat: float, lng: float, timezone_name: str) -> Optional[Dict[str, object]]:
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lng,
-        "hourly": "temperature_2m,precipitation_probability,weather_code",
-        "forecast_days": 2,
-        "timezone": timezone_name or "Asia/Tokyo",
-    }
-    resp = requests.get(url, params=params, timeout=12)
-    resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    data["_evidence_url"] = _build_open_meteo_api_url(url, params)
+    return data
 
 
 def _weather_line_for_day(day_data: Dict[str, object]) -> str:
@@ -191,6 +248,17 @@ def _weather_line_for_day(day_data: Dict[str, object]) -> str:
     return f"{day_data.get('date')}: {label}{temp_text}{rain_text}"
 
 
+def _build_mock_weather_context_with_reason(planning_state: Dict[str, object], reason: str) -> Dict[str, object]:
+    ctx = build_mock_weather_context(planning_state)
+    ctx["mode_label"] = "参考値"
+    ctx["source_name"] = "モック"
+    ctx["source_type"] = "mock"
+    ctx["fetched_at"] = _format_weather_fetch_time()
+    ctx["evidence_url"] = ""
+    ctx["fallback_reason"] = reason
+    return ctx
+
+
 def _build_live_weather_context(planning_state: Dict[str, object], context_label: str = "plan") -> Optional[Dict[str, object]]:
     start_date_text = safe_text(planning_state.get("start_date"), "")
     if not start_date_text:
@@ -203,14 +271,18 @@ def _build_live_weather_context(planning_state: Dict[str, object], context_label
     today = datetime.now().date()
     day_offset = (start_date - today).days
 
-    # NOTE: Open-Meteoの無料forecastが安定する近未来だけAPI連携し、それ以外はモックへfallback
+    # NOTE:
+    # Open-Meteo無料予報の範囲外は「参考値」に落とす。
+    # 実予報取得できたときは、絶対にモック表示文言を混ぜない。
     if day_offset < 0 or day_offset > 7:
         return None
 
-    destination_name = safe_text(planning_state.get("primary_destination"), "") or safe_text(planning_state.get("return_place"), "")
+    destination_name = _infer_weather_target_place(planning_state)
     departure_name = safe_text(planning_state.get("departure_place"), "")
     if not destination_name:
         return None
+
+    end_date_text = _guess_trip_end_date(planning_state, start_date_text)
 
     try:
         dest_geo = _weather_geocode(destination_name)
@@ -219,44 +291,69 @@ def _build_live_weather_context(planning_state: Dict[str, object], context_label
             return None
 
         tz_name = str(dest_geo.get("timezone") or "Asia/Tokyo")
-        daily_raw = _weather_forecast_daily(float(dest_geo["latitude"]), float(dest_geo["longitude"]), tz_name, start_date_text, start_date_text)
+        daily_raw = _weather_forecast_daily(
+            float(dest_geo["latitude"]),
+            float(dest_geo["longitude"]),
+            tz_name,
+            start_date_text,
+            end_date_text,
+        )
         daily = daily_raw.get("daily") or {}
         if not daily or not daily.get("time"):
             return None
 
-        row = {
-            "date": str(daily["time"][0]),
-            "weather_code": daily.get("weather_code", [None])[0],
-            "tmax": daily.get("temperature_2m_max", [None])[0],
-            "tmin": daily.get("temperature_2m_min", [None])[0],
-            "precip": daily.get("precipitation_probability_max", [None])[0],
-        }
-        detail_lines = [_weather_line_for_day(row)]
-        headline = f"{destination_name}の天気: {_weather_code_label(row['weather_code'])}"
-        summary = f"{row['date']} の {destination_name} は {_weather_code_label(row['weather_code'])}、{row['tmin']:.0f}〜{row['tmax']:.0f}℃、降水確率 {int(row['precip'])}% の見込みです。"
+        rows = []
+        for idx, date_value in enumerate(daily.get("time", [])):
+            rows.append({
+                "date": str(date_value),
+                "weather_code": (daily.get("weather_code") or [None])[idx],
+                "tmax": (daily.get("temperature_2m_max") or [None])[idx],
+                "tmin": (daily.get("temperature_2m_min") or [None])[idx],
+                "precip": (daily.get("precipitation_probability_max") or [None])[idx],
+            })
+        if not rows:
+            return None
+
+        first_row = rows[0]
+        detail_lines = [_weather_line_for_day(row) for row in rows]
+        headline = f"{destination_name}の天気: {_weather_code_label(first_row['weather_code'])}"
+        if len(rows) == 1:
+            summary = (
+                f"{first_row['date']} の {destination_name} は {_weather_code_label(first_row['weather_code'])}、"
+                f"{first_row['tmin']:.0f}〜{first_row['tmax']:.0f}℃、降水確率 {int(first_row['precip'])}% の見込みです。"
+            )
+        else:
+            summary = f"{destination_name} の {start_date_text} 〜 {end_date_text} の実予報です。日別の見立ては下記を確認してください。"
 
         gap_advice = "出発地との大きな差はなさそうです。"
         dep_label = departure_name or "出発地"
         if dep_geo and dep_geo.get("latitude") is not None and dep_geo.get("longitude") is not None:
-            dep_daily_raw = _weather_forecast_daily(float(dep_geo["latitude"]), float(dep_geo["longitude"]), str(dep_geo.get("timezone") or tz_name), start_date_text, start_date_text)
+            dep_daily_raw = _weather_forecast_daily(
+                float(dep_geo["latitude"]),
+                float(dep_geo["longitude"]),
+                str(dep_geo.get("timezone") or tz_name),
+                start_date_text,
+                start_date_text,
+            )
             dep_daily = dep_daily_raw.get("daily") or {}
             if dep_daily and dep_daily.get("temperature_2m_max"):
                 dep_tmax = dep_daily.get("temperature_2m_max", [None])[0]
-                dep_tmin = dep_daily.get("temperature_2m_min", [None])[0]
-                if dep_tmax is not None and row['tmax'] is not None:
-                    diff = float(row['tmax']) - float(dep_tmax)
+                if dep_tmax is not None and first_row['tmax'] is not None:
+                    diff = float(first_row['tmax']) - float(dep_tmax)
                     if abs(diff) >= 4:
                         direction = "暖かい" if diff > 0 else "涼しい"
                         gap_advice = f"到着地は出発地より {abs(diff):.0f}℃ほど{direction}見込みです。服装を調整してください。"
 
-        packing = "折りたたみ傘があると安心です。" if int(row['precip'] or 0) >= 40 else "薄手の羽織りがあると安心です。"
-        execution_hint = "雨が強い場合は屋外スポットを後ろ倒しにする候補を提示します。" if int(row['precip'] or 0) >= 40 else "極端な天候変化がなければそのまま進行可能です。"
-        mode_label = "実天気API"
-        date_range_label = start_date_text
+        first_precip = int(first_row.get('precip') or 0)
+        packing = "折りたたみ傘と防水性のある靴があると安心です。" if first_precip >= 40 else "薄手の羽織りがあると安心です。"
+        execution_hint = "雨予報が強い日は屋外スポットの入替候補を提案できます。" if any(int(r.get('precip') or 0) >= 40 for r in rows) else "大きな雨予報がなければそのまま進行しやすい見込みです。"
 
+        evidence_url = str(daily_raw.get("_evidence_url") or "")
         return {
-            "mode_label": mode_label,
-            "date_range_label": date_range_label,
+            "mode_label": "実予報",
+            "source_name": "Open-Meteo",
+            "source_type": "api_success",
+            "date_range_label": start_date_text if start_date_text == end_date_text else f"{start_date_text} 〜 {end_date_text}",
             "headline": headline,
             "summary": summary,
             "detail_lines": detail_lines,
@@ -265,32 +362,54 @@ def _build_live_weather_context(planning_state: Dict[str, object], context_label
             "destination_label": destination_name,
             "gap_advice": gap_advice,
             "execution_hint": execution_hint,
+            "fetched_at": _format_weather_fetch_time(),
+            "evidence_url": evidence_url,
+            "fallback_reason": "",
         }
     except Exception as e:
-        log_event("天候API", f"実天気取得に失敗したためモックへfallback: {e}", level="warning")
+        log_event("天候API", f"実天気取得に失敗したため参考値へfallback: {e}", level="warning")
         return None
 
 
 def _get_weather_context(planning_state: Dict[str, object], context_label: str = "plan") -> Dict[str, object]:
+    start_date_text = safe_text(planning_state.get("start_date"), "")
+    if start_date_text:
+        try:
+            start_date = datetime.strptime(start_date_text, "%Y-%m-%d").date()
+            day_offset = (start_date - datetime.now().date()).days
+            if day_offset < 0 or day_offset > 7:
+                return _build_mock_weather_context_with_reason(planning_state, "予報対象外の日付のため参考値を表示しています。")
+        except Exception:
+            pass
+
     live = _build_live_weather_context(planning_state, context_label=context_label)
     if live:
         return live
-    ctx = build_mock_weather_context(planning_state)
-    if isinstance(ctx, dict) and not ctx.get("fallback_reason"):
-        ctx["fallback_reason"] = "7日超の先日付、またはAPI取得失敗のためモック表示です。"
-    return ctx
+    return _build_mock_weather_context_with_reason(planning_state, "天候APIの取得に失敗したため参考値を表示しています。")
 
 
 def render_mock_weather_panel(planning_state: Dict[str, object], context_label: str = "plan") -> None:
     weather_context = _get_weather_context(planning_state, context_label=context_label)
-    mode_label = safe_text(weather_context.get("mode_label"), "モック")
+    mode_label = safe_text(weather_context.get("mode_label"), "参考値")
     fallback_reason = safe_text(weather_context.get("fallback_reason"), "")
-    caption_suffix = "※7日超の先日付やAPI失敗時はモックに自動fallbackします。"
+    source_name = safe_text(weather_context.get("source_name"), "-")
+    fetched_at = safe_text(weather_context.get("fetched_at"), "-")
+    evidence_url = safe_text(weather_context.get("evidence_url"), "")
 
     with st.container():
         st.markdown("### 🌤️ 天候メモ")
-        st.caption(f"天気取得: {mode_label} / 対象日: {weather_context['date_range_label']} / {caption_suffix}")
+        st.caption(f"天気取得: {mode_label} / 対象日: {weather_context['date_range_label']} / 対象地: {weather_context['destination_label']}")
         st.info(f"**{weather_context['headline']}**\n\n{weather_context['summary']}")
+
+        meta1, meta2 = st.columns([2, 1])
+        with meta1:
+            st.write(f"- 取得元: {source_name}")
+            st.write(f"- 取得時刻: {fetched_at}")
+            if fallback_reason and fallback_reason != '-':
+                st.write(f"- 補足: {fallback_reason}")
+        with meta2:
+            if evidence_url and evidence_url != '-':
+                st.link_button("🔗 予報の根拠を見る", evidence_url, use_container_width=True)
 
         d1, d2 = st.columns(2)
         with d1:
@@ -303,11 +422,8 @@ def render_mock_weather_panel(planning_state: Dict[str, object], context_label: 
             st.write(f"- 出発地: {weather_context['departure_label']}")
             st.write(f"- 到着地: {weather_context['destination_label']}")
             st.write(f"- 差分メモ: {weather_context['gap_advice']}")
-            if fallback_reason and fallback_reason != '-':
-                st.write(f"- 補足: {fallback_reason}")
             if context_label == "execution":
                 st.write(f"- 実行中メモ: {weather_context['execution_hint']}")
-
 
 
 def build_weather_event_detail(planning_state: Dict[str, object]) -> str:
@@ -331,7 +447,6 @@ def build_weather_event_detail(planning_state: Dict[str, object]) -> str:
         parts.append(f"実行中メモ: {execution_hint}")
 
     return " ".join(part for part in parts if part).strip()
-
 
 # =========================================================
 # 初期化
@@ -3153,7 +3268,7 @@ with tabs[3]:
 
             if st.session_state.show_weather_dialog:
                 st.markdown("#### 🌥️ 天候不順の内容")
-                weather_context = build_mock_weather_context(st.session_state.planning_state)
+                weather_context = _get_weather_context(st.session_state.planning_state, context_label="execution")
                 st.info(
                     f"**現在の天候メモ連動**\n\n"
                     f"- 想定: {weather_context['summary']}\n"
