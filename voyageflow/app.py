@@ -34,7 +34,7 @@ from maps.routes_api import RoutesAPI
 # - 画面上部にアプリ名・バージョン名・更新日を表示
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.10-ground-estimate-weather-api"
+APP_VERSION_NAME = "v6.2.11-llm-duration-display-unified"
 APP_UPDATED_DATE = "2026-04-17"
 
 
@@ -275,17 +275,21 @@ def _get_weather_context(planning_state: Dict[str, object], context_label: str =
     live = _build_live_weather_context(planning_state, context_label=context_label)
     if live:
         return live
-    return build_mock_weather_context(planning_state)
+    ctx = build_mock_weather_context(planning_state)
+    if isinstance(ctx, dict) and not ctx.get("fallback_reason"):
+        ctx["fallback_reason"] = "7日超の先日付、またはAPI取得失敗のためモック表示です。"
+    return ctx
 
 
 def render_mock_weather_panel(planning_state: Dict[str, object], context_label: str = "plan") -> None:
     weather_context = _get_weather_context(planning_state, context_label=context_label)
     mode_label = safe_text(weather_context.get("mode_label"), "モック")
+    fallback_reason = safe_text(weather_context.get("fallback_reason"), "")
     caption_suffix = "※7日超の先日付やAPI失敗時はモックに自動fallbackします。"
 
     with st.container():
         st.markdown("### 🌤️ 天候メモ")
-        st.caption(f"{mode_label} / {weather_context['date_range_label']} / {caption_suffix}")
+        st.caption(f"天気取得: {mode_label} / 対象日: {weather_context['date_range_label']} / {caption_suffix}")
         st.info(f"**{weather_context['headline']}**\n\n{weather_context['summary']}")
 
         d1, d2 = st.columns(2)
@@ -299,6 +303,8 @@ def render_mock_weather_panel(planning_state: Dict[str, object], context_label: 
             st.write(f"- 出発地: {weather_context['departure_label']}")
             st.write(f"- 到着地: {weather_context['destination_label']}")
             st.write(f"- 差分メモ: {weather_context['gap_advice']}")
+            if fallback_reason and fallback_reason != '-':
+                st.write(f"- 補足: {fallback_reason}")
             if context_label == "execution":
                 st.write(f"- 実行中メモ: {weather_context['execution_hint']}")
 
@@ -956,12 +962,17 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
                 enriched.at[idx, "one_point"] = (existing_note + " / " + safety_note).strip(" /")[:180]
             continue
 
-        # --- 新幹線や列車名そのものを目的地にした行は、既存行程の時間を保持する ---
+        # --- 新幹線や列車名そのものを destination にした行は、app.py では無理に再計算しない ---
+        # TODO: 本来は Phase2 / Phase3 側で「列車サービス名」「便名」を transport type として保持すべき。
         rail_service_like = any(token in f"{origin_name} {destination_name}" for token in ["新幹線", "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "サンダーバード", "しらさぎ", "つるぎ"])
         if rail_service_like:
-            enriched.at[idx, "route_data_source"] = "ground_estimate_unavailable"
+            enriched.at[idx, "route_data_source"] = "kept_existing_schedule"
             enriched.at[idx, "estimated_duration_label"] = ""
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+            existing_note = safe_text(enriched.at[idx, "one_point"], "")
+            note = "未解決課題: 列車サービス名を含む移動は、構造化層で transport type を保持してから再計算すべきです。"
+            if note not in existing_note:
+                enriched.at[idx, "one_point"] = (existing_note + " / " + note).strip(" /")[:180]
             continue
 
         origin_lat = prev_row.get("latitude")
@@ -969,7 +980,7 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
         destination_lat = next_row.get("latitude")
         destination_lng = next_row.get("longitude")
         if any(pd.isna(v) for v in [origin_lat, origin_lng, destination_lat, destination_lng]):
-            enriched.at[idx, "route_data_source"] = "ground_estimate_unavailable"
+            enriched.at[idx, "route_data_source"] = "kept_existing_schedule"
             enriched.at[idx, "estimated_duration_label"] = ""
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             continue
@@ -1469,19 +1480,19 @@ def build_route_source_text(row_dict: Dict) -> str:
         return "移動時間: 実検索（Google Routes）"
     if source == "llm_estimate":
         if departure_at and departure_at != "-":
-            return f"移動時間: LLM概算 {duration_label} / {departure_at} 出発想定"
+            return f"移動時間: LLM概算 {duration_label}（{departure_at} 出発想定）"
         return f"移動時間: LLM概算 {duration_label}"
     if source == "non_ground_skipped":
         return "移動時間: 既存行程の時間を保持（航空・空港系は app.py で再計算しない）"
     if source == "ground_estimate_unavailable":
-        return "移動時間: 位置情報不足のため既存行程の時間を保持"
+        return "移動時間: 既存行程の時間を保持（位置情報不足）"
     if duration_label and duration_label != "-":
         return f"移動時間: {duration_label}"
     return "移動時間: 推定値（フォールバック）"
 
 
 def build_transport_display_safe(row_dict: Dict) -> str:
-    """表示用の重複除去。`電車 電車 30分` のような二重表現を防ぐ。"""
+    """表示用の重複除去 + 既存の時間表現を削除。時間は `移動時間:` 行だけに一本化する。"""
     base = safe_text(build_transport_display(row_dict), "")
     if not base:
         return "移動"
@@ -1489,7 +1500,12 @@ def build_transport_display_safe(row_dict: Dict) -> str:
     base = re.sub(r"^(徒歩|電車|タクシー|レンタカー|自家用車|自転車)\s+\1\b", r"\1", base)
     base = base.replace("電車 電車", "電車").replace("徒歩 徒歩", "徒歩").replace("タクシー タクシー", "タクシー")
     base = base.replace("レンタカー レンタカー", "レンタカー").replace("自家用車 自家用車", "自家用車")
-    return base
+    # 末尾の「30分」「約25分」などは削除し、時間表示は別行へ寄せる
+    base = re.sub(r"\s*(約)?\d+\s*〜\s*\d+\s*分$", "", base)
+    base = re.sub(r"\s*(約)?\d+\s*分$", "", base)
+    base = re.sub(r"\s*[/-]\s*(約)?\d+\s*分$", "", base)
+    base = re.sub(r"\s+", " ", base).strip(" ：:-")
+    return base or "移動"
 
 
 def resolve_planning_state() -> Dict:
