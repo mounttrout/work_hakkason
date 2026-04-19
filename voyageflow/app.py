@@ -34,7 +34,7 @@ from maps.routes_api import RoutesAPI
 # - normalize_phase2_dataframe で既存 destination を不用意に上書きしないよう修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.16-time-consistency-fix"
+APP_VERSION_NAME = "v6.2.17-time-consistency-and-daily-hotel-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -2191,7 +2191,7 @@ def _coerce_positive_minutes(value) -> Optional[int]:
 
 
 def rebuild_phase2_time_consistency(df: pd.DataFrame) -> pd.DataFrame:
-    # --- 修正箇所: Spot行の end_time を duration_minutes から再計算して時間整合性を揃える ---
+    # --- 修正箇所: Spot行の end_time は既存値を優先し、欠損・破綻時のみ duration_minutes で補完 ---
     if df is None or df.empty:
         return df
 
@@ -2205,12 +2205,117 @@ def rebuild_phase2_time_consistency(df: pd.DataFrame) -> pd.DataFrame:
         duration_minutes = _coerce_positive_minutes(normalized.at[idx, "duration_minutes"] if "duration_minutes" in normalized.columns else None)
         is_transport = bool(normalized.at[idx, "is_transport"]) if "is_transport" in normalized.columns else False
 
-        if start_time and duration_minutes is not None and not is_transport:
-            normalized.at[idx, "end_time"] = _add_minutes_to_clock(start_time, duration_minutes)
-        elif (not end_time or end_time == "-") and start_time and duration_minutes is not None:
+        if not start_time or is_transport:
+            continue
+
+        existing_gap = _minutes_between_clock(start_time, end_time) if end_time and end_time != "-" else None
+        if existing_gap is not None and 1 <= existing_gap <= 24 * 60:
+            # 既存の時刻が自然ならそれを尊重する
+            continue
+
+        if duration_minutes is not None and 1 <= duration_minutes <= 24 * 60:
             normalized.at[idx, "end_time"] = _add_minutes_to_clock(start_time, duration_minutes)
 
     return normalized.reset_index(drop=True)
+
+
+def _make_same_day_spot_row(base_row: dict, start_time: str, end_time: str, destination: str, purpose: str, genre: str, one_point: str) -> dict:
+    row = dict(base_row)
+    row["start_time"] = start_time
+    row["end_time"] = end_time
+    row["destination"] = destination
+    row["purpose"] = purpose
+    row["genre"] = genre
+    row["duration_minutes"] = _minutes_between_clock(start_time, end_time) or 30
+    row["is_transport"] = False
+    row["transport_mode"] = None
+    row["one_point"] = one_point
+    row["route_from"] = ""
+    row["route_to"] = ""
+    row["route_url"] = ""
+    row["route_data_source"] = ""
+    row["estimated_duration_label"] = ""
+    row["address"] = safe_text(row.get("address"), "")
+    return row
+
+
+def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
+    # --- 修正箇所: 複数日では、最終日を除く各日の終わりと2日目以降の各日の始まりにホテルカードを補完 ---
+    if df is None or df.empty:
+        return df
+
+    normalized = df.copy().reset_index(drop=True)
+    if int(planning_state.get("trip_days", 1) or 1) <= 1 or not bool(planning_state.get("hotel_required", True)):
+        return normalized
+
+    if "day" in normalized.columns and "sequence" in normalized.columns:
+        normalized = normalized.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+
+    day_values = sorted([int(v) for v in normalized["day"].dropna().unique().tolist()])
+    if len(day_values) <= 1:
+        return normalized
+
+    rows = []
+    for day in day_values:
+        day_df = normalized[normalized["day"] == day].sort_values("sequence", kind="stable").reset_index(drop=True)
+        if day_df.empty:
+            continue
+
+        day_rows = [row.to_dict() for _, row in day_df.iterrows()]
+        first_row = day_rows[0]
+        last_row = day_rows[-1]
+        current_date = safe_text(first_row.get("date"), safe_text(last_row.get("date"), planning_state.get("start_date", "")))
+
+        has_hotel_start = False
+        has_hotel_end = False
+        for row in day_rows:
+            dest = safe_text(row.get("destination"), "").lower()
+            genre = safe_text(row.get("genre"), "").lower()
+            purpose = safe_text(row.get("purpose"), "").lower()
+            if "hotel" in dest or "ホテル" in safe_text(row.get("destination"), "") or genre == "hotel" or purpose in {"hotel", "accommodation"}:
+                if safe_text(row.get("start_time"), "") <= "10:30":
+                    has_hotel_start = True
+                if safe_text(row.get("end_time"), "") >= "19:00" or purpose in {"hotel", "accommodation"}:
+                    has_hotel_end = True
+
+        if day != day_values[-1] and not has_hotel_end:
+            last_end = safe_text(last_row.get("end_time"), "20:00")
+            hotel_end = _make_same_day_spot_row(
+                last_row,
+                start_time=last_end,
+                end_time="21:00" if last_end < "21:00" else _add_minutes_to_clock(last_end, 60),
+                destination="宿泊ホテル",
+                purpose="accommodation",
+                genre="hotel",
+                one_point="翌日に備えてホテルへチェックイン。荷物整理と休息を優先します。",
+            )
+            hotel_end["date"] = current_date
+            hotel_end["day"] = day
+            day_rows.append(hotel_end)
+
+        if day != day_values[0] and not has_hotel_start:
+            first_start = safe_text(first_row.get("start_time"), "09:00")
+            start_hotel = _make_same_day_spot_row(
+                first_row,
+                start_time="09:00" if first_start > "09:00" else first_start,
+                end_time=first_start,
+                destination="宿泊ホテル",
+                purpose="departure",
+                genre="hotel",
+                one_point="ホテルを出発してその日の行程を開始します。",
+            )
+            start_hotel["date"] = current_date
+            start_hotel["day"] = day
+            day_rows = [start_hotel] + day_rows
+
+        rows.extend(day_rows)
+
+    rebuilt = pd.DataFrame(rows)
+    if "day" in rebuilt.columns:
+        rebuilt["day"] = rebuilt["day"].astype(int)
+    rebuilt = rebuilt.sort_values(["day", "date", "start_time", "end_time"], kind="stable").reset_index(drop=True)
+    rebuilt["sequence"] = rebuilt.groupby("day").cumcount() + 1
+    return rebuilt
 
 
 def _infer_mode_from_transport_style(transport_style: str) -> str:
@@ -2510,7 +2615,9 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
         if not has_hotel:
             insert_hotel_row(df)
 
-    # --- 修正箇所: Phase2のスポット滞在時間を duration_minutes ベースで再整合 ---
+    # --- 修正箇所: Phase2の既存時刻を尊重しつつ整合を取り、複数日はホテルカードを補完 ---
+    df = rebuild_phase2_time_consistency(df)
+    df = ensure_daily_hotel_rows(df, planning_state)
     df = rebuild_phase2_time_consistency(df)
     return df.reset_index(drop=True)
 
