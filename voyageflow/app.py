@@ -25,16 +25,16 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.19-phase2-stability-and-hotel-canonical-fix
+# 【バージョン名】VoyageFlow v6.2.21-transport-bridge-generalization
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
-# - ホテル名の具体名を優先保持し、同一都市圏と判断できる翌日の始端・当日の終端ホテルカードへ引き回すよう修正
-# - エリアや都市の変化が大きい可能性がある場合は、ホテル名を勝手に固定せず汎用ホテル表記を維持するよう修正
-# - 福井駅→福井駅、東京駅→東京駅のような同一地点移動カードを生成しないよう修正
-# - 完成旅程の再構築時も順番ベース移動生成ロジックを維持するよう修正
+# - Phase2 の train / transport 行を独立スポットとして扱わず、前後スポットを橋渡しする移動ヒントとして使うよう修正
+# - train 行がある場合は、前後スポットを出発地・到着地とし、列車名をヒントに LLM / ルート生成へ渡すよう修正
+# - 福井駅→北陸新幹線かがやき→東京駅 のような並びを、福井駅→東京駅 の移動カード1枚へ再構成するよう修正
+# - ホテル正本保持ロジックは維持しつつ、既存 UI を壊さない範囲で局所修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.19-phase2-stability-and-hotel-canonical-fix"
+APP_VERSION_NAME = "v6.2.21-transport-bridge-generalization"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -595,16 +595,67 @@ def _is_generic_hotel_label(name: str) -> bool:
 
 
 def _is_transport_service_like_destination(name: str) -> bool:
-    # --- 修正箇所: 新幹線や列車サービス名だけの transport 行は、Phase2/Phase3 の独立スポットとして扱わない ---
+    # --- 修正箇所: 列車・航空便・船便・バス便など、移動手段名そのものの行は独立スポットとして扱わない ---
     text = safe_text(name, "")
     if not text:
         return False
     lowered = text.lower()
-    keywords = [
+    non_ascii_keywords = [
         "新幹線", "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "つるぎ",
-        "サンダーバード", "しらさぎ", "北陸新幹線", "列車", "train", "rail", "便", "flight", "フライト"
+        "サンダーバード", "しらさぎ", "列車", "電車", "航空便", "飛行機", "フライト",
+        "フェリー", "客船", "船便", "高速バス", "夜行バス", "バス", "タクシー"
     ]
-    return any(k in text for k in keywords if not k.isalpha()) or any(k in lowered for k in ["train", "rail", "flight"])
+    ascii_keywords = ["train", "rail", "flight", "air", "ship", "ferry", "bus", "taxi"]
+    return any(k in text for k in non_ascii_keywords) or any(k in lowered for k in ascii_keywords)
+
+
+def _infer_mode_from_service_hint(service_hint: str, fallback_mode: str) -> str:
+    # --- 修正箇所: train 専用ではなく、transport 全般の service_hint から mode を推定する ---
+    text = safe_text(service_hint, "").lower()
+    if any(token in text for token in ["新幹線", "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "つるぎ", "サンダーバード", "しらさぎ", "列車", "電車", "train", "rail"]):
+        return "train"
+    if any(token in text for token in ["flight", "air", "フライト", "航空", "飛行機", "便"]):
+        return "air"
+    if any(token in text for token in ["ship", "ferry", "船", "客船", "フェリー", "船便"]):
+        return "ship"
+    if any(token in text for token in ["bus", "高速バス", "夜行バス", "バス"]):
+        return "bus"
+    if any(token in text for token in ["taxi", "タクシー"]):
+        return "taxi"
+    if any(token in text for token in ["徒歩", "walk"]):
+        return "walk"
+    return fallback_mode
+
+
+def _is_transport_bridge_row(row: pd.Series | Dict | None) -> bool:
+    # --- 修正箇所: train / flight / ship / bus などを含む transport 行を、前後スポットを橋渡しする行として判定 ---
+    if row is None:
+        return False
+    purpose = safe_text(_row_value(row, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(row, "genre", ""), "").lower()
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    bridge_genres = {"transport", "train", "flight", "air", "ship", "ferry", "bus", "taxi"}
+    return purpose == "transport" or genre in bridge_genres or _is_transport_service_like_destination(destination)
+
+
+def _compose_transport_bridge_hints(bridge_rows: list) -> tuple[str, str]:
+    # --- 修正箇所: 複数の transport 行から service_hint / mode_hint を汎用的に組み立てる ---
+    service_parts = []
+    mode_hint = ""
+    for row in bridge_rows:
+        destination = safe_text(_row_value(row, "destination", ""), "")
+        genre = safe_text(_row_value(row, "genre", ""), "").lower()
+        purpose = safe_text(_row_value(row, "purpose", ""), "").lower()
+        if destination:
+            service_parts.append(destination)
+        if not mode_hint:
+            mode_hint = _infer_mode_from_service_hint(destination, "")
+        if not mode_hint and genre:
+            mode_hint = _infer_mode_from_service_hint(genre, "")
+        if not mode_hint and purpose:
+            mode_hint = _infer_mode_from_service_hint(purpose, "")
+    service_hint = " / ".join([part for part in service_parts if part])
+    return service_hint, (mode_hint or "train")
 
 
 def _extract_concrete_hotel_name_from_day(day_df: pd.DataFrame) -> str:
@@ -2473,6 +2524,7 @@ def _llm_transport_duration_from_sequence(
     next_purpose: str,
     current_note: str,
     next_note: str,
+    service_hint: str = "",
 ) -> Optional[Dict[str, object]]:
     # --- 修正箇所: destination の意味解釈を増やさず、隣接スポットの自然文だけを LLM に渡す ---
     prompt = f"""
@@ -2499,6 +2551,7 @@ def _llm_transport_duration_from_sequence(
 - 到着地点の目的: {next_purpose}
 - 出発地点メモ: {current_note}
 - 到着地点メモ: {next_note}
+- 移動手段ヒント: {service_hint}
 
 【出力JSON形式】
 {{
@@ -2529,8 +2582,9 @@ minutes を出せない場合:
         if minutes <= 0 or minutes > 24 * 60:
             return None
         mode = str(data.get("mode", "") or "").strip().lower()
-        if mode not in {"walk", "train", "taxi", "car", "private_car", "bike"}:
+        if mode not in {"walk", "train", "taxi", "car", "private_car", "bike", "air"}:
             mode = _infer_mode_from_transport_style(transport_style)
+        mode = _infer_mode_from_service_hint(service_hint, mode)
         confidence = str(data.get("confidence", "medium") or "medium").strip().lower()
         reason = str(data.get("reason", "") or "").strip()
         return {"minutes": minutes, "mode": mode, "confidence": confidence, "reason": reason}
@@ -2552,7 +2606,7 @@ def _fallback_transport_estimate_from_sequence(
         source = "existing_time_gap"
         note = "構造化データ上の時刻差分を採用"
     else:
-        default_map = {"walk": 20, "train": 30, "taxi": 25, "car": 30, "private_car": 30, "bike": 20}
+        default_map = {"walk": 20, "train": 30, "bus": 35, "taxi": 25, "car": 30, "private_car": 30, "bike": 20, "ship": 90, "air": 180}
         minutes = default_map.get(mode, 30)
         label = f"約{minutes}分（推測）"
         source = "sequence_fallback"
@@ -2561,26 +2615,23 @@ def _fallback_transport_estimate_from_sequence(
 
 
 def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
-    # --- 修正箇所: Phase2 の順番を使うが、新幹線・列車サービス名だけの transport 行はスポットカード化しない ---
+    # --- 修正箇所: train / transport 行は独立スポットにせず、前後スポットを橋渡しする移動ヒントとして扱う ---
     if df2 is None or df2.empty:
         return df2
 
     source_df = df2.copy().reset_index(drop=True)
-    filtered_rows: List[Dict[str, object]] = []
-    for _, row in source_df.iterrows():
-        row_dict = row.to_dict()
-        purpose = safe_text(row_dict.get("purpose"), "").lower()
-        destination = safe_text(row_dict.get("destination"), "")
-        if purpose == "transport" and _is_transport_service_like_destination(destination):
-            log_event("Phase3", f"列車サービス名の transport 行を Phase3 スポット列から除外: {destination}", level="info")
-            continue
-        filtered_rows.append(row_dict)
-
-    source_df = pd.DataFrame(filtered_rows).reset_index(drop=True)
     rows: List[Dict[str, object]] = []
 
     for idx in range(len(source_df)):
         current = source_df.iloc[idx].copy()
+        current_purpose = safe_text(current.get("purpose"), "").lower()
+        current_destination = safe_text(current.get("destination"), "")
+        current_is_service_transport = current_purpose == "transport" and _is_transport_service_like_destination(current_destination)
+
+        if current_is_service_transport:
+            log_event("Phase3", f"列車サービス行を単独スポット表示しない: {current_destination}", level="info")
+            continue
+
         current_dict = current.to_dict()
         current_dict["is_transport"] = False
         current_dict["route_from"] = safe_text(current_dict.get("route_from"), "")
@@ -2593,16 +2644,33 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
         if idx >= len(source_df) - 1:
             continue
 
-        nxt = source_df.iloc[idx + 1]
+        next_idx = idx + 1
+        nxt = source_df.iloc[next_idx]
         if int(current.get("day", 1) or 1) != int(nxt.get("day", 1) or 1):
             continue
 
+        service_hint = ""
+        actual_next = nxt
+
+        next_purpose = safe_text(nxt.get("purpose"), "").lower()
+        next_destination = safe_text(nxt.get("destination"), "")
+        next_is_service_transport = next_purpose == "transport" and _is_transport_service_like_destination(next_destination)
+
+        if next_is_service_transport:
+            if next_idx + 1 >= len(source_df):
+                continue
+            bridged = source_df.iloc[next_idx + 1]
+            if int(current.get("day", 1) or 1) != int(bridged.get("day", 1) or 1):
+                continue
+            service_hint = next_destination
+            actual_next = bridged
+            log_event("Phase3", f"train橋渡し移動を生成: {safe_text(current.get('destination'), '')} → {safe_text(actual_next.get('destination'), '')} / {service_hint}", level="info")
+
         origin_name = safe_text(current.get("destination"), "")
-        destination_name = safe_text(nxt.get("destination"), "")
+        destination_name = safe_text(actual_next.get("destination"), "")
         if not origin_name or not destination_name:
             continue
 
-        # --- 修正箇所: 福井駅→福井駅、東京駅→東京駅（北陸新幹線）のような同一地点移動は作らない ---
         if _same_effective_place(origin_name, destination_name):
             log_event("Phase3", f"同一地点移動をスキップ: {origin_name} → {destination_name}", level="info")
             continue
@@ -2617,38 +2685,39 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             departure_time=departure_time,
             transport_style=safe_text(planning_state.get("transport_style"), "自動（おすすめ）"),
             current_purpose=safe_text(current.get("purpose"), ""),
-            next_purpose=safe_text(nxt.get("purpose"), ""),
+            next_purpose=safe_text(actual_next.get("purpose"), ""),
             current_note=safe_text(current.get("one_point"), ""),
-            next_note=safe_text(nxt.get("one_point"), ""),
+            next_note=safe_text(actual_next.get("one_point"), ""),
+            service_hint=service_hint,
         )
 
         if llm_result:
             transport_minutes = int(llm_result["minutes"])
-            transport_mode = str(llm_result.get("mode", _infer_mode_from_transport_style(planning_state.get("transport_style", ""))))
+            transport_mode = _infer_mode_from_service_hint(service_hint, str(llm_result.get("mode", _infer_mode_from_transport_style(planning_state.get("transport_style", "")))))
             duration_label = f"約{transport_minutes}分"
-            route_source = "llm_sequence_estimate"
+            route_source = "llm_sequence_estimate" if not service_hint else "llm_train_bridge_estimate"
             one_point = safe_text(llm_result.get("reason"), "")
         else:
-            fallback = _fallback_transport_estimate_from_sequence(current, nxt, planning_state)
+            fallback = _fallback_transport_estimate_from_sequence(current, actual_next, planning_state)
             transport_minutes = int(fallback["minutes"])
-            transport_mode = str(fallback["mode"])
+            transport_mode = _infer_mode_from_service_hint(service_hint, str(fallback["mode"]))
             duration_label = str(fallback["label"])
-            route_source = str(fallback["source"])
+            route_source = str(fallback["source"]) if not service_hint else "train_bridge_fallback"
             one_point = str(fallback["note"])
 
-        # --- 修正箇所: 時間整合性を優先し、次スポットの start_time が妥当ならそれを到着時刻に採用 ---
-        next_start_time = safe_text(nxt.get("start_time"), "")
+        next_start_time = safe_text(actual_next.get("start_time"), "")
         consistent_gap = _minutes_between_clock(departure_time, next_start_time) if departure_time and next_start_time else None
         if consistent_gap is not None and 1 <= consistent_gap <= 12 * 60:
             transport_minutes = consistent_gap
             arrival_time = next_start_time
             duration_label = f"約{transport_minutes}分"
-            route_source = "phase2_time_gap_priority"
+            route_source = "phase2_time_gap_priority" if not service_hint else "phase2_train_bridge_time_gap_priority"
             if not one_point or one_point == "-":
                 one_point = "構造化データ上の時刻差分を優先して移動時間を整合"
         else:
             arrival_time = _add_minutes_to_clock(departure_time, transport_minutes)
-        route_url = build_google_maps_dir_url(origin_name, destination_name, transport_mode)
+
+        route_url = build_google_maps_dir_url(origin_name, destination_name, transport_mode if transport_mode != "air" else "train")
         transport_row = {
             "day": int(current.get("day", 1) or 1),
             "sequence": float(current.get("sequence", idx + 1) or idx + 1) + 0.5,
@@ -2660,7 +2729,7 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             "genre": "transport",
             "duration_minutes": transport_minutes,
             "is_transport": True,
-            "transport_mode": transport_mode,
+            "transport_mode": transport_mode if transport_mode != "air" else "train",
             "one_point": one_point,
             "address": "",
             "route_from": origin_name,
