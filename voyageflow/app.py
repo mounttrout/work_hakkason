@@ -25,16 +25,16 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.21-transport-bridge-generalization
+# 【バージョン名】VoyageFlow v6.2.22-hotel-canonical-stability-fix
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
-# - Phase2 の train / transport 行を独立スポットとして扱わず、前後スポットを橋渡しする移動ヒントとして使うよう修正
-# - train 行がある場合は、前後スポットを出発地・到着地とし、列車名をヒントに LLM / ルート生成へ渡すよう修正
-# - 福井駅→北陸新幹線かがやき→東京駅 のような並びを、福井駅→東京駅 の移動カード1枚へ再構成するよう修正
-# - ホテル正本保持ロジックは維持しつつ、既存 UI を壊さない範囲で局所修正
+# - ホテル候補抽出を厳格化し、商業施設や一般スポットをホテル候補にしないよう修正
+# - 日単位のホテル正本保持を安定化
+# - Day1 先頭にホテルが出ないよう補正
+# - 最終日以外の各日終端と翌日始端のホテル補完を見直し
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.21-transport-bridge-generalization"
+APP_VERSION_NAME = "v6.2.22-hotel-canonical-stability-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -579,19 +579,47 @@ def _same_effective_place(a: str, b: str) -> bool:
     return left == right or left in right or right in left
 
 
+def _contains_hotel_token(name: str) -> bool:
+    text = safe_text(name, "")
+    lowered = text.lower()
+    return any(token in lowered for token in ["hotel", "inn", "resort", "hostel"]) or any(token in text for token in ["ホテル", "旅館"])
+
+
 def _is_hotel_like_name(name: str) -> bool:
     text = safe_text(name, "")
-    return any(token in text.lower() for token in ["hotel", "inn"]) or any(token in text for token in ["ホテル", "宿"])
+    if not text:
+        return False
+    if _is_generic_hotel_label(text):
+        return True
+    return _contains_hotel_token(text)
 
 
 def _is_generic_hotel_label(name: str) -> bool:
     text = safe_text(name, "")
-    generic_tokens = ["宿泊ホテル", "周辺ホテル", "エリア周辺ホテル", "ホテル", "ホテル出発"]
+    generic_tokens = [
+        "宿泊ホテル", "周辺ホテル", "エリア周辺ホテル", "ホテル", "ホテル出発",
+        "宿泊先", "ホテル周辺", "ホテルメイン", "おすすめホテル"
+    ]
     if text in generic_tokens:
         return True
     if text.endswith("周辺ホテル") or text.endswith("エリア周辺ホテル"):
         return True
     return text in {"ホテル", "宿"}
+
+
+def _is_valid_hotel_row(row: Dict | pd.Series) -> bool:
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    purpose = safe_text(_row_value(row, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(row, "genre", ""), "").lower()
+    if not destination:
+        return False
+    if genre == "hotel":
+        return True
+    if purpose in {"accommodation", "hotel", "stay", "lodging"}:
+        return True
+    if _contains_hotel_token(destination):
+        return True
+    return False
 
 
 def _is_transport_service_like_destination(name: str) -> bool:
@@ -664,9 +692,12 @@ def _extract_concrete_hotel_name_from_day(day_df: pd.DataFrame) -> str:
     concrete_names = []
     for _, row in day_df.iterrows():
         dest = safe_text(row.get("destination"), "")
-        if _is_hotel_like_name(dest) and not _is_generic_hotel_label(dest):
+        if _is_valid_hotel_row(row) and not _is_generic_hotel_label(dest):
             concrete_names.append(dest)
-    return concrete_names[0] if concrete_names else ""
+    # 同日の終盤にある accommodation を優先
+    if concrete_names:
+        return concrete_names[-1]
+    return ""
 
 
 def _extract_area_hint(name: str) -> str:
@@ -698,38 +729,57 @@ def _detect_large_area_change_between_days(prev_day_df: pd.DataFrame, next_day_d
     return prev_area != next_area and prev_area not in next_area and next_area not in prev_area
 
 
+def _resolve_canonical_hotel_by_day(normalized: pd.DataFrame) -> Dict[int, str]:
+    canonical_hotel_by_day: Dict[int, str] = {}
+    days = sorted(normalized["day"].dropna().astype(int).unique().tolist()) if "day" in normalized.columns else []
+
+    explicit_by_day: Dict[int, str] = {}
+    for day in days:
+        day_df = normalized[normalized["day"] == day].sort_values("sequence", kind="stable").reset_index(drop=True)
+        explicit_name = _extract_concrete_hotel_name_from_day(day_df)
+        if explicit_name:
+            explicit_by_day[day] = explicit_name
+            canonical_hotel_by_day[day] = explicit_name
+
+    for day in days:
+        if day in canonical_hotel_by_day:
+            continue
+        prev_day = day - 1
+        next_day = day + 1
+        if prev_day in explicit_by_day:
+            prev_day_df = normalized[normalized["day"] == prev_day].reset_index(drop=True)
+            cur_day_df = normalized[normalized["day"] == day].reset_index(drop=True)
+            if not _detect_large_area_change_between_days(prev_day_df, cur_day_df):
+                canonical_hotel_by_day[day] = explicit_by_day[prev_day]
+                continue
+        if next_day in explicit_by_day:
+            cur_day_df = normalized[normalized["day"] == day].reset_index(drop=True)
+            next_day_df = normalized[normalized["day"] == next_day].reset_index(drop=True)
+            if not _detect_large_area_change_between_days(cur_day_df, next_day_df):
+                canonical_hotel_by_day[day] = explicit_by_day[next_day]
+
+    return canonical_hotel_by_day
+
+
 def _propagate_hotel_names(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
-    # --- 修正箇所: 具体ホテル名の正本を日ごとに保持し、同一都市圏では generic ホテル表現へ上書きする ---
+    # --- 修正箇所: ホテル正本を日単位で安定保持し、generic ホテル表現だけを具体名へ置換 ---
     if df is None or df.empty:
         return df
     normalized = df.copy().reset_index(drop=True)
     if "day" not in normalized.columns:
         return normalized
 
-    canonical_hotel_by_day: Dict[int, str] = {}
+    canonical_hotel_by_day = _resolve_canonical_hotel_by_day(normalized)
     days = sorted(normalized["day"].dropna().astype(int).unique().tolist())
-
-    for day in days:
-        day_df = normalized[normalized["day"] == day].reset_index(drop=True)
-        concrete_name = _extract_concrete_hotel_name_from_day(day_df)
-        if concrete_name:
-            canonical_hotel_by_day[day] = concrete_name
-
-    for prev_day, next_day in zip(days, days[1:]):
-        if prev_day not in canonical_hotel_by_day:
-            continue
-        prev_day_df = normalized[normalized["day"] == prev_day].reset_index(drop=True)
-        next_day_df = normalized[normalized["day"] == next_day].reset_index(drop=True)
-        if _detect_large_area_change_between_days(prev_day_df, next_day_df):
-            log_event("ホテル補完", f"Day{prev_day}→Day{next_day} でエリア変化が大きいため、ホテル名を自動固定しません。", level="warning")
-            continue
-        canonical_hotel_by_day.setdefault(next_day, canonical_hotel_by_day[prev_day])
 
     for day in days:
         hotel_name = canonical_hotel_by_day.get(day, "")
         if not hotel_name:
             continue
-        same_day_generic_mask = (normalized["day"] == day) & normalized["destination"].astype(str).apply(lambda x: _is_hotel_like_name(x) and _is_generic_hotel_label(x))
+        same_day_generic_mask = (normalized["day"] == day) & normalized.apply(
+            lambda row: _is_hotel_like_name(safe_text(row.get("destination"), "")) and _is_generic_hotel_label(safe_text(row.get("destination"), "")),
+            axis=1,
+        )
         if same_day_generic_mask.any():
             normalized.loc[same_day_generic_mask, "destination"] = hotel_name
 
@@ -2423,7 +2473,7 @@ def _make_same_day_spot_row(base_row: dict, start_time: str, end_time: str, dest
 
 
 def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
-    # --- 修正箇所: 複数日では、最終日を除く各日の終わりと2日目以降の各日の始まりにホテルカードを補完 ---
+    # --- 修正箇所: ホテル補完を見直し。Day1 先頭ホテル禁止・日末終端と翌朝始端だけを補完 ---
     if df is None or df.empty:
         return df
 
@@ -2438,37 +2488,57 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
     if len(day_values) <= 1:
         return normalized
 
+    canonical_hotel_by_day = _resolve_canonical_hotel_by_day(normalized)
     rows = []
+    first_day = day_values[0]
+    last_day = day_values[-1]
+
     for day in day_values:
         day_df = normalized[normalized["day"] == day].sort_values("sequence", kind="stable").reset_index(drop=True)
         if day_df.empty:
             continue
 
         day_rows = [row.to_dict() for _, row in day_df.iterrows()]
-        first_row = day_rows[0]
-        last_row = day_rows[-1]
-        current_date = safe_text(first_row.get("date"), safe_text(last_row.get("date"), planning_state.get("start_date", "")))
+        current_date = safe_text(day_rows[0].get("date"), planning_state.get("start_date", ""))
 
+        # Day1 先頭側に誤って入った generic/補完ホテルは除外
+        if day == first_day:
+            cleaned_rows = []
+            seen_non_hotel = False
+            for row in day_rows:
+                row_dest = safe_text(row.get("destination"), "")
+                if not seen_non_hotel and _is_hotel_like_name(row_dest):
+                    if _is_generic_hotel_label(row_dest) or safe_text(row.get("purpose"), "").lower() in {"departure", "accommodation", "hotel"}:
+                        log_event("ホテル補完", f"Day1先頭側のホテル行を除外: {row_dest}", level="info")
+                        continue
+                if not _is_hotel_like_name(row_dest):
+                    seen_non_hotel = True
+                cleaned_rows.append(row)
+            day_rows = cleaned_rows if cleaned_rows else day_rows
+
+        # 既存ホテル開始/終端の検出は valid hotel row のみに限定
         has_hotel_start = False
         has_hotel_end = False
         for row in day_rows:
-            dest = safe_text(row.get("destination"), "").lower()
-            genre = safe_text(row.get("genre"), "").lower()
-            purpose = safe_text(row.get("purpose"), "").lower()
-            if "hotel" in dest or "ホテル" in safe_text(row.get("destination"), "") or genre == "hotel" or purpose in {"hotel", "accommodation"}:
-                if safe_text(row.get("start_time"), "") <= "10:30":
-                    has_hotel_start = True
-                if safe_text(row.get("end_time"), "") >= "19:00" or purpose in {"hotel", "accommodation"}:
-                    has_hotel_end = True
+            row_dest = safe_text(row.get("destination"), "")
+            if not _is_valid_hotel_row(row):
+                continue
+            row_start = safe_text(row.get("start_time"), "")
+            row_end = safe_text(row.get("end_time"), "")
+            if day != first_day and row_start and row_start <= "10:30":
+                has_hotel_start = True
+            if day != last_day and ((row_end and row_end >= "18:00") or safe_text(row.get("purpose"), "").lower() in {"accommodation", "hotel"}):
+                has_hotel_end = True
 
-        day_hotel_name = _extract_concrete_hotel_name_from_day(day_df) or "宿泊ホテル"
+        day_hotel_name = canonical_hotel_by_day.get(day, "")
 
-        if day != day_values[-1] and not has_hotel_end:
-            last_end = safe_text(last_row.get("end_time"), "20:00")
+        if day != last_day and not has_hotel_end and day_hotel_name:
+            last_non_hotel = next((row for row in reversed(day_rows) if not _is_hotel_like_name(safe_text(row.get("destination"), ""))), day_rows[-1])
+            last_end = safe_text(last_non_hotel.get("end_time"), "20:00") or "20:00"
             hotel_end = _make_same_day_spot_row(
-                last_row,
+                last_non_hotel,
                 start_time=last_end,
-                end_time="21:00" if last_end < "21:00" else _add_minutes_to_clock(last_end, 60),
+                end_time="23:00" if last_end < "23:00" else _add_minutes_to_clock(last_end, 60),
                 destination=day_hotel_name,
                 purpose="accommodation",
                 genre="hotel",
@@ -2478,27 +2548,30 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
             hotel_end["day"] = day
             day_rows.append(hotel_end)
 
-        if day != day_values[0] and not has_hotel_start:
-            first_start = safe_text(first_row.get("start_time"), "09:00")
-            start_hotel = _make_same_day_spot_row(
-                first_row,
-                start_time="09:00" if first_start > "09:00" else first_start,
-                end_time=first_start,
-                destination=day_hotel_name,
-                purpose="departure",
-                genre="hotel",
-                one_point="ホテルを出発してその日の行程を開始します。",
-            )
-            start_hotel["date"] = current_date
-            start_hotel["day"] = day
-            day_rows = [start_hotel] + day_rows
+        if day != first_day and not has_hotel_start:
+            prev_hotel_name = canonical_hotel_by_day.get(day - 1, "") or canonical_hotel_by_day.get(day, "")
+            if prev_hotel_name:
+                first_non_hotel = next((row for row in day_rows if not _is_hotel_like_name(safe_text(row.get("destination"), ""))), day_rows[0])
+                first_start = safe_text(first_non_hotel.get("start_time"), "09:00") or "09:00"
+                start_hotel = _make_same_day_spot_row(
+                    first_non_hotel,
+                    start_time="09:00" if first_start > "09:00" else first_start,
+                    end_time=first_start,
+                    destination=prev_hotel_name,
+                    purpose="departure",
+                    genre="hotel",
+                    one_point="ホテルを出発してその日の行程を開始します。",
+                )
+                start_hotel["date"] = current_date
+                start_hotel["day"] = day
+                day_rows = [start_hotel] + day_rows
 
         rows.extend(day_rows)
 
     rebuilt = pd.DataFrame(rows)
     if "day" in rebuilt.columns:
         rebuilt["day"] = rebuilt["day"].astype(int)
-    rebuilt = rebuilt.sort_values(["day", "date", "start_time", "end_time"], kind="stable").reset_index(drop=True)
+    rebuilt = rebuilt.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
     rebuilt["sequence"] = rebuilt.groupby("day").cumcount() + 1
     rebuilt = _propagate_hotel_names(rebuilt, planning_state)
     return rebuilt
@@ -2839,7 +2912,7 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
         df = df.loc[~drop_mask].reset_index(drop=True)
 
     if planning_state["hotel_required"]:
-        has_hotel = df["destination"].astype(str).str.contains("ホテル|hotel|宿", case=False, na=False).any()
+        has_hotel = df.apply(lambda row: _is_valid_hotel_row(row), axis=1).any()
         if not has_hotel:
             insert_hotel_row(df)
 
