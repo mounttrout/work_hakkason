@@ -25,16 +25,16 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.16-time-consistency-fix
+# 【バージョン名】VoyageFlow v6.2.18-hotel-memory-and-same-place-fix
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
-# - Phase3の移動生成方針を変更し、Phase2の構造化データを順番どおりに解釈して隣接スポット間の移動カードを生成
-# - destination の意味解釈を増やさず、元の構造化データの各行をスポットとして尊重
-# - 移動時間は隣接スポットの自然文情報を LLM に渡して概算し、失敗時は既存時刻差分または保守的推定へフォールバック
-# - normalize_phase2_dataframe で既存 destination を不用意に上書きしないよう修正
+# - ホテル名の具体名を優先保持し、同一都市圏と判断できる翌日の始端・当日の終端ホテルカードへ引き回すよう修正
+# - エリアや都市の変化が大きい可能性がある場合は、ホテル名を勝手に固定せず汎用ホテル表記を維持するよう修正
+# - 福井駅→福井駅、東京駅→東京駅のような同一地点移動カードを生成しないよう修正
+# - 完成旅程の再構築時も順番ベース移動生成ロジックを維持するよう修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.17-time-consistency-and-daily-hotel-fix"
+APP_VERSION_NAME = "v6.2.18-hotel-memory-and-same-place-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -552,6 +552,117 @@ def safe_text(value, default: str = "-") -> str:
 
 
 
+
+
+def _normalize_location_for_compare(name: str) -> str:
+    # --- 修正箇所: 同一地点移動を抑制するため、駅名・ホテル名比較用の正規化を追加 ---
+    text = safe_text(name, "").lower()
+    if not text:
+        return ""
+    text = re.sub(r"（.*?）|\(.*?\)", "", text)
+    text = text.replace("　", " ").replace("→", " ")
+    removable_tokens = [
+        "北陸新幹線", "新幹線", "jr", "駅構内", "周辺", "付近", "エリア",
+        "hotel", "the", "宿泊ホテル", "周辺ホテル", "ホテル出発", "チェックイン",
+    ]
+    for token in removable_tokens:
+        text = text.replace(token, "")
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def _same_effective_place(a: str, b: str) -> bool:
+    left = _normalize_location_for_compare(a)
+    right = _normalize_location_for_compare(b)
+    if not left or not right:
+        return False
+    return left == right or left in right or right in left
+
+
+def _is_hotel_like_name(name: str) -> bool:
+    text = safe_text(name, "")
+    return any(token in text.lower() for token in ["hotel", "inn"]) or any(token in text for token in ["ホテル", "宿"])
+
+
+def _is_generic_hotel_label(name: str) -> bool:
+    text = safe_text(name, "")
+    generic_tokens = ["宿泊ホテル", "周辺ホテル", "エリア周辺ホテル", "ホテル", "ホテル出発"]
+    if text in generic_tokens:
+        return True
+    if text.endswith("周辺ホテル") or text.endswith("エリア周辺ホテル"):
+        return True
+    return text in {"ホテル", "宿"}
+
+
+def _extract_area_hint(name: str) -> str:
+    text = safe_text(name, "")
+    if not text:
+        return ""
+    patterns = [
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+(?:都|道|府|県))",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+(?:市|区|町|村))",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+エリア)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    for token in ["札幌", "小樽", "函館", "旭川", "東京", "新宿", "渋谷", "銀座", "上野", "浅草", "丸の内", "大阪", "梅田", "難波", "京都", "名古屋", "福井", "金沢", "博多", "福岡", "那覇", "沖縄", "北海道"]:
+        if token in text:
+            return token
+    return ""
+
+
+def _detect_large_area_change_between_days(prev_day_df: pd.DataFrame, next_day_df: pd.DataFrame) -> bool:
+    prev_candidates = [safe_text(row.get("destination"), "") for _, row in prev_day_df.iterrows() if not bool(row.get("is_transport", False)) and not _is_hotel_like_name(safe_text(row.get("destination"), ""))]
+    next_candidates = [safe_text(row.get("destination"), "") for _, row in next_day_df.iterrows() if not bool(row.get("is_transport", False)) and not _is_hotel_like_name(safe_text(row.get("destination"), ""))]
+    prev_area = next((hint for hint in (_extract_area_hint(v) for v in prev_candidates) if hint), "")
+    next_area = next((hint for hint in (_extract_area_hint(v) for v in next_candidates) if hint), "")
+    if not prev_area or not next_area:
+        return False
+    return prev_area != next_area and prev_area not in next_area and next_area not in prev_area
+
+
+def _propagate_hotel_names(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
+    # --- 修正箇所: 具体ホテル名を保持しつつ、広域移動が疑われる場合は勝手に固定しない ---
+    if df is None or df.empty:
+        return df
+    normalized = df.copy().reset_index(drop=True)
+    if "day" not in normalized.columns:
+        return normalized
+
+    concrete_hotel_by_day: Dict[int, str] = {}
+    for day in sorted(normalized["day"].dropna().astype(int).unique().tolist()):
+        day_df = normalized[normalized["day"] == day]
+        concrete_names = []
+        for _, row in day_df.iterrows():
+            dest = safe_text(row.get("destination"), "")
+            if _is_hotel_like_name(dest) and not _is_generic_hotel_label(dest):
+                concrete_names.append(dest)
+        if concrete_names:
+            concrete_hotel_by_day[day] = concrete_names[0]
+
+    for day, hotel_name in concrete_hotel_by_day.items():
+        mask_same_day_generic = (normalized["day"] == day) & normalized["destination"].astype(str).apply(lambda x: _is_hotel_like_name(x) and _is_generic_hotel_label(x))
+        if mask_same_day_generic.any():
+            normalized.loc[mask_same_day_generic, "destination"] = hotel_name
+
+    days = sorted(normalized["day"].dropna().astype(int).unique().tolist())
+    for prev_day, next_day in zip(days, days[1:]):
+        if prev_day not in concrete_hotel_by_day:
+            continue
+        prev_day_df = normalized[normalized["day"] == prev_day].reset_index(drop=True)
+        next_day_df = normalized[normalized["day"] == next_day].reset_index(drop=True)
+        if _detect_large_area_change_between_days(prev_day_df, next_day_df):
+            log_event("ホテル補完", f"Day{prev_day}→Day{next_day} でエリア変化が大きいため、ホテル名を自動固定しません。", level="warning")
+            continue
+        hotel_name = concrete_hotel_by_day[prev_day]
+        next_generic_mask = (normalized["day"] == next_day) & normalized["destination"].astype(str).apply(lambda x: _is_hotel_like_name(x) and _is_generic_hotel_label(x))
+        if next_generic_mask.any():
+            normalized.loc[next_generic_mask, "destination"] = hotel_name
+            concrete_hotel_by_day[next_day] = hotel_name
+
+    return normalized
 
 
 def parse_route_diagnostic_departure_iso(departure_text: str) -> str:
@@ -2284,7 +2395,7 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
                 last_row,
                 start_time=last_end,
                 end_time="21:00" if last_end < "21:00" else _add_minutes_to_clock(last_end, 60),
-                destination="宿泊ホテル",
+                destination=safe_text(last_row.get("destination"), "宿泊ホテル") if _is_hotel_like_name(safe_text(last_row.get("destination"), "")) else "宿泊ホテル",
                 purpose="accommodation",
                 genre="hotel",
                 one_point="翌日に備えてホテルへチェックイン。荷物整理と休息を優先します。",
@@ -2299,7 +2410,7 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
                 first_row,
                 start_time="09:00" if first_start > "09:00" else first_start,
                 end_time=first_start,
-                destination="宿泊ホテル",
+                destination=safe_text(last_row.get("destination"), "宿泊ホテル") if _is_hotel_like_name(safe_text(last_row.get("destination"), "")) else "宿泊ホテル",
                 purpose="departure",
                 genre="hotel",
                 one_point="ホテルを出発してその日の行程を開始します。",
@@ -2315,6 +2426,7 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
         rebuilt["day"] = rebuilt["day"].astype(int)
     rebuilt = rebuilt.sort_values(["day", "date", "start_time", "end_time"], kind="stable").reset_index(drop=True)
     rebuilt["sequence"] = rebuilt.groupby("day").cumcount() + 1
+    rebuilt = _propagate_hotel_names(rebuilt, planning_state)
     return rebuilt
 
 
@@ -2454,6 +2566,11 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
         origin_name = safe_text(current.get("destination"), "")
         destination_name = safe_text(nxt.get("destination"), "")
         if not origin_name or not destination_name:
+            continue
+
+        # --- 修正箇所: 福井駅→福井駅、東京駅→東京駅（北陸新幹線）のような同一地点移動は作らない ---
+        if _same_effective_place(origin_name, destination_name):
+            log_event("Phase3", f"同一地点移動をスキップ: {origin_name} → {destination_name}", level="info")
             continue
 
         departure_time = safe_text(current.get("end_time"), safe_text(current.get("start_time"), planning_state.get("departure_time", "09:00")))
@@ -2693,17 +2810,10 @@ def rebuild_final_itinerary_from_phase2(updated_df2: pd.DataFrame, reason: str) 
         raise ValueError("構造化データが空のため完成旅程を再構築できません。")
 
     normalized_df2 = normalize_phase2_dataframe(updated_df2.copy(), st.session_state.planning_state)
-    router = Phase3Routing(logger=log_event)
-    request_text = st.session_state.trip_plan or st.session_state.trip_plan_draft or build_phase1_request_text()
-    with _disable_live_routes_api_for_phase3():
-        df3 = router.insert_routes(
-            normalized_df2,
-            user_request=request_text,
-            transport_preference=st.session_state.planning_state["transport_style"],
-        )
+    # --- 修正箇所: 編集後の再構築でも順番ベース移動生成ロジックを維持 ---
+    df3 = build_phase3_from_sequential_destinations(normalized_df2, st.session_state.planning_state)
     if df3 is None or df3.empty:
         raise ValueError("完成旅程の再構築に失敗しました。")
-    df3 = enrich_transport_rows_with_estimates(df3, st.session_state.planning_state, use_case="final_itinerary")
 
     st.session_state.df_phase2 = normalized_df2.reset_index(drop=True)
     st.session_state.df_phase3 = df3.reset_index(drop=True)
