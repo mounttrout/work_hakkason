@@ -25,7 +25,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.15-sequential-llm-route-builder
+# 【バージョン名】VoyageFlow v6.2.16-time-consistency-fix
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
 # - Phase3の移動生成方針を変更し、Phase2の構造化データを順番どおりに解釈して隣接スポット間の移動カードを生成
@@ -34,7 +34,7 @@ from maps.routes_api import RoutesAPI
 # - normalize_phase2_dataframe で既存 destination を不用意に上書きしないよう修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.15-sequential-llm-route-builder"
+APP_VERSION_NAME = "v6.2.16-time-consistency-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -2180,6 +2180,39 @@ def _minutes_between_clock(start_time: str, end_time: str) -> Optional[int]:
         return None
 
 
+def _coerce_positive_minutes(value) -> Optional[int]:
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return None
+        minutes = int(float(value))
+        return minutes if minutes > 0 else None
+    except Exception:
+        return None
+
+
+def rebuild_phase2_time_consistency(df: pd.DataFrame) -> pd.DataFrame:
+    # --- 修正箇所: Spot行の end_time を duration_minutes から再計算して時間整合性を揃える ---
+    if df is None or df.empty:
+        return df
+
+    normalized = df.copy().reset_index(drop=True)
+    if "day" in normalized.columns and "sequence" in normalized.columns:
+        normalized = normalized.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+
+    for idx in normalized.index:
+        start_time = safe_text(normalized.at[idx, "start_time"], "")
+        end_time = safe_text(normalized.at[idx, "end_time"], "")
+        duration_minutes = _coerce_positive_minutes(normalized.at[idx, "duration_minutes"] if "duration_minutes" in normalized.columns else None)
+        is_transport = bool(normalized.at[idx, "is_transport"]) if "is_transport" in normalized.columns else False
+
+        if start_time and duration_minutes is not None and not is_transport:
+            normalized.at[idx, "end_time"] = _add_minutes_to_clock(start_time, duration_minutes)
+        elif (not end_time or end_time == "-") and start_time and duration_minutes is not None:
+            normalized.at[idx, "end_time"] = _add_minutes_to_clock(start_time, duration_minutes)
+
+    return normalized.reset_index(drop=True)
+
+
 def _infer_mode_from_transport_style(transport_style: str) -> str:
     mapping = {
         "徒歩メイン": "walk",
@@ -2347,7 +2380,18 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             route_source = str(fallback["source"])
             one_point = str(fallback["note"])
 
-        arrival_time = _add_minutes_to_clock(departure_time, transport_minutes)
+        # --- 修正箇所: 時間整合性を優先し、次スポットの start_time が妥当ならそれを到着時刻に採用 ---
+        next_start_time = safe_text(nxt.get("start_time"), "")
+        consistent_gap = _minutes_between_clock(departure_time, next_start_time) if departure_time and next_start_time else None
+        if consistent_gap is not None and 1 <= consistent_gap <= 12 * 60:
+            transport_minutes = consistent_gap
+            arrival_time = next_start_time
+            duration_label = f"約{transport_minutes}分"
+            route_source = "phase2_time_gap_priority"
+            if not one_point or one_point == "-":
+                one_point = "構造化データ上の時刻差分を優先して移動時間を整合"
+        else:
+            arrival_time = _add_minutes_to_clock(departure_time, transport_minutes)
         route_url = build_google_maps_dir_url(origin_name, destination_name, transport_mode)
         transport_row = {
             "day": int(current.get("day", 1) or 1),
@@ -2466,6 +2510,8 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
         if not has_hotel:
             insert_hotel_row(df)
 
+    # --- 修正箇所: Phase2のスポット滞在時間を duration_minutes ベースで再整合 ---
+    df = rebuild_phase2_time_consistency(df)
     return df.reset_index(drop=True)
 
 
