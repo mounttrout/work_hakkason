@@ -25,16 +25,17 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.23-hotel-dedupe-and-weather-fallback-fix
+# 【バージョン名】VoyageFlow v6.2.24-hotel-dedupe-weather-and-syntax-fix
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
 # - 同一日の重複ホテルカードを統合し、夜のホテルカードを1件に整理
 # - 翌朝の generic ホテル出発カードは前日ホテル正本へ置換
 # - Day1 先頭ホテル除去ロジックを維持しつつホテル名引き回しを安定化
 # - 天候fallback表示から「モック」を外し、ユーザー向け文言を参考値ベースに整理
+# - 同一日の重複ホテル統合ロジック内の正規表現SyntaxErrorを修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.23-hotel-dedupe-and-weather-fallback-fix"
+APP_VERSION_NAME = "v6.2.24-hotel-dedupe-weather-and-syntax-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -2487,7 +2488,7 @@ def _merge_same_day_duplicate_hotel_rows(df: pd.DataFrame) -> pd.DataFrame:
     def _hotel_key(name: str) -> str:
         text = safe_text(name, "")
         text = re.sub(r"[\s\u3000]+", "", text)
-        text = re.sub(r"["'「」()（）【】［］\[\]・,，.．]", "", text)
+        text = re.sub(r"[\"'「」()（）【】［］\[\]・,，.．]", "", text)
         return text.lower()
 
     idx = 0
