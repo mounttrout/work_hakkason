@@ -25,16 +25,16 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.22-hotel-canonical-stability-fix
+# 【バージョン名】VoyageFlow v6.2.23-hotel-dedupe-and-weather-fallback-fix
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
-# - ホテル候補抽出を厳格化し、商業施設や一般スポットをホテル候補にしないよう修正
-# - 日単位のホテル正本保持を安定化
-# - Day1 先頭にホテルが出ないよう補正
-# - 最終日以外の各日終端と翌日始端のホテル補完を見直し
+# - 同一日の重複ホテルカードを統合し、夜のホテルカードを1件に整理
+# - 翌朝の generic ホテル出発カードは前日ホテル正本へ置換
+# - Day1 先頭ホテル除去ロジックを維持しつつホテル名引き回しを安定化
+# - 天候fallback表示から「モック」を外し、ユーザー向け文言を参考値ベースに整理
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.22-hotel-canonical-stability-fix"
+APP_VERSION_NAME = "v6.2.23-hotel-dedupe-and-weather-fallback-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -267,8 +267,8 @@ def _weather_line_for_day(day_data: Dict[str, object]) -> str:
 def _build_mock_weather_context_with_reason(planning_state: Dict[str, object], reason: str) -> Dict[str, object]:
     ctx = build_mock_weather_context(planning_state)
     ctx["mode_label"] = "参考値"
-    ctx["source_name"] = "モック"
-    ctx["source_type"] = "mock"
+    ctx["source_name"] = "参考データ"
+    ctx["source_type"] = "fallback"
     ctx["fetched_at"] = _format_weather_fetch_time()
     ctx["evidence_url"] = ""
     ctx["api_evidence_url"] = ""
@@ -418,6 +418,7 @@ def render_mock_weather_panel(planning_state: Dict[str, object], context_label: 
     mode_label = safe_text(weather_context.get("mode_label"), "参考値")
     fallback_reason = safe_text(weather_context.get("fallback_reason"), "")
     source_name = safe_text(weather_context.get("source_name"), "-")
+    source_type = safe_text(weather_context.get("source_type"), "")
     fetched_at = safe_text(weather_context.get("fetched_at"), "-")
     evidence_url = safe_text(weather_context.get("evidence_url"), "")
 
@@ -428,7 +429,10 @@ def render_mock_weather_panel(planning_state: Dict[str, object], context_label: 
 
         meta1, meta2 = st.columns([2, 1])
         with meta1:
-            st.write(f"- 取得元: {source_name}")
+            if source_type == "api_success":
+                st.write(f"- 取得元: {source_name}")
+            else:
+                st.write("- 表示種別: 参考値")
             st.write(f"- 取得時刻: {fetched_at}")
             if fallback_reason and fallback_reason != '-':
                 st.write(f"- 補足: {fallback_reason}")
@@ -2472,6 +2476,55 @@ def _make_same_day_spot_row(base_row: dict, start_time: str, end_time: str, dest
     return row
 
 
+def _merge_same_day_duplicate_hotel_rows(df: pd.DataFrame) -> pd.DataFrame:
+    # --- 修正箇所: 同一日の連続ホテル行を1件に統合 ---
+    if df is None or df.empty:
+        return df
+
+    merged_rows = []
+    rows = [row.to_dict() for _, row in df.sort_values(["day", "sequence"], kind="stable").iterrows()]
+
+    def _hotel_key(name: str) -> str:
+        text = safe_text(name, "")
+        text = re.sub(r"[\s\u3000]+", "", text)
+        text = re.sub(r"["'「」()（）【】［］\[\]・,，.．]", "", text)
+        return text.lower()
+
+    idx = 0
+    while idx < len(rows):
+        current = rows[idx]
+        if idx + 1 < len(rows):
+            nxt = rows[idx + 1]
+            same_day = int(current.get("day", 0) or 0) == int(nxt.get("day", 0) or 0)
+            if same_day and _is_valid_hotel_row(current) and _is_valid_hotel_row(nxt):
+                if _hotel_key(current.get("destination", "")) == _hotel_key(nxt.get("destination", "")):
+                    merged = dict(current)
+                    cur_start = safe_text(current.get("start_time"), "")
+                    cur_end = safe_text(current.get("end_time"), "")
+                    nxt_start = safe_text(nxt.get("start_time"), "")
+                    nxt_end = safe_text(nxt.get("end_time"), "")
+                    starts = [v for v in [cur_start, nxt_start] if v]
+                    ends = [v for v in [cur_end, nxt_end] if v]
+                    if starts:
+                        merged["start_time"] = min(starts)
+                    if ends:
+                        merged["end_time"] = max(ends)
+                    merged["purpose"] = "accommodation"
+                    merged["genre"] = "hotel"
+                    merged["one_point"] = safe_text(current.get("one_point"), "") or safe_text(nxt.get("one_point"), "") or "翌日に備えてホテルで休息します。"
+                    merged_rows.append(merged)
+                    idx += 2
+                    continue
+        merged_rows.append(current)
+        idx += 1
+
+    rebuilt = pd.DataFrame(merged_rows)
+    if not rebuilt.empty and "day" in rebuilt.columns:
+        rebuilt = rebuilt.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+        rebuilt["sequence"] = rebuilt.groupby("day").cumcount() + 1
+    return rebuilt
+
+
 def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
     # --- 修正箇所: ホテル補完を見直し。Day1 先頭ホテル禁止・日末終端と翌朝始端だけを補完 ---
     if df is None or df.empty:
@@ -2516,6 +2569,22 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
                 cleaned_rows.append(row)
             day_rows = cleaned_rows if cleaned_rows else day_rows
 
+        day_hotel_name = canonical_hotel_by_day.get(day, "")
+
+        # --- 修正箇所: generic ホテル開始行は前日ホテル正本へ置換 ---
+        if day != first_day:
+            prev_hotel_name = canonical_hotel_by_day.get(day - 1, "") or day_hotel_name
+            if prev_hotel_name:
+                for row in day_rows:
+                    row_dest = safe_text(row.get("destination"), "")
+                    row_purpose = safe_text(row.get("purpose"), "").lower()
+                    if _is_hotel_like_name(row_dest) and (_is_generic_hotel_label(row_dest) or row_purpose == "departure"):
+                        row["destination"] = prev_hotel_name
+                        row["genre"] = "hotel"
+                        if row_purpose in {"", "transport"}:
+                            row["purpose"] = "departure"
+                        break
+
         # 既存ホテル開始/終端の検出は valid hotel row のみに限定
         has_hotel_start = False
         has_hotel_end = False
@@ -2529,8 +2598,6 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
                 has_hotel_start = True
             if day != last_day and ((row_end and row_end >= "18:00") or safe_text(row.get("purpose"), "").lower() in {"accommodation", "hotel"}):
                 has_hotel_end = True
-
-        day_hotel_name = canonical_hotel_by_day.get(day, "")
 
         if day != last_day and not has_hotel_end and day_hotel_name:
             last_non_hotel = next((row for row in reversed(day_rows) if not _is_hotel_like_name(safe_text(row.get("destination"), ""))), day_rows[-1])
@@ -2573,6 +2640,8 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
         rebuilt["day"] = rebuilt["day"].astype(int)
     rebuilt = rebuilt.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
     rebuilt["sequence"] = rebuilt.groupby("day").cumcount() + 1
+    rebuilt = _propagate_hotel_names(rebuilt, planning_state)
+    rebuilt = _merge_same_day_duplicate_hotel_rows(rebuilt)
     rebuilt = _propagate_hotel_names(rebuilt, planning_state)
     return rebuilt
 
