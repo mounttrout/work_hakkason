@@ -4,7 +4,6 @@ import urllib.parse
 import re
 import html
 import json
-import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
@@ -26,14 +25,17 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.28-syntax-clean-redelivery
+# 【バージョン名】VoyageFlow v6.2.24-hotel-dedupe-weather-and-syntax-fix
 # 【制作日】2026-04-19
 # 【前バージョンからの修正内容】
-# - 先頭の駅transport行を出発スポットとして残しつつ、移動時間の二重計上を防止
-# - Googleカレンダー同期の予定タイトルを旅程向けに改善
-# - Googleカレンダー同期の個別リンク文言をわかりやすく調整
+# - 同一日の重複ホテルカードを統合し、夜のホテルカードを1件に整理
+# - 翌朝の generic ホテル出発カードは前日ホテル正本へ置換
+# - Day1 先頭ホテル除去ロジックを維持しつつホテル名引き回しを安定化
+# - 天候fallback表示から「モック」を外し、ユーザー向け文言を参考値ベースに整理
+# - 同一日の重複ホテル統合ロジック内の正規表現SyntaxErrorを修正
+# =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.28-syntax-clean-redelivery"
+APP_VERSION_NAME = "v6.2.29-ambiguous-spot-and-day1-hotel-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -554,184 +556,6 @@ def safe_text(value, default: str = "-") -> str:
     return text if text else default
 
 
-# =========================================================
-# 修正箇所: Googleカレンダー同期ヘルパー
-# - 完成旅程から Google Calendar 登録リンク / ICS 出力を行う
-# - OAuth は使わず、まずは安全な同期導線に限定
-# =========================================================
-def _parse_itinerary_datetime(date_text: str, time_text: str) -> Optional[datetime]:
-    date_value = str(date_text or "").strip()
-    time_value = str(time_text or "").strip()
-    if not date_value or not time_value or time_value == "-":
-        return None
-    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
-        try:
-            return datetime.strptime(f"{date_value} {time_value}", fmt)
-        except Exception:
-            continue
-    return None
-
-
-def _calendar_end_datetime_from_row(row: Dict[str, object]) -> Optional[datetime]:
-    start_dt = _parse_itinerary_datetime(safe_text(row.get("date"), ""), safe_text(row.get("start_time"), ""))
-    if start_dt is None:
-        return None
-
-    explicit_end = _parse_itinerary_datetime(safe_text(row.get("date"), ""), safe_text(row.get("end_time"), ""))
-    if explicit_end and explicit_end > start_dt:
-        return explicit_end
-
-    duration_minutes = row.get("duration_minutes")
-    if pd.notna(duration_minutes):
-        try:
-            minutes = max(1, int(float(duration_minutes)))
-            return start_dt + timedelta(minutes=minutes)
-        except Exception:
-            pass
-
-    stay_minutes = row.get("stay_minutes")
-    if pd.notna(stay_minutes):
-        try:
-            minutes = max(1, int(float(stay_minutes)))
-            return start_dt + timedelta(minutes=minutes)
-        except Exception:
-            pass
-
-    return start_dt + timedelta(minutes=60)
-
-
-def _calendar_title_from_row(row_dict: Dict[str, object]) -> str:
-    # --- 修正箇所: Googleカレンダーの予定タイトルを旅程向けに整形 ---
-    destination = safe_text(row_dict.get("destination"), "予定")
-    purpose_raw = safe_text(row_dict.get("purpose"), "")
-    purpose_label = safe_text(format_purpose(purpose_raw), "予定")
-    day_value = row_dict.get("day")
-    day_prefix = f"Day{int(day_value)} " if pd.notna(day_value) else ""
-
-    lowered = purpose_raw.lower()
-    if lowered in {"departure"}:
-        return f"{day_prefix}出発：{destination}"
-    if lowered in {"arrival"}:
-        return f"{day_prefix}到着：{destination}"
-    if lowered in {"accommodation"}:
-        return f"{day_prefix}宿泊：{destination}"
-    if lowered in {"meal", "lunch", "dinner"}:
-        return f"{day_prefix}食事：{destination}"
-    if lowered in {"shopping"}:
-        return f"{day_prefix}買い物：{destination}"
-    if lowered in {"activity", "sightseeing"}:
-        return f"{day_prefix}観光：{destination}"
-    return f"{day_prefix}{purpose_label}：{destination}"
-
-
-def _calendar_rows_from_itinerary(df: pd.DataFrame) -> List[Dict[str, object]]:
-    if df is None or df.empty:
-        return []
-
-    rows: List[Dict[str, object]] = []
-    normalized = df.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
-    for _, row in normalized.iterrows():
-        row_dict = row.to_dict()
-        if bool(row_dict.get("is_transport", False)):
-            continue
-        destination = safe_text(row_dict.get("destination"), "")
-        if not destination:
-            continue
-        start_dt = _parse_itinerary_datetime(safe_text(row_dict.get("date"), ""), safe_text(row_dict.get("start_time"), ""))
-        end_dt = _calendar_end_datetime_from_row(row_dict)
-        if start_dt is None or end_dt is None or end_dt <= start_dt:
-            continue
-        purpose = safe_text(format_purpose(row_dict.get("purpose")), "予定")
-        note = safe_text(row_dict.get("one_point"), "")
-        rows.append({
-            "title": destination,
-            "description": f"VoyageFlow旅程 / 目的: {purpose}" + (f"\n\n{note}" if note and note != "-" else ""),
-            "location": destination,
-            "start_dt": start_dt,
-            "end_dt": end_dt,
-            "day": row_dict.get("day"),
-            "sequence": row_dict.get("sequence"),
-        })
-    return rows
-
-
-def _google_calendar_event_url(event_row: Dict[str, object]) -> str:
-    start_dt = event_row["start_dt"].strftime("%Y%m%dT%H%M%S")
-    end_dt = event_row["end_dt"].strftime("%Y%m%dT%H%M%S")
-    params = {
-        "action": "TEMPLATE",
-        "text": event_row.get("title", "VoyageFlow旅程"),
-        "dates": f"{start_dt}/{end_dt}",
-        "ctz": "Asia/Tokyo",
-        "details": event_row.get("description", ""),
-        "location": event_row.get("location", ""),
-    }
-    return "https://calendar.google.com/calendar/render?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-
-
-def _escape_ics_text(value: str) -> str:
-    text = str(value or "")
-    text = text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
-    text = text.replace("\n", "\\n")
-    return text
-
-
-def _ics_content_from_rows(event_rows: List[Dict[str, object]]) -> str:
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//VoyageFlow//Calendar Sync//JA",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
-        "X-WR-CALNAME:VoyageFlow旅程",
-        "X-WR-TIMEZONE:Asia/Tokyo",
-    ]
-    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    for event in event_rows:
-        uid = f"{uuid.uuid4()}@voyageflow.local"
-        start_local = event["start_dt"].strftime("%Y%m%dT%H%M%S")
-        end_local = event["end_dt"].strftime("%Y%m%dT%H%M%S")
-        lines.extend([
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"DTSTAMP:{stamp}",
-            f"DTSTART;TZID=Asia/Tokyo:{start_local}",
-            f"DTEND;TZID=Asia/Tokyo:{end_local}",
-            f"SUMMARY:{_escape_ics_text(event.get('title', 'VoyageFlow旅程'))}",
-            f"DESCRIPTION:{_escape_ics_text(event.get('description', ''))}",
-            f"LOCATION:{_escape_ics_text(event.get('location', ''))}",
-            "END:VEVENT",
-        ])
-    lines.append("END:VCALENDAR")
-    return "\r\n".join(lines) + "\r\n"
-
-
-def render_google_calendar_sync_panel(df: pd.DataFrame) -> None:
-    event_rows = _calendar_rows_from_itinerary(df)
-    st.markdown("### 🗓️ Googleカレンダー同期")
-    if not event_rows:
-        st.caption("同期できる予定がまだありません。完成旅程を作成してください。")
-        return
-
-    st.caption("Googleカレンダーへ個別登録するか、旅程全体を .ics でダウンロードして取り込めます。")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        ics_text = _ics_content_from_rows(event_rows)
-        st.download_button(
-            "📥 旅程全体を .ics でダウンロード",
-            data=ics_text.encode("utf-8"),
-            file_name="voyageflow_itinerary.ics",
-            mime="text/calendar",
-            use_container_width=True,
-        )
-    with c2:
-        first_url = _google_calendar_event_url(event_rows[0])
-        st.link_button("📅 旅程の最初の予定をGoogleカレンダーで開く", first_url, use_container_width=True)
-
-    with st.expander("予定ごとのGoogleカレンダー登録リンク", expanded=False):
-        for idx, event in enumerate(event_rows, start=1):
-            label = f"{event['start_dt'].strftime('%m/%d %H:%M')} - {event['title']}"
-            st.link_button(label, _google_calendar_event_url(event), use_container_width=True)
 
 
 
@@ -898,6 +722,57 @@ def _extract_area_hint(name: str) -> str:
         if token in text:
             return token
     return ""
+
+
+
+
+def _is_ambiguous_destination_label(name: str) -> bool:
+    text = safe_text(name, "")
+    if not text:
+        return True
+    blocked_exact = {"エリア", "周辺", "駅周辺", "観光地", "レストラン", "食事処", "宿泊先"}
+    if text in blocked_exact:
+        return True
+    blocked_suffixes = ["エリア", "周辺"]
+    if text in blocked_exact:
+        return True
+    lowered = text.lower()
+    if lowered in {"area", "spot", "restaurant", "hotel area"}:
+        return True
+    return False
+
+
+def _repair_ambiguous_destinations(df: pd.DataFrame) -> pd.DataFrame:
+    # --- 修正箇所: 「エリア」などの曖昧スポット名を、近傍の具体地名から最低限補う ---
+    if df is None or df.empty or "destination" not in df.columns:
+        return df
+    repaired = df.copy().reset_index(drop=True)
+    last_anchor = ""
+    for idx in range(len(repaired)):
+        dest = safe_text(repaired.at[idx, "destination"], "")
+        if not _is_ambiguous_destination_label(dest):
+            if not _is_valid_hotel_row(repaired.iloc[idx]):
+                last_anchor = dest
+            continue
+
+        candidate = ""
+        if last_anchor:
+            anchor_hint = _extract_area_hint(last_anchor) or last_anchor
+            if anchor_hint:
+                candidate = f"{anchor_hint}周辺" if anchor_hint == last_anchor else anchor_hint
+
+        if not candidate:
+            one_point = safe_text(repaired.at[idx, "one_point"], "")
+            anchor_hint = _extract_area_hint(one_point)
+            if anchor_hint:
+                candidate = anchor_hint
+
+        if candidate:
+            log_event("Phase2正規化", f"曖昧destinationを補正: {dest} -> {candidate}", level="info")
+            repaired.at[idx, "destination"] = candidate
+            if not _is_valid_hotel_row(repaired.iloc[idx]):
+                last_anchor = candidate
+    return repaired
 
 
 def _detect_large_area_change_between_days(prev_day_df: pd.DataFrame, next_day_df: pd.DataFrame) -> bool:
@@ -2747,6 +2622,8 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
             day_rows = cleaned_rows if cleaned_rows else day_rows
 
         day_hotel_name = canonical_hotel_by_day.get(day, "")
+        next_day_hotel_name = canonical_hotel_by_day.get(day + 1, "")
+        hotel_end_name = day_hotel_name or next_day_hotel_name
 
         # --- 修正箇所: generic ホテル開始行は前日ホテル正本へ置換 ---
         if day != first_day:
@@ -2776,14 +2653,14 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
             if day != last_day and ((row_end and row_end >= "18:00") or safe_text(row.get("purpose"), "").lower() in {"accommodation", "hotel"}):
                 has_hotel_end = True
 
-        if day != last_day and not has_hotel_end and day_hotel_name:
+        if day != last_day and not has_hotel_end and hotel_end_name:
             last_non_hotel = next((row for row in reversed(day_rows) if not _is_hotel_like_name(safe_text(row.get("destination"), ""))), day_rows[-1])
             last_end = safe_text(last_non_hotel.get("end_time"), "20:00") or "20:00"
             hotel_end = _make_same_day_spot_row(
                 last_non_hotel,
                 start_time=last_end,
                 end_time="23:00" if last_end < "23:00" else _add_minutes_to_clock(last_end, 60),
-                destination=day_hotel_name,
+                destination=hotel_end_name,
                 purpose="accommodation",
                 genre="hotel",
                 one_point="翌日に備えてホテルへチェックイン。荷物整理と休息を優先します。",
@@ -2933,52 +2810,6 @@ def _fallback_transport_estimate_from_sequence(
     return {"minutes": minutes, "mode": mode, "label": label, "source": source, "note": note}
 
 
-def _build_departure_spot_from_initial_transport_row(row: pd.Series | Dict) -> Optional[Dict[str, object]]:
-    # --- 修正箇所: 先頭の駅transport行は出発スポットとして残す ---
-    row_dict = row.to_dict() if isinstance(row, pd.Series) else dict(row)
-    destination = safe_text(row_dict.get("destination"), "")
-    if not destination:
-        return None
-
-    start_time = safe_text(row_dict.get("start_time"), "")
-    end_time = safe_text(row_dict.get("end_time"), "")
-    prep_end_time = start_time
-    if start_time:
-        prep_end_time = _add_minutes_to_clock(start_time, 15)
-    if end_time and start_time:
-        gap = _minutes_between_clock(start_time, end_time)
-        if gap is not None and gap > 0:
-            prep_end_time = _add_minutes_to_clock(start_time, min(gap, 15))
-
-    departure_row = dict(row_dict)
-    departure_row["purpose"] = "departure"
-    departure_row["genre"] = safe_text(row_dict.get("genre"), "station") or "station"
-    departure_row["is_transport"] = False
-    departure_row["start_time"] = start_time
-    departure_row["end_time"] = prep_end_time
-    departure_row["duration_minutes"] = _minutes_between_clock(start_time, prep_end_time) or 15
-    departure_row["route_from"] = ""
-    departure_row["route_to"] = ""
-    departure_row["route_url"] = ""
-    departure_row["route_data_source"] = "phase2_departure_spot_split"
-    departure_row["estimated_duration_label"] = ""
-    departure_row["transport_mode"] = ""
-    existing_note = safe_text(row_dict.get("one_point"), "")
-    if existing_note in {"", "-"}:
-        departure_row["one_point"] = "出発前の準備と移動前確認を行います。"
-    return departure_row
-
-
-def _transport_departure_time_from_current_row(current: pd.Series | Dict, idx: int) -> str:
-    current_dict = current.to_dict() if isinstance(current, pd.Series) else dict(current)
-    start_time = safe_text(current_dict.get("start_time"), "")
-    end_time = safe_text(current_dict.get("end_time"), "")
-    if idx == 0 and safe_text(current_dict.get("purpose"), "").lower() == "transport":
-        if start_time:
-            return _add_minutes_to_clock(start_time, 15)
-    return end_time or start_time
-
-
 def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
     # --- 修正箇所: train / transport 行は独立スポットにせず、前後スポットを橋渡しする移動ヒントとして扱う ---
     if df2 is None or df2.empty:
@@ -2992,28 +2823,19 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
         current_purpose = safe_text(current.get("purpose"), "").lower()
         current_destination = safe_text(current.get("destination"), "")
         current_is_service_transport = current_purpose == "transport" and _is_transport_service_like_destination(current_destination)
-        current_is_transport_row = current_purpose == "transport"
 
-        # --- 修正箇所: 先頭の駅transport行だけは出発スポットとして残し、他のtransport行は移動カード側へ集約する ---
-        if current_is_transport_row:
-            if idx == 0:
-                departure_spot = _build_departure_spot_from_initial_transport_row(current)
-                if departure_spot:
-                    rows.append(departure_spot)
-                    log_event("Phase3", f"先頭transport行を出発スポットとして保持: {current_destination}", level="info")
-            elif current_is_service_transport:
-                log_event("Phase3", f"列車サービス行を単独スポット表示しない: {current_destination}", level="info")
-            else:
-                log_event("Phase3", f"transport行を単独スポット表示しない: {current_destination}", level="info")
-        else:
-            current_dict = current.to_dict()
-            current_dict["is_transport"] = False
-            current_dict["route_from"] = safe_text(current_dict.get("route_from"), "")
-            current_dict["route_to"] = safe_text(current_dict.get("route_to"), "")
-            current_dict["route_url"] = safe_text(current_dict.get("route_url"), "")
-            current_dict["route_data_source"] = safe_text(current_dict.get("route_data_source"), "")
-            current_dict["estimated_duration_label"] = safe_text(current_dict.get("estimated_duration_label"), "")
-            rows.append(current_dict)
+        if current_is_service_transport:
+            log_event("Phase3", f"列車サービス行を単独スポット表示しない: {current_destination}", level="info")
+            continue
+
+        current_dict = current.to_dict()
+        current_dict["is_transport"] = False
+        current_dict["route_from"] = safe_text(current_dict.get("route_from"), "")
+        current_dict["route_to"] = safe_text(current_dict.get("route_to"), "")
+        current_dict["route_url"] = safe_text(current_dict.get("route_url"), "")
+        current_dict["route_data_source"] = safe_text(current_dict.get("route_data_source"), "")
+        current_dict["estimated_duration_label"] = safe_text(current_dict.get("estimated_duration_label"), "")
+        rows.append(current_dict)
 
         if idx >= len(source_df) - 1:
             continue
@@ -3049,7 +2871,7 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             log_event("Phase3", f"同一地点移動をスキップ: {origin_name} → {destination_name}", level="info")
             continue
 
-        departure_time = _transport_departure_time_from_current_row(current, idx) or safe_text(current.get("end_time"), safe_text(current.get("start_time"), planning_state.get("departure_time", "09:00")))
+        departure_time = safe_text(current.get("end_time"), safe_text(current.get("start_time"), planning_state.get("departure_time", "09:00")))
         departure_date = safe_text(current.get("date"), safe_text(planning_state.get("start_date"), ""))
 
         llm_result = _llm_transport_duration_from_sequence(
@@ -3211,6 +3033,9 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
         for dest in dropped:
             log_event("Phase2正規化", f"列車サービス名の transport 行を除外: {dest}", level="info")
         df = df.loc[~drop_mask].reset_index(drop=True)
+
+    # --- 修正箇所: 曖昧destination（エリア等）を最低限補正 ---
+    df = _repair_ambiguous_destinations(df)
 
     if planning_state["hotel_required"]:
         has_hotel = df.apply(lambda row: _is_valid_hotel_row(row), axis=1).any()
@@ -4108,7 +3933,6 @@ with tabs[2]:
             st.dataframe(st.session_state.df_phase2[display_cols], use_container_width=True, height=320)
 
         st.markdown("### 完成旅程タイムライン")
-        render_google_calendar_sync_panel(df_phase3)
         render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
         render_itinerary_cards(
             df_phase3,
