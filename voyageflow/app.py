@@ -4,6 +4,7 @@ import urllib.parse
 import re
 import html
 import json
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
@@ -35,7 +36,7 @@ from maps.routes_api import RoutesAPI
 # - 同一日の重複ホテル統合ロジック内の正規表現SyntaxErrorを修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.30-hotel-canonical-and-meal-protect-fix"
+APP_VERSION_NAME = "v6.2.31-calendar-sync-restore"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -557,6 +558,173 @@ def safe_text(value, default: str = "-") -> str:
 
 
 
+
+
+
+# =========================================================
+# 修正箇所: Googleカレンダー同期ヘルパー
+# - 完成旅程から Google Calendar 登録リンク / ICS 出力を行う
+# - OAuth は使わず、まずは安全な同期導線に限定
+# =========================================================
+def _parse_itinerary_datetime(date_text: str, time_text: str) -> Optional[datetime]:
+    date_value = str(date_text or "").strip()
+    time_value = str(time_text or "").strip()
+    if not date_value or not time_value or time_value == "-":
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(f"{date_value} {time_value}", fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _calendar_end_datetime_from_row(row: Dict[str, object]) -> Optional[datetime]:
+    start_dt = _parse_itinerary_datetime(safe_text(row.get("date"), ""), safe_text(row.get("start_time"), ""))
+    if start_dt is None:
+        return None
+
+    explicit_end = _parse_itinerary_datetime(safe_text(row.get("date"), ""), safe_text(row.get("end_time"), ""))
+    if explicit_end and explicit_end > start_dt:
+        return explicit_end
+
+    duration_minutes = row.get("duration_minutes")
+    if pd.notna(duration_minutes):
+        try:
+            minutes = max(1, int(float(duration_minutes)))
+            return start_dt + timedelta(minutes=minutes)
+        except Exception:
+            pass
+
+    stay_minutes = row.get("stay_minutes")
+    if pd.notna(stay_minutes):
+        try:
+            minutes = max(1, int(float(stay_minutes)))
+            return start_dt + timedelta(minutes=minutes)
+        except Exception:
+            pass
+
+    return start_dt + timedelta(minutes=60)
+
+
+def _calendar_title_from_row(row: Dict[str, object]) -> str:
+    day_label = f"Day{int(row.get('day'))}" if pd.notna(row.get('day')) else "旅程"
+    purpose_raw = safe_text(row.get("purpose"), "")
+    purpose = format_purpose(purpose_raw) if purpose_raw and purpose_raw != "-" else "予定"
+    destination = safe_text(row.get("destination"), "予定")
+    if purpose in {"出発", "到着", "食事", "買い物", "観光・見学", "宿泊"}:
+        return f"{day_label} {purpose}：{destination}"
+    return f"{day_label} {destination}"
+
+
+def _calendar_rows_from_itinerary(df: pd.DataFrame) -> List[Dict[str, object]]:
+    if df is None or df.empty:
+        return []
+
+    rows: List[Dict[str, object]] = []
+    normalized = df.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+    for _, row in normalized.iterrows():
+        row_dict = row.to_dict()
+        if bool(row_dict.get("is_transport", False)):
+            continue
+        destination = safe_text(row_dict.get("destination"), "")
+        if not destination:
+            continue
+        start_dt = _parse_itinerary_datetime(safe_text(row_dict.get("date"), ""), safe_text(row_dict.get("start_time"), ""))
+        end_dt = _calendar_end_datetime_from_row(row_dict)
+        if start_dt is None or end_dt is None or end_dt <= start_dt:
+            continue
+        purpose = safe_text(format_purpose(row_dict.get("purpose")), "予定")
+        note = safe_text(row_dict.get("one_point"), "")
+        rows.append({
+            "title": _calendar_title_from_row(row_dict),
+            "description": f"VoyageFlow旅程 / 目的: {purpose}" + (f"\n\n{note}" if note and note != "-" else ""),
+            "location": destination,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "day": row_dict.get("day"),
+            "sequence": row_dict.get("sequence"),
+        })
+    return rows
+
+
+def _google_calendar_event_url(event_row: Dict[str, object]) -> str:
+    start_dt = event_row["start_dt"].strftime("%Y%m%dT%H%M%S")
+    end_dt = event_row["end_dt"].strftime("%Y%m%dT%H%M%S")
+    params = {
+        "action": "TEMPLATE",
+        "text": event_row.get("title", "VoyageFlow旅程"),
+        "dates": f"{start_dt}/{end_dt}",
+        "ctz": "Asia/Tokyo",
+        "details": event_row.get("description", ""),
+        "location": event_row.get("location", ""),
+    }
+    return "https://calendar.google.com/calendar/render?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+
+
+def _escape_ics_text(value: str) -> str:
+    text = str(value or "")
+    text = text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+    text = text.replace("\n", "\\n")
+    return text
+
+
+def _ics_content_from_rows(event_rows: List[Dict[str, object]]) -> str:
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//VoyageFlow//Calendar Sync//JA",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:VoyageFlow旅程",
+        "X-WR-TIMEZONE:Asia/Tokyo",
+    ]
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    for event in event_rows:
+        uid = f"{uuid.uuid4()}@voyageflow.local"
+        start_local = event["start_dt"].strftime("%Y%m%dT%H%M%S")
+        end_local = event["end_dt"].strftime("%Y%m%dT%H%M%S")
+        lines.extend([
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART;TZID=Asia/Tokyo:{start_local}",
+            f"DTEND;TZID=Asia/Tokyo:{end_local}",
+            f"SUMMARY:{_escape_ics_text(event.get('title', 'VoyageFlow旅程'))}",
+            f"DESCRIPTION:{_escape_ics_text(event.get('description', ''))}",
+            f"LOCATION:{_escape_ics_text(event.get('location', ''))}",
+            "END:VEVENT",
+        ])
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def render_google_calendar_sync_panel(df: pd.DataFrame) -> None:
+    event_rows = _calendar_rows_from_itinerary(df)
+    st.markdown("### 🗓️ Googleカレンダー同期")
+    if not event_rows:
+        st.caption("同期できる予定がまだありません。完成旅程を作成してください。")
+        return
+
+    st.caption("Googleカレンダーへ個別登録するか、旅程全体を .ics でダウンロードして取り込めます。")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        ics_text = _ics_content_from_rows(event_rows)
+        st.download_button(
+            "📥 旅程全体を .ics でダウンロード",
+            data=ics_text.encode("utf-8"),
+            file_name="voyageflow_itinerary.ics",
+            mime="text/calendar",
+            use_container_width=True,
+        )
+    with c2:
+        first_url = _google_calendar_event_url(event_rows[0])
+        st.link_button("📅 最初の予定をGoogleカレンダーで開く", first_url, use_container_width=True)
+
+    with st.expander("予定ごとのGoogleカレンダー登録リンク", expanded=False):
+        for event in event_rows:
+            label = f"{event['start_dt'].strftime('%m/%d %H:%M')} - {event['title']}"
+            st.link_button(label, _google_calendar_event_url(event), use_container_width=True)
 
 
 def _normalize_location_for_compare(name: str) -> str:
@@ -4015,6 +4183,7 @@ with tabs[2]:
             st.dataframe(st.session_state.df_phase2[display_cols], use_container_width=True, height=320)
 
         st.markdown("### 完成旅程タイムライン")
+        render_google_calendar_sync_panel(df_phase3)
         render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
         render_itinerary_cards(
             df_phase3,
