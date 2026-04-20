@@ -36,7 +36,7 @@ from maps.routes_api import RoutesAPI
 # - 同一日の重複ホテル統合ロジック内の正規表現SyntaxErrorを修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.25-google-calendar-sync"
+APP_VERSION_NAME = "v6.2.26-station-transport-double-count-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -2925,19 +2925,23 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
         current_purpose = safe_text(current.get("purpose"), "").lower()
         current_destination = safe_text(current.get("destination"), "")
         current_is_service_transport = current_purpose == "transport" and _is_transport_service_like_destination(current_destination)
+        current_is_transport_row = current_purpose == "transport"
 
-        if current_is_service_transport:
-            log_event("Phase3", f"列車サービス行を単独スポット表示しない: {current_destination}", level="info")
-            continue
-
-        current_dict = current.to_dict()
-        current_dict["is_transport"] = False
-        current_dict["route_from"] = safe_text(current_dict.get("route_from"), "")
-        current_dict["route_to"] = safe_text(current_dict.get("route_to"), "")
-        current_dict["route_url"] = safe_text(current_dict.get("route_url"), "")
-        current_dict["route_data_source"] = safe_text(current_dict.get("route_data_source"), "")
-        current_dict["estimated_duration_label"] = safe_text(current_dict.get("estimated_duration_label"), "")
-        rows.append(current_dict)
+        # --- 修正箇所: Phase2 の transport 行は独立スポットとして出さず、移動カード側へ時間を集約する ---
+        if current_is_transport_row:
+            if current_is_service_transport:
+                log_event("Phase3", f"列車サービス行を単独スポット表示しない: {current_destination}", level="info")
+            else:
+                log_event("Phase3", f"transport行を単独スポット表示しない: {current_destination}", level="info")
+        else:
+            current_dict = current.to_dict()
+            current_dict["is_transport"] = False
+            current_dict["route_from"] = safe_text(current_dict.get("route_from"), "")
+            current_dict["route_to"] = safe_text(current_dict.get("route_to"), "")
+            current_dict["route_url"] = safe_text(current_dict.get("route_url"), "")
+            current_dict["route_data_source"] = safe_text(current_dict.get("route_data_source"), "")
+            current_dict["estimated_duration_label"] = safe_text(current_dict.get("estimated_duration_label"), "")
+            rows.append(current_dict)
 
         if idx >= len(source_df) - 1:
             continue
