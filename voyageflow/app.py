@@ -34,7 +34,7 @@ from maps.routes_api import RoutesAPI
 # - 移動開始の数分前に予約するとよい旨の案内を追加
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.32-uber-link-for-taxi"
+APP_VERSION_NAME = "v6.2.33-phase35-validation-agent"
 APP_UPDATED_DATE = "2026-04-20"
 
 
@@ -533,6 +533,8 @@ def init_session_state() -> None:
         "hide_cancelled_plan": False,
         "hide_completed_execution": False,
         "hide_cancelled_execution": False,
+        "validation_agent_result": None,
+        "validation_agent_raw": "",
     }
 
     for key, value in defaults.items():
@@ -723,6 +725,149 @@ def render_google_calendar_sync_panel(df: pd.DataFrame) -> None:
         for event in event_rows:
             label = f"{event['start_dt'].strftime('%m/%d %H:%M')} - {event['title']}"
             st.link_button(label, _google_calendar_event_url(event), use_container_width=True)
+
+
+# =========================================================
+# 修正箇所: Phase3.5 検証エージェント（実験・指摘のみ）
+# =========================================================
+def _itinerary_text_for_validation(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+
+    lines: List[str] = []
+    for _, row in df.reset_index(drop=True).iterrows():
+        day = safe_text(row.get("day"), "")
+        start_time = safe_text(row.get("start_time"), "")
+        end_time = safe_text(row.get("end_time"), "")
+        destination = safe_text(row.get("destination"), "")
+        purpose = safe_text(row.get("purpose"), "")
+        is_transport = bool(row.get("is_transport", False))
+        transport_mode = safe_text(row.get("transport_mode"), "")
+        route_from = safe_text(row.get("route_from"), "")
+        route_to = safe_text(row.get("route_to"), "")
+        one_point = safe_text(row.get("one_point"), "")
+
+        if is_transport:
+            segment = f"Day{day} {start_time}-{end_time} 移動: {route_from or destination} → {route_to or destination}"
+            if transport_mode and transport_mode != '-':
+                segment += f" / 手段={transport_mode}"
+            if one_point and one_point != '-':
+                segment += f" / メモ={one_point}"
+            lines.append(segment)
+        else:
+            segment = f"Day{day} {start_time}-{end_time} スポット: {destination}"
+            if purpose and purpose != '-':
+                segment += f" / 目的={purpose}"
+            if one_point and one_point != '-':
+                segment += f" / メモ={one_point}"
+            lines.append(segment)
+    return "\n".join(lines)
+
+
+def _build_phase35_validation_prompt(natural_plan_text: str, itinerary_text: str) -> str:
+    return f"""
+あなたは旅行プランの検証担当です。
+自然文の旅程案と、完成旅程タイムラインを比較し、違和感のある点だけを指摘してください。
+
+重要ルール:
+- 自動で書き換えない
+- 指摘と修正提案だけを返す
+- 問題がない場合は issues を空配列にする
+- 出力は必ずJSONのみ
+- 最大5件まで
+
+出力形式:
+{{
+  "summary": "全体所見",
+  "issues": [
+    {{
+      "type": "duplicate_hotel",
+      "severity": "medium",
+      "location": "Day1 19:30 新宿のホテル",
+      "issue": "抽象ホテルノードと具体ホテル名が重複している",
+      "suggestion": "具体ホテル名へ統合し、中間ノードを削除する"
+    }}
+  ]
+}}
+
+比較対象の自然文旅程:
+{natural_plan_text}
+
+比較対象の完成旅程:
+{itinerary_text}
+""".strip()
+
+
+def run_phase35_validation_agent(natural_plan_text: str, df: pd.DataFrame) -> Dict[str, object]:
+    itinerary_text = _itinerary_text_for_validation(df)
+    if not natural_plan_text.strip() or not itinerary_text.strip():
+        return {"summary": "比較対象が不足しています。", "issues": []}
+
+    prompt = _build_phase35_validation_prompt(natural_plan_text, itinerary_text)
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        data = _safe_json_extract(raw) or {}
+        summary = safe_text(data.get("summary"), "大きな違和感は見つかりませんでした。")
+        issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+        normalized_issues = []
+        for issue in issues[:5]:
+            if not isinstance(issue, dict):
+                continue
+            normalized_issues.append({
+                "type": safe_text(issue.get("type"), "issue"),
+                "severity": safe_text(issue.get("severity"), "medium"),
+                "location": safe_text(issue.get("location"), ""),
+                "issue": safe_text(issue.get("issue"), ""),
+                "suggestion": safe_text(issue.get("suggestion"), ""),
+            })
+        return {"summary": summary, "issues": normalized_issues, "raw": raw}
+    except Exception as e:
+        log_event("Phase3.5検証", f"検証エージェント失敗: {e}", level="warning")
+        return {
+            "summary": "検証エージェントの実行に失敗しました。今回は完成旅程をそのまま利用してください。",
+            "issues": [],
+            "raw": str(e),
+        }
+
+
+def render_phase35_validation_panel(natural_plan_text: str, df: pd.DataFrame) -> None:
+    st.markdown("### 🧪 Phase3.5 検証エージェント（実験）")
+    st.caption("自然文案と完成旅程を比較し、違和感のある点と修正提案だけを表示します。自動修正は行いません。問題があれば、この実験機能を無効扱いにしてすぐ戻せます。")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("🔍 旅程表を検証する", use_container_width=True):
+            result = run_phase35_validation_agent(natural_plan_text, df)
+            st.session_state.validation_agent_result = result
+            st.session_state.validation_agent_raw = safe_text(result.get("raw"), "")
+    with col2:
+        if st.button("🧹 検証結果をクリア", use_container_width=True):
+            st.session_state.validation_agent_result = None
+            st.session_state.validation_agent_raw = ""
+            st.rerun()
+
+    result = st.session_state.get("validation_agent_result")
+    if not result:
+        st.info("必要なときだけ実行する確認用パネルです。完成旅程そのものは変更しません。")
+        return
+
+    st.info(result.get("summary", "全体所見はありません。"))
+    issues = result.get("issues") or []
+    if not issues:
+        st.success("検証エージェントは大きな違和感を見つけませんでした。")
+    else:
+        for idx, issue in enumerate(issues, start=1):
+            severity = safe_text(issue.get("severity"), "medium").lower()
+            box = st.warning if severity in {"high", "medium"} else st.info
+            location = safe_text(issue.get("location"), "該当箇所")
+            issue_text = safe_text(issue.get("issue"), "")
+            suggestion = safe_text(issue.get("suggestion"), "")
+            type_name = safe_text(issue.get("type"), "issue")
+            box(f"{idx}. [{type_name}] {location}\n\n問題: {issue_text}\n\n修正案: {suggestion}")
+
+    with st.expander("検証エージェントの生出力（デバッグ用）", expanded=False):
+        st.code(st.session_state.get("validation_agent_raw", ""), language="json")
 
 
 def _normalize_location_for_compare(name: str) -> str:
@@ -4207,6 +4352,7 @@ with tabs[2]:
 
         st.markdown("### 完成旅程タイムライン")
         render_google_calendar_sync_panel(df_phase3)
+        render_phase35_validation_panel(st.session_state.trip_plan or "", df_phase3)
         render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
         render_itinerary_cards(
             df_phase3,
