@@ -35,7 +35,7 @@ from maps.routes_api import RoutesAPI
 # - 同一日の重複ホテル統合ロジック内の正規表現SyntaxErrorを修正
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.29-ambiguous-spot-and-day1-hotel-fix"
+APP_VERSION_NAME = "v6.2.30-hotel-canonical-and-meal-protect-fix"
 APP_UPDATED_DATE = "2026-04-19"
 
 
@@ -691,6 +691,32 @@ def _compose_transport_bridge_hints(bridge_rows: list) -> tuple[str, str]:
     return service_hint, (mode_hint or "train")
 
 
+def _extract_concrete_hotel_name_from_plan_text(plan_text: str) -> str:
+    # --- 修正箇所: Phase1自然文の「宿泊先: ...」から具体ホテル名を強制抽出 ---
+    text = str(plan_text or "")
+    if not text.strip():
+        return ""
+
+    for raw_line in text.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        m = re.search(r"宿泊先\s*[:：]\s*(.+)$", line)
+        candidate = ""
+        if m:
+            candidate = m.group(1).strip()
+        elif "ホテル" in line and any(token in line for token in ["宿泊", "チェックイン", "ホテル"]):
+            candidate = line.strip()
+        if not candidate:
+            continue
+        candidate = re.sub(r"\s*[（(][^）)]*エリア[^）)]*[）)]\s*$", "", candidate).strip()
+        candidate = re.sub(r"\s*[（(][^）)]*周辺[^）)]*[）)]\s*$", "", candidate).strip()
+        candidate = re.sub(r"^(宿泊先\s*[:：]\s*)", "", candidate).strip()
+        if candidate and not _is_generic_hotel_label(candidate):
+            return candidate
+    return ""
+
+
 def _extract_concrete_hotel_name_from_day(day_df: pd.DataFrame) -> str:
     if day_df is None or day_df.empty:
         return ""
@@ -775,6 +801,42 @@ def _repair_ambiguous_destinations(df: pd.DataFrame) -> pd.DataFrame:
     return repaired
 
 
+def _looks_like_meal_time(start_time: str, end_time: str) -> bool:
+    start = safe_text(start_time, "")
+    end = safe_text(end_time, "")
+    if not start:
+        return False
+    return ("07:00" <= start <= "10:30") or ("11:00" <= start <= "14:30") or ("17:00" <= start <= "21:30") or (end and ("11:30" <= end <= "14:30" or "18:00" <= end <= "22:00"))
+
+
+def _protect_meal_rows(df: pd.DataFrame) -> pd.DataFrame:
+    # --- 修正箇所: shopping系施設でも食事文脈なら purpose=meal を優先保持 ---
+    if df is None or df.empty:
+        return df
+    repaired = df.copy().reset_index(drop=True)
+    for idx in range(len(repaired)):
+        row = repaired.iloc[idx]
+        purpose = safe_text(row.get("purpose"), "").lower()
+        genre = safe_text(row.get("genre"), "").lower()
+        if purpose in {"meal", "lunch", "dinner", "breakfast"}:
+            continue
+        if _is_valid_hotel_row(row) or bool(row.get("is_transport", False)):
+            continue
+
+        destination = safe_text(row.get("destination"), "")
+        one_point = safe_text(row.get("one_point"), "")
+        context = f"{destination} {one_point}".lower()
+        meal_tokens = ["ランチ", "昼食", "夕食", "朝食", "ディナー", "食事", "グルメ", "レストラン", "カフェ", "喫茶", "フード", "sweets", "cafe"]
+        shoppingish = genre in {"shopping", "shopping_area", "market", "department_store", "mall"} or any(token in context for token in ["ショップ", "買い物", "ショッピング", "商業施設"])
+        mealish = any(token.lower() in context for token in [t.lower() for t in meal_tokens])
+        if mealish and (_looks_like_meal_time(safe_text(row.get("start_time"), ""), safe_text(row.get("end_time"), "")) or shoppingish):
+            repaired.at[idx, "purpose"] = "meal"
+            if genre in {"shopping", "shopping_area", "market"}:
+                repaired.at[idx, "genre"] = "restaurant"
+            log_event("Phase2正規化", f"meal行を保護: {destination}", level="info")
+    return repaired
+
+
 def _detect_large_area_change_between_days(prev_day_df: pd.DataFrame, next_day_df: pd.DataFrame) -> bool:
     prev_candidates = [safe_text(row.get("destination"), "") for _, row in prev_day_df.iterrows() if not bool(row.get("is_transport", False)) and not _is_hotel_like_name(safe_text(row.get("destination"), ""))]
     next_candidates = [safe_text(row.get("destination"), "") for _, row in next_day_df.iterrows() if not bool(row.get("is_transport", False)) and not _is_hotel_like_name(safe_text(row.get("destination"), ""))]
@@ -789,6 +851,10 @@ def _resolve_canonical_hotel_by_day(normalized: pd.DataFrame) -> Dict[int, str]:
     canonical_hotel_by_day: Dict[int, str] = {}
     days = sorted(normalized["day"].dropna().astype(int).unique().tolist()) if "day" in normalized.columns else []
 
+    phase1_hotel_name = _extract_concrete_hotel_name_from_plan_text(
+        st.session_state.get("trip_plan") or st.session_state.get("trip_plan_draft") or ""
+    )
+
     explicit_by_day: Dict[int, str] = {}
     for day in days:
         day_df = normalized[normalized["day"] == day].sort_values("sequence", kind="stable").reset_index(drop=True)
@@ -796,6 +862,11 @@ def _resolve_canonical_hotel_by_day(normalized: pd.DataFrame) -> Dict[int, str]:
         if explicit_name:
             explicit_by_day[day] = explicit_name
             canonical_hotel_by_day[day] = explicit_name
+
+    if phase1_hotel_name:
+        first_day = days[0] if days else 1
+        canonical_hotel_by_day.setdefault(first_day, phase1_hotel_name)
+        explicit_by_day.setdefault(first_day, phase1_hotel_name)
 
     for day in days:
         if day in canonical_hotel_by_day:
@@ -813,6 +884,9 @@ def _resolve_canonical_hotel_by_day(normalized: pd.DataFrame) -> Dict[int, str]:
             next_day_df = normalized[normalized["day"] == next_day].reset_index(drop=True)
             if not _detect_large_area_change_between_days(cur_day_df, next_day_df):
                 canonical_hotel_by_day[day] = explicit_by_day[next_day]
+                continue
+        if phase1_hotel_name:
+            canonical_hotel_by_day[day] = phase1_hotel_name
 
     return canonical_hotel_by_day
 
@@ -2561,6 +2635,12 @@ def _merge_same_day_duplicate_hotel_rows(df: pd.DataFrame) -> pd.DataFrame:
                         merged["start_time"] = min(starts)
                     if ends:
                         merged["end_time"] = max(ends)
+                    cur_dest = safe_text(current.get("destination"), "")
+                    nxt_dest = safe_text(nxt.get("destination"), "")
+                    if _is_generic_hotel_label(cur_dest) and not _is_generic_hotel_label(nxt_dest):
+                        merged["destination"] = nxt_dest
+                    elif _is_generic_hotel_label(nxt_dest) and not _is_generic_hotel_label(cur_dest):
+                        merged["destination"] = cur_dest
                     merged["purpose"] = "accommodation"
                     merged["genre"] = "hotel"
                     merged["one_point"] = safe_text(current.get("one_point"), "") or safe_text(nxt.get("one_point"), "") or "翌日に備えてホテルで休息します。"
@@ -3036,6 +3116,8 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
 
     # --- 修正箇所: 曖昧destination（エリア等）を最低限補正 ---
     df = _repair_ambiguous_destinations(df)
+    # --- 修正箇所: 昼食/夕食文脈の行は shopping系施設でも meal を優先保持 ---
+    df = _protect_meal_rows(df)
 
     if planning_state["hotel_required"]:
         has_hotel = df.apply(lambda row: _is_valid_hotel_row(row), axis=1).any()
