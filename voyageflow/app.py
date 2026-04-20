@@ -26,18 +26,16 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.24-hotel-dedupe-weather-and-syntax-fix
-# 【制作日】2026-04-19
+# 【バージョン名】VoyageFlow v6.2.32-uber-link-for-taxi
+# 【制作日】2026-04-20
 # 【前バージョンからの修正内容】
-# - 同一日の重複ホテルカードを統合し、夜のホテルカードを1件に整理
-# - 翌朝の generic ホテル出発カードは前日ホテル正本へ置換
-# - Day1 先頭ホテル除去ロジックを維持しつつホテル名引き回しを安定化
-# - 天候fallback表示から「モック」を外し、ユーザー向け文言を参考値ベースに整理
-# - 同一日の重複ホテル統合ロジック内の正規表現SyntaxErrorを修正
+# - タクシー移動カードのときだけ Uber 導線を追加
+# - Uber は安全なリンク導線のみ追加し、既存の旅程・ホテル・カレンダー・天候ロジックは変更しない
+# - 移動開始の数分前に予約するとよい旨の案内を追加
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.31-calendar-sync-restore"
-APP_UPDATED_DATE = "2026-04-19"
+APP_VERSION_NAME = "v6.2.32-uber-link-for-taxi"
+APP_UPDATED_DATE = "2026-04-20"
 
 
 # =========================================================
@@ -3507,6 +3505,24 @@ def render_timeline_visibility_controls(scope: str, title: str = "表示オプ�
 
 
 
+
+# =========================================================
+# 修正箇所: タクシー移動向け Uber 導線
+# =========================================================
+def build_uber_ride_url(origin_name: str, destination_name: str) -> str:
+    pickup = str(origin_name or '').strip()
+    dropoff = str(destination_name or '').strip()
+    params = {
+        'action': 'setPickup',
+        'pickup': 'my_location',
+    }
+    if pickup:
+        params['pickup[nickname]'] = pickup
+    if dropoff:
+        params['dropoff[formatted_address]'] = dropoff
+        params['dropoff[nickname]'] = dropoff
+    return 'https://m.uber.com/ul/?' + urllib.parse.urlencode(params)
+
 def _format_highlight_comment_html(text: str) -> str:
     text = safe_text(text, "")
     if not text:
@@ -3606,6 +3622,13 @@ def render_itinerary_cards(
                     if note:
                         st.markdown(f"<div class='vf-card-note'>差分: {note}</div>", unsafe_allow_html=True)
                     st.link_button("🗺️ Google Mapsでルートを見る", route_url, use_container_width=True)
+
+                    # 修正箇所: タクシー移動カードのときだけ Uber 導線を表示
+                    current_transport_mode = safe_text(row_dict.get("transport_mode"), "").lower()
+                    if current_transport_mode == "taxi":
+                        uber_url = build_uber_ride_url(origin, destination)
+                        st.caption("タクシー移動です。移動開始の数分前に Uber を予約するとスムーズです。")
+                        st.link_button("🚕 Uberで配車予約", uber_url, use_container_width=True)
 
                     if allow_transport_edit and absolute_idx is not None:
                         with st.expander(f"移動手段を変更 Day{int(day)}-Step{absolute_idx + 1}", expanded=False):
