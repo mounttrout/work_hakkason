@@ -34,8 +34,8 @@ from maps.routes_api import RoutesAPI
 # - 移動開始の数分前に予約するとよい旨の案内を追加
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.33-phase35-validation-agent"
-APP_UPDATED_DATE = "2026-04-20"
+APP_VERSION_NAME = "v6.2.34c-phase35-safer-approval-guard"
+APP_UPDATED_DATE = "2026-04-21"
 
 
 # =========================================================
@@ -537,6 +537,8 @@ def init_session_state() -> None:
         "validation_agent_raw": "",
         "validation_autofix_summary": [],
         "validation_time_overlap_candidates": [],
+        "validation_source_plan_text": "",
+        "validation_source_itinerary_text": "",
     }
 
     for key, value in defaults.items():
@@ -840,13 +842,21 @@ def render_phase35_validation_panel(natural_plan_text: str, df: pd.DataFrame) ->
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("🔍 旅程表を検証する", use_container_width=True):
+            st.session_state.validation_autofix_summary = []
+            st.session_state.validation_time_overlap_candidates = []
             result = run_phase35_validation_agent(natural_plan_text, df)
             st.session_state.validation_agent_result = result
             st.session_state.validation_agent_raw = safe_text(result.get("raw"), "")
+            st.session_state.validation_source_plan_text = safe_text(natural_plan_text, "")
+            st.session_state.validation_source_itinerary_text = _itinerary_text_for_validation(df)
     with col2:
         if st.button("🧹 検証結果をクリア", use_container_width=True):
             st.session_state.validation_agent_result = None
             st.session_state.validation_agent_raw = ""
+            st.session_state.validation_autofix_summary = []
+            st.session_state.validation_time_overlap_candidates = []
+            st.session_state.validation_source_plan_text = ""
+            st.session_state.validation_source_itinerary_text = ""
             st.rerun()
 
     result = st.session_state.get("validation_agent_result")
@@ -3503,12 +3513,15 @@ def approve_and_build_phase2_phase3() -> None:
         log_event("検査", "スポット間の移動カード欠落は検出されませんでした。")
 
     validation_result = st.session_state.get("validation_agent_result")
+    validation_source_plan_text = safe_text(st.session_state.get("validation_source_plan_text"), "")
     autofix_summary: List[str] = []
     overlap_candidates: List[Dict[str, object]] = []
-    if isinstance(validation_result, dict) and validation_result:
+    if isinstance(validation_result, dict) and validation_result and validation_source_plan_text == safe_text(trip_plan, ""):
         df3, autofix_summary, overlap_candidates = _apply_phase35_safe_autofix(df3, validation_result)
         for note in autofix_summary:
             log_event("Phase3.5", note, level="info")
+    elif isinstance(validation_result, dict) and validation_result:
+        log_event("Phase3.5", "検証結果の元になった旅程案が現在の了承案と異なるため、自動反映をスキップ", level="warning")
 
     st.session_state.validation_autofix_summary = autofix_summary
     st.session_state.validation_time_overlap_candidates = overlap_candidates
