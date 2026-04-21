@@ -539,6 +539,8 @@ def init_session_state() -> None:
         "validation_time_overlap_candidates": [],
         "validation_source_plan_text": "",
         "validation_source_itinerary_text": "",
+        "applied_validation_fixes": [],
+        "dismissed_validation_fixes": [],
     }
 
     for key, value in defaults.items():
@@ -837,18 +839,21 @@ def run_phase35_validation_agent(natural_plan_text: str, df: pd.DataFrame) -> Di
 
 def render_phase35_validation_panel(natural_plan_text: str, df: pd.DataFrame) -> None:
     st.markdown("### 🧪 Phase3.5 検証エージェント（実験）")
-    st.caption("自然文案と完成旅程を比較し、違和感のある点と修正提案だけを表示します。自動修正は行いません。問題があれば、この実験機能を無効扱いにしてすぐ戻せます。")
+    st.caption("自然文案と完成旅程を比較し、違和感のある点と修正提案だけを表示します。time_overlap は候補ボタンから局所適用できます。その他は自動修正しません。")
 
     col1, col2 = st.columns([1, 1])
     with col1:
         if st.button("🔍 旅程表を検証する", use_container_width=True):
             st.session_state.validation_autofix_summary = []
             st.session_state.validation_time_overlap_candidates = []
+            st.session_state.applied_validation_fixes = []
+            st.session_state.dismissed_validation_fixes = []
             result = run_phase35_validation_agent(natural_plan_text, df)
             st.session_state.validation_agent_result = result
             st.session_state.validation_agent_raw = safe_text(result.get("raw"), "")
             st.session_state.validation_source_plan_text = safe_text(natural_plan_text, "")
             st.session_state.validation_source_itinerary_text = _itinerary_text_for_validation(df)
+            st.session_state.validation_time_overlap_candidates = _find_time_overlap_candidates(df)
     with col2:
         if st.button("🧹 検証結果をクリア", use_container_width=True):
             st.session_state.validation_agent_result = None
@@ -857,6 +862,8 @@ def render_phase35_validation_panel(natural_plan_text: str, df: pd.DataFrame) ->
             st.session_state.validation_time_overlap_candidates = []
             st.session_state.validation_source_plan_text = ""
             st.session_state.validation_source_itinerary_text = ""
+            st.session_state.applied_validation_fixes = []
+            st.session_state.dismissed_validation_fixes = []
             st.rerun()
 
     result = st.session_state.get("validation_agent_result")
@@ -880,20 +887,27 @@ def render_phase35_validation_panel(natural_plan_text: str, df: pd.DataFrame) ->
 
     autofix_summary = st.session_state.get("validation_autofix_summary") or []
     if autofix_summary:
-        st.markdown("#### Phase3.5 自動反映メモ")
+        st.markdown("#### Phase3.5 反映メモ")
         for note in autofix_summary:
             st.write(f"- {safe_text(note, '')}")
 
-    overlap_candidates = st.session_state.get("validation_time_overlap_candidates") or []
+    overlap_candidates = _phase35_refresh_overlap_candidates() if isinstance(st.session_state.get("df_phase3"), pd.DataFrame) else []
     if overlap_candidates:
         st.markdown("#### time_overlap 修正候補")
-        for idx, candidate in enumerate(overlap_candidates, start=1):
-            st.write(
-                f"{idx}. Day{candidate.get('day')} "
+        dismissed_keys = set(st.session_state.get("dismissed_validation_fixes") or [])
+        visible_candidates = [c for c in overlap_candidates if _phase35_overlap_candidate_key(c) not in dismissed_keys]
+        if not visible_candidates:
+            st.caption("現在表示中の候補はありません。必要なら再検証してください。")
+        for idx, candidate in enumerate(visible_candidates, start=1):
+            st.markdown(
+                f"**{idx}. Day{candidate.get('day')}** "
                 f"{candidate.get('current_destination')} 終了 {candidate.get('current_end_time')} → "
-                f"{candidate.get('next_destination')} 開始 {candidate.get('next_start_time')} "
-                f"(重複 {candidate.get('minutes_overlap')}分 / 候補開始 {candidate.get('suggested_next_start_time')})"
+                f"{candidate.get('next_destination')} 開始 {candidate.get('next_start_time')}  \n"
+                f"重複 {candidate.get('minutes_overlap')}分 / 候補開始 {candidate.get('suggested_next_start_time')}"
             )
+            _render_time_overlap_candidate_actions(candidate, idx)
+            st.divider()
+        st.caption("適用後は、その場で完成旅程へ反映します。最終確認のため再検証してください。")
 
     with st.expander("検証エージェントの生出力（デバッグ用）", expanded=False):
         st.code(st.session_state.get("validation_agent_raw", ""), language="json")
@@ -924,7 +938,7 @@ def _find_time_overlap_candidates(df: pd.DataFrame) -> List[Dict[str, object]]:
     if df is None or df.empty:
         return candidates
 
-    normalized = df.copy()
+    normalized = df.copy().reset_index(drop=True)
     if "day" in normalized.columns and "sequence" in normalized.columns:
         normalized = normalized.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
 
@@ -940,14 +954,148 @@ def _find_time_overlap_candidates(df: pd.DataFrame) -> List[Dict[str, object]]:
             if next_start < current_end:
                 candidates.append({
                     "day": int(day) if pd.notna(day) else day,
+                    "current_sequence": int(current.get("sequence")) if pd.notna(current.get("sequence")) else None,
+                    "next_sequence": int(nxt.get("sequence")) if pd.notna(nxt.get("sequence")) else None,
                     "current_destination": safe_text(current.get("destination"), ""),
                     "next_destination": safe_text(nxt.get("destination"), ""),
                     "current_end_time": safe_text(current.get("end_time"), ""),
                     "next_start_time": safe_text(nxt.get("start_time"), ""),
+                    "next_end_time": safe_text(nxt.get("end_time"), ""),
                     "suggested_next_start_time": safe_text(current.get("end_time"), ""),
                     "minutes_overlap": current_end - next_start,
+                    "candidate_key": f"day{int(day) if pd.notna(day) else day}-seq{int(current.get('sequence')) if pd.notna(current.get('sequence')) else 'x'}-{int(nxt.get('sequence')) if pd.notna(nxt.get('sequence')) else 'y'}",
                 })
     return candidates
+
+
+def _phase35_overlap_candidate_key(candidate: Dict[str, object]) -> str:
+    explicit_key = safe_text(candidate.get("candidate_key"), "")
+    if explicit_key:
+        return explicit_key
+    day = safe_text(candidate.get("day"), "x")
+    current_sequence = safe_text(candidate.get("current_sequence"), "x")
+    next_sequence = safe_text(candidate.get("next_sequence"), "y")
+    return f"day{day}-seq{current_sequence}-{next_sequence}"
+
+
+def _phase35_refresh_overlap_candidates() -> List[Dict[str, object]]:
+    current_df = st.session_state.get("df_phase3")
+    candidates = _find_time_overlap_candidates(current_df) if isinstance(current_df, pd.DataFrame) else []
+    st.session_state.validation_time_overlap_candidates = candidates
+    return candidates
+
+
+def _apply_time_overlap_candidate(df: pd.DataFrame, candidate: Dict[str, object]) -> tuple[pd.DataFrame, Optional[str]]:
+    if df is None or df.empty:
+        return df, None
+
+    day_value = candidate.get("day")
+    current_sequence = candidate.get("current_sequence")
+    next_sequence = candidate.get("next_sequence")
+    suggested_start = safe_text(candidate.get("suggested_next_start_time"), "")
+    if day_value is None or current_sequence is None or next_sequence is None or not suggested_start:
+        return df, None
+
+    working = df.copy().reset_index(drop=True)
+    current_mask = (working["day"] == day_value) & (working["sequence"] == current_sequence)
+    next_mask = (working["day"] == day_value) & (working["sequence"] == next_sequence)
+    if not current_mask.any() or not next_mask.any():
+        return df, None
+
+    next_idx = working.index[next_mask][0]
+    old_start = safe_text(working.at[next_idx, "start_time"], "")
+    if old_start == suggested_start:
+        return df, None
+
+    old_start_minutes = _time_to_minutes(old_start)
+    new_start_minutes = _time_to_minutes(suggested_start)
+    if old_start_minutes is None or new_start_minutes is None or new_start_minutes < old_start_minutes:
+        return df, None
+
+    delta_minutes = new_start_minutes - old_start_minutes
+    working.at[next_idx, "start_time"] = suggested_start
+
+    next_end = safe_text(working.at[next_idx, "end_time"], "")
+    next_end_minutes = _time_to_minutes(next_end)
+    if next_end_minutes is not None and delta_minutes > 0:
+        working.at[next_idx, "end_time"] = _add_minutes_to_clock(next_end, delta_minutes)
+
+    note = (
+        f"Day{day_value} Seq{next_sequence} {safe_text(working.at[next_idx, 'destination'], '')} の開始を "
+        f"{old_start} → {suggested_start} に調整"
+    )
+    return working, note
+
+
+def _dismiss_time_overlap_candidate(candidate_key: str) -> None:
+    dismissed = st.session_state.get("dismissed_validation_fixes") or []
+    if candidate_key not in dismissed:
+        dismissed.append(candidate_key)
+    st.session_state.dismissed_validation_fixes = dismissed
+
+
+def _record_applied_validation_fix(candidate_key: str) -> None:
+    applied = st.session_state.get("applied_validation_fixes") or []
+    if candidate_key not in applied:
+        applied.append(candidate_key)
+    st.session_state.applied_validation_fixes = applied
+
+
+def _apply_time_overlap_candidate_to_session(candidate_key: str) -> None:
+    candidates = st.session_state.get("validation_time_overlap_candidates") or []
+    target = next((c for c in candidates if _phase35_overlap_candidate_key(c) == candidate_key), None)
+    if not target:
+        st.warning("修正候補が見つかりませんでした。再検証してください。")
+        return
+
+    current_df = st.session_state.get("df_phase3")
+    if not isinstance(current_df, pd.DataFrame) or current_df.empty:
+        st.warning("完成旅程がまだありません。")
+        return
+
+    updated_df, note = _apply_time_overlap_candidate(current_df, target)
+    if note is None:
+        st.info("この候補はすでに適用済みか、現在の旅程には適用できませんでした。")
+        return
+
+    st.session_state.df_phase3 = updated_df
+    st.session_state.execution_engine = ExecutionEngine(updated_df)
+    st.session_state.validation_source_itinerary_text = _itinerary_text_for_validation(updated_df)
+    _record_applied_validation_fix(candidate_key)
+
+    summary = st.session_state.get("validation_autofix_summary") or []
+    summary.append(f"UI適用: {note}")
+    st.session_state.validation_autofix_summary = summary[-20:]
+
+    refreshed = _phase35_refresh_overlap_candidates()
+    remaining_keys = {_phase35_overlap_candidate_key(c) for c in refreshed}
+    dismissed = [k for k in (st.session_state.get("dismissed_validation_fixes") or []) if k in remaining_keys]
+    st.session_state.dismissed_validation_fixes = dismissed
+    log_event("Phase3.5", f"time_overlap候補をUI適用: {note}", level="info")
+
+
+def _render_time_overlap_candidate_actions(candidate: Dict[str, object], display_index: int) -> None:
+    candidate_key = _phase35_overlap_candidate_key(candidate)
+    applied = candidate_key in (st.session_state.get("applied_validation_fixes") or [])
+    dismissed = candidate_key in (st.session_state.get("dismissed_validation_fixes") or [])
+
+    status_parts = []
+    if applied:
+        status_parts.append("適用済み")
+    if dismissed:
+        status_parts.append("今回は無視")
+    if status_parts:
+        st.caption(" / ".join(status_parts))
+
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        if st.button("この候補を適用", key=f"apply_overlap_{candidate_key}", use_container_width=True, disabled=applied):
+            _apply_time_overlap_candidate_to_session(candidate_key)
+            st.rerun()
+    with action_col2:
+        if st.button("今回は無視", key=f"dismiss_overlap_{candidate_key}", use_container_width=True):
+            _dismiss_time_overlap_candidate(candidate_key)
+            st.rerun()
 
 
 def _drop_redundant_nodes_safely(df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
@@ -3525,6 +3673,8 @@ def approve_and_build_phase2_phase3() -> None:
 
     st.session_state.validation_autofix_summary = autofix_summary
     st.session_state.validation_time_overlap_candidates = overlap_candidates
+    st.session_state.applied_validation_fixes = []
+    st.session_state.dismissed_validation_fixes = []
 
     st.session_state.trip_plan = trip_plan
     st.session_state.df_phase2 = df2
