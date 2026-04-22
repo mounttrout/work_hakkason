@@ -2092,10 +2092,25 @@ def _extract_google_transit_summary(steps: list) -> str:
     return " / ".join(deduped[:3])
 
 
-def _fetch_google_directions_legacy(origin_query: str, destination_query: str, mode: str, departure_date: str, departure_time: str) -> Optional[Dict[str, object]]:
+def _fetch_google_directions_legacy(origin_query: str, destination_query: str, mode: str, departure_date: str, departure_time: str, return_debug: bool = False):
     api_key = _get_maps_api_key()
+    debug_info: Dict[str, object] = {
+        "origin_query": origin_query,
+        "destination_query": destination_query,
+        "requested_mode": mode,
+        "api_mode": _google_directions_mode_for_transport(mode),
+        "departure_date": departure_date,
+        "departure_time": departure_time,
+        "has_api_key": bool(api_key),
+        "status_code": None,
+        "api_status": "",
+        "error_message": "",
+        "response_text_preview": "",
+        "request_params_preview": {},
+    }
     if not api_key:
-        return None
+        debug_info["error_message"] = "MAPS_API_KEY が見つかりません"
+        return (None, debug_info) if return_debug else None
 
     directions_mode = _google_directions_mode_for_transport(mode)
     params: Dict[str, object] = {
@@ -2119,18 +2134,40 @@ def _fetch_google_directions_legacy(origin_query: str, destination_query: str, m
         if departure_epoch:
             params["departure_time"] = departure_epoch
 
+    debug_info["request_params_preview"] = {
+        "origin": params.get("origin"),
+        "destination": params.get("destination"),
+        "mode": params.get("mode"),
+        "language": params.get("language"),
+        "region": params.get("region"),
+        "departure_time": params.get("departure_time"),
+    }
+
     try:
         resp = requests.get("https://maps.googleapis.com/maps/api/directions/json", params=params, timeout=15)
+        debug_info["status_code"] = resp.status_code
+        debug_info["response_text_preview"] = (resp.text or "")[:2000]
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        log_event("GoogleDirections", f"Directions API 呼び出し失敗: {e}", level="warning")
-        return None
+        debug_info["error_message"] = str(e)
+        log_event(
+            "GoogleDirections",
+            f"Directions API 呼び出し失敗: {e} / status_code={debug_info.get('status_code')} / body={debug_info.get('response_text_preview', '')[:300]}",
+            level="warning",
+        )
+        return (None, debug_info) if return_debug else None
 
     status = str(data.get("status") or "")
+    debug_info["api_status"] = status
+    debug_info["error_message"] = str(data.get("error_message") or "")
     if status != "OK":
-        log_event("GoogleDirections", f"Directions API status={status} / {origin_query} -> {destination_query}", level="warning")
-        return None
+        log_event(
+            "GoogleDirections",
+            f"Directions API status={status} / error={debug_info.get('error_message')} / {origin_query} -> {destination_query} / body={debug_info.get('response_text_preview', '')[:300]}",
+            level="warning",
+        )
+        return (None, debug_info) if return_debug else None
 
     routes = data.get("routes") or []
     if not routes:
@@ -4612,18 +4649,21 @@ with st.sidebar:
                         "departure": departure_raw,
                     })
 
-                    result = _fetch_google_directions_legacy(
+                    result, debug_info = _fetch_google_directions_legacy(
                         query_origin,
                         query_destination,
                         gd_mode,
                         departure_raw[:10] if len(departure_raw) >= 10 else "",
                         departure_raw[11:16] if len(departure_raw) >= 16 else "09:00",
+                        return_debug=True,
                     )
+                    st.write("GoogleDirections 生レスポンス診断")
+                    st.json(debug_info or {})
                     st.write("Directions結果（整形済み）")
                     st.json(result or {})
 
                     if not result:
-                        st.warning("Directions API から結果を取得できませんでした。内部ログの GoogleDirections を確認してください。")
+                        st.warning("Directions API から結果を取得できませんでした。上の GoogleDirections 生レスポンス診断 を確認してください。")
                     else:
                         st.markdown("**診断サマリー**")
                         st.json({
