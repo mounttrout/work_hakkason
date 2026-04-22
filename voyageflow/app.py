@@ -26,7 +26,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.36-safe-node-normalization-and-terminal-trim
+# 【バージョン名】VoyageFlow v6.2.37-google-directions-minimal-safe
 # 【制作日】2026-04-22
 # 【前バージョンからの修正内容】
 # - タクシー移動カードのときだけ Uber 導線を追加
@@ -34,7 +34,7 @@ from maps.routes_api import RoutesAPI
 # - 移動開始の数分前に予約するとよい旨の案内を追加
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.36-safe-node-normalization-and-terminal-trim"
+APP_VERSION_NAME = "v6.2.37-google-directions-minimal-safe"
 APP_UPDATED_DATE = "2026-04-22"
 
 
@@ -1990,6 +1990,200 @@ minutes を出せない場合:
         return None
 
 
+# =========================================================
+# 修正箇所: Google Directions API（Legacy）最小導入
+# - Routes API の transit ではなく Directions API の transit を局所利用
+# - 失敗時は既存のLLM概算/距離推定へ安全にフォールバック
+# - Place ID 強制ではなく、まずは既存座標を優先して壊れた destination 文字列の影響を下げる
+# =========================================================
+def _get_maps_api_key() -> str:
+    try:
+        key = st.secrets.get("MAPS_API_KEY") or os.getenv("MAPS_API_KEY") or ""
+        return str(key).strip()
+    except Exception:
+        return str(os.getenv("MAPS_API_KEY") or "").strip()
+
+
+def _normalize_route_query_name(name: str) -> str:
+    text = safe_text(name, "")
+    if not text:
+        return text
+    text = re.sub(r"^\*\s*", "", text).strip()
+    text = re.sub(r"^\d{1,2}:\d{2}\s*-\s*", "", text).strip()
+    text = re.sub(r"[（(].*?[）)]", "", text).strip()
+    text = text.replace("到着・ホテルチェックイン", "").replace("ホテルチェックイン", "")
+    text = text.replace("到着", "").replace("出発", "")
+    text = text.replace("解散", "").replace("集合", "")
+    text = re.sub(r"\s+", " ", text).strip(" -・")
+    if not text:
+        return safe_text(name, "")
+    return text
+
+
+def _build_google_directions_location_query(name: str, lat, lng) -> str:
+    try:
+        if lat is not None and lng is not None and not (pd.isna(lat) or pd.isna(lng)):
+            return f"{float(lat):.6f},{float(lng):.6f}"
+    except Exception:
+        pass
+    return _normalize_route_query_name(name)
+
+
+def _google_directions_mode_for_transport(mode: str) -> str:
+    key = safe_text(mode, "walk").lower()
+    if key in {"train", "transit", "bus", "rail"}:
+        return "transit"
+    if key in {"car", "taxi", "drive", "driving", "private_car"}:
+        return "driving"
+    if key in {"bike", "bicycle"}:
+        return "bicycling"
+    return "walking"
+
+
+def _parse_google_duration_minutes(duration_text: str) -> Optional[int]:
+    text = str(duration_text or "").strip()
+    if not text:
+        return None
+    total = 0
+    m = re.search(r"(\d+)\s*day", text)
+    if m:
+        total += int(m.group(1)) * 24 * 60
+    m = re.search(r"(\d+)\s*hour", text)
+    if m:
+        total += int(m.group(1)) * 60
+    mins = re.findall(r"(\d+)\s*min", text)
+    if mins:
+        total += sum(int(v) for v in mins)
+    if total > 0:
+        return total
+    m = re.search(r"(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def _extract_google_transit_summary(steps: list) -> str:
+    if not isinstance(steps, list):
+        return ""
+    parts = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        mode = safe_text(step.get("travel_mode"), "")
+        if mode == "TRANSIT":
+            detail = step.get("transit_details") or {}
+            line = detail.get("line") or {}
+            vehicle = (line.get("vehicle") or {}).get("name") or "公共交通"
+            name = line.get("short_name") or line.get("name") or ""
+            dep = (detail.get("departure_stop") or {}).get("name") or ""
+            arr = (detail.get("arrival_stop") or {}).get("name") or ""
+            text = f"{vehicle}"
+            if name:
+                text += f" {name}"
+            if dep or arr:
+                text += f"（{dep}→{arr}）"
+            parts.append(text)
+        elif mode == "WALKING":
+            parts.append("徒歩")
+        elif mode == "DRIVING":
+            parts.append("車")
+    deduped = []
+    for part in parts:
+        if part and part not in deduped:
+            deduped.append(part)
+    return " / ".join(deduped[:3])
+
+
+def _fetch_google_directions_legacy(origin_query: str, destination_query: str, mode: str, departure_date: str, departure_time: str) -> Optional[Dict[str, object]]:
+    api_key = _get_maps_api_key()
+    if not api_key:
+        return None
+
+    directions_mode = _google_directions_mode_for_transport(mode)
+    params: Dict[str, object] = {
+        "origin": origin_query,
+        "destination": destination_query,
+        "mode": directions_mode,
+        "language": "ja",
+        "region": "jp",
+        "key": api_key,
+    }
+
+    if directions_mode == "transit":
+        departure_epoch = None
+        raw = f"{safe_text(departure_date, '')} {safe_text(departure_time, '')}".strip()
+        for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+            try:
+                departure_epoch = int(datetime.strptime(raw, fmt).timestamp())
+                break
+            except Exception:
+                continue
+        if departure_epoch:
+            params["departure_time"] = departure_epoch
+
+    try:
+        resp = requests.get("https://maps.googleapis.com/maps/api/directions/json", params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log_event("GoogleDirections", f"Directions API 呼び出し失敗: {e}", level="warning")
+        return None
+
+    status = str(data.get("status") or "")
+    if status != "OK":
+        log_event("GoogleDirections", f"Directions API status={status} / {origin_query} -> {destination_query}", level="warning")
+        return None
+
+    routes = data.get("routes") or []
+    if not routes:
+        return None
+    route = routes[0]
+    legs = route.get("legs") or []
+    if not legs:
+        return None
+    leg = legs[0]
+    minutes = None
+    if isinstance(leg.get("duration"), dict):
+        try:
+            minutes = max(1, int(round(int(leg["duration"].get("value", 0)) / 60)))
+        except Exception:
+            minutes = _parse_google_duration_minutes((leg.get("duration") or {}).get("text", ""))
+    if not minutes:
+        minutes = _parse_google_duration_minutes((leg.get("duration") or {}).get("text", ""))
+    if not minutes:
+        return None
+
+    fare = route.get("fare") or {}
+    transit_summary = _extract_google_transit_summary(leg.get("steps") or [])
+    return {
+        "minutes": int(minutes),
+        "label": safe_text((leg.get("duration") or {}).get("text"), f"約{int(minutes)}分"),
+        "distance_text": safe_text((leg.get("distance") or {}).get("text"), ""),
+        "fare_text": safe_text(fare.get("text"), ""),
+        "transit_summary": transit_summary,
+        "mode": directions_mode,
+        "start_address": safe_text(leg.get("start_address"), origin_query),
+        "end_address": safe_text(leg.get("end_address"), destination_query),
+        "source": "google_directions_legacy",
+    }
+
+
+def _validate_google_route_minutes(distance_km: float, minutes: int, mode: str, origin_name: str, destination_name: str) -> bool:
+    if minutes <= 0:
+        return False
+    mode_key = safe_text(mode, "walk").lower()
+    # あまりに非現実な短時間は棄却して既存フォールバックへ戻す
+    if distance_km >= 20 and minutes < 20:
+        return False
+    if distance_km >= 60 and minutes < 45:
+        return False
+    if distance_km >= 120 and minutes < 70:
+        return False
+    if mode_key in {"walk", "walking"} and distance_km > 3.0 and minutes < 25:
+        return False
+    if mode_key in {"train", "transit", "bus"} and distance_km < 1.2 and minutes > 90:
+        return False
+    return True
+
+
 @contextmanager
 def _disable_live_routes_api_for_phase3():
     original = None
@@ -2100,56 +2294,103 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             mode = "train"
             enriched.at[idx, "transport_mode"] = mode
 
-        llm_result = _llm_transport_duration_estimate(
-            origin_name=origin_name,
-            destination_name=destination_name,
-            mode=mode,
-            departure_date=departure_date,
-            departure_time=departure_time,
-            distance_km=distance_km,
-            origin_lat=float(origin_lat),
-            origin_lng=float(origin_lng),
-            destination_lat=float(destination_lat),
-            destination_lng=float(destination_lng),
-        )
+        google_result = None
+        origin_query = _build_google_directions_location_query(origin_name, origin_lat, origin_lng)
+        destination_query = _build_google_directions_location_query(destination_name, destination_lat, destination_lng)
+        # Google Directions API は最小導入。train/bus/walk/taxi/car の現実的な移動時間取得を優先する。
+        if origin_query and destination_query:
+            google_result = _fetch_google_directions_legacy(
+                origin_query=origin_query,
+                destination_query=destination_query,
+                mode=mode,
+                departure_date=departure_date,
+                departure_time=departure_time,
+            )
 
-        if llm_result and llm_result.get("minutes") and _validate_llm_minutes(
+        if google_result and _validate_google_route_minutes(
             distance_km=distance_km,
+            minutes=int(google_result["minutes"]),
             mode=mode,
-            minutes=int(llm_result["minutes"]),
             origin_name=origin_name,
             destination_name=destination_name,
         ):
-            minutes = int(llm_result["minutes"])
+            minutes = int(google_result["minutes"])
             label = f"約{minutes}分"
-            enriched.at[idx, "route_data_source"] = "llm_estimate"
+            line_parts = [label]
+            if google_result.get("transit_summary"):
+                line_parts.append(str(google_result["transit_summary"]))
+            if google_result.get("fare_text") and google_result.get("fare_text") != "-":
+                line_parts.append(f"運賃 {google_result['fare_text']}")
+            enriched.at[idx, "route_data_source"] = str(google_result.get("source", "google_directions_legacy"))
             enriched.at[idx, "estimated_duration_label"] = label
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
             enriched.at[idx, "duration_minutes"] = minutes
             enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-            enriched.at[idx, "route_line_simple"] = f"{label}"
+            enriched.at[idx, "route_line_simple"] = " / ".join(line_parts[:3])
             enriched.at[idx, "route_from"] = origin_name
             enriched.at[idx, "route_to"] = destination_name
-            reason = str(llm_result.get("reason", "")).strip()
-            if reason:
-                enriched.at[idx, "one_point"] = reason[:120]
+            note_parts = []
+            if google_result.get("distance_text") and google_result.get("distance_text") != "-":
+                note_parts.append(f"Google Directions 推定距離 {google_result['distance_text']}")
+            if google_result.get("transit_summary"):
+                note_parts.append(str(google_result["transit_summary"]))
+            if google_result.get("fare_text") and google_result.get("fare_text") != "-":
+                note_parts.append(f"運賃 {google_result['fare_text']}")
+            if note_parts:
+                enriched.at[idx, "one_point"] = " / ".join(note_parts)[:160]
         else:
-            if llm_result and llm_result.get("minutes"):
-                log_event("移動時間推定", f"LLM概算を棄却: {origin_name} → {destination_name} / {llm_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
-            fallback = _build_safe_distance_fallback(distance_km, mode, origin_name, destination_name)
-            minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
-            label = str(fallback.get("label", f"約{minutes}分（推測）"))
-            enriched.at[idx, "route_data_source"] = str(fallback.get("source", "distance_estimate"))
-            enriched.at[idx, "estimated_duration_label"] = label
-            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
-            enriched.at[idx, "duration_minutes"] = minutes
-            enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-            enriched.at[idx, "route_line_simple"] = f"{label}"
-            enriched.at[idx, "route_from"] = origin_name
-            enriched.at[idx, "route_to"] = destination_name
-            note = str(fallback.get("note", "")).strip()
-            if note:
-                enriched.at[idx, "one_point"] = note[:120]
+            if google_result:
+                log_event("移動時間推定", f"Google Directions 結果を棄却: {origin_name} → {destination_name} / {google_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+            llm_result = _llm_transport_duration_estimate(
+                origin_name=origin_name,
+                destination_name=destination_name,
+                mode=mode,
+                departure_date=departure_date,
+                departure_time=departure_time,
+                distance_km=distance_km,
+                origin_lat=float(origin_lat),
+                origin_lng=float(origin_lng),
+                destination_lat=float(destination_lat),
+                destination_lng=float(destination_lng),
+            )
+
+            if llm_result and llm_result.get("minutes") and _validate_llm_minutes(
+                distance_km=distance_km,
+                mode=mode,
+                minutes=int(llm_result["minutes"]),
+                origin_name=origin_name,
+                destination_name=destination_name,
+            ):
+                minutes = int(llm_result["minutes"])
+                label = f"約{minutes}分"
+                enriched.at[idx, "route_data_source"] = "llm_estimate"
+                enriched.at[idx, "estimated_duration_label"] = label
+                enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+                enriched.at[idx, "duration_minutes"] = minutes
+                enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+                enriched.at[idx, "route_line_simple"] = f"{label}"
+                enriched.at[idx, "route_from"] = origin_name
+                enriched.at[idx, "route_to"] = destination_name
+                reason = str(llm_result.get("reason", "")).strip()
+                if reason:
+                    enriched.at[idx, "one_point"] = reason[:120]
+            else:
+                if llm_result and llm_result.get("minutes"):
+                    log_event("移動時間推定", f"LLM概算を棄却: {origin_name} → {destination_name} / {llm_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+                fallback = _build_safe_distance_fallback(distance_km, mode, origin_name, destination_name)
+                minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
+                label = str(fallback.get("label", f"約{minutes}分（推測）"))
+                enriched.at[idx, "route_data_source"] = str(fallback.get("source", "distance_estimate"))
+                enriched.at[idx, "estimated_duration_label"] = label
+                enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+                enriched.at[idx, "duration_minutes"] = minutes
+                enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+                enriched.at[idx, "route_line_simple"] = f"{label}"
+                enriched.at[idx, "route_from"] = origin_name
+                enriched.at[idx, "route_to"] = destination_name
+                note = str(fallback.get("note", "")).strip()
+                if note:
+                    enriched.at[idx, "one_point"] = note[:120]
 
     return enriched
 
