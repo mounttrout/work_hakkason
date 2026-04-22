@@ -2020,7 +2020,7 @@ def _normalize_route_query_name(name: str) -> str:
     return text
 
 
-def _build_google_directions_location_query(name: str, lat, lng) -> str:
+def _build_google_directions_location_query(name: str, lat=None, lng=None) -> str:
     try:
         if lat is not None and lng is not None and not (pd.isna(lat) or pd.isna(lng)):
             return f"{float(lat):.6f},{float(lng):.6f}"
@@ -4594,8 +4594,8 @@ with st.sidebar:
                     destination_raw = str(gd_destination or "")
                     origin_clean = _normalize_route_query_name(origin_raw)
                     destination_clean = _normalize_route_query_name(destination_raw)
-                    query_origin = _build_google_directions_location_query({"destination": origin_clean})
-                    query_destination = _build_google_directions_location_query({"destination": destination_clean})
+                    query_origin = _build_google_directions_location_query(origin_clean, None, None)
+                    query_destination = _build_google_directions_location_query(destination_clean, None, None)
                     departure_raw = str(gd_departure or "").strip()
                     api_mode = _google_directions_mode_for_transport(gd_mode)
 
