@@ -1004,28 +1004,26 @@ def _apply_time_overlap_candidate(df: pd.DataFrame, candidate: Dict[str, object]
 
     next_idx = working.index[next_mask][0]
     old_start = safe_text(working.at[next_idx, "start_time"], "")
-    if old_start == suggested_start:
-        return df, None
+    if old_start != suggested_start:
+        old_start_minutes = _time_to_minutes(old_start)
+        new_start_minutes = _time_to_minutes(suggested_start)
+        if old_start_minutes is None or new_start_minutes is None or new_start_minutes < old_start_minutes:
+            return df, None
 
-    old_start_minutes = _time_to_minutes(old_start)
-    new_start_minutes = _time_to_minutes(suggested_start)
-    if old_start_minutes is None or new_start_minutes is None or new_start_minutes < old_start_minutes:
-        return df, None
+        delta_minutes = new_start_minutes - old_start_minutes
+        working.at[next_idx, "start_time"] = suggested_start
 
-    delta_minutes = new_start_minutes - old_start_minutes
-    working.at[next_idx, "start_time"] = suggested_start
+        next_end = safe_text(working.at[next_idx, "end_time"], "")
+        next_end_minutes = _time_to_minutes(next_end)
+        if next_end_minutes is not None and delta_minutes > 0:
+            working.at[next_idx, "end_time"] = _add_minutes_to_clock(next_end, delta_minutes)
 
-    next_end = safe_text(working.at[next_idx, "end_time"], "")
-    next_end_minutes = _time_to_minutes(next_end)
-    if next_end_minutes is not None and delta_minutes > 0:
-        working.at[next_idx, "end_time"] = _add_minutes_to_clock(next_end, delta_minutes)
-
-    note = (
-        f"Day{day_value} Seq{next_sequence} {safe_text(working.at[next_idx, 'destination'], '')} の開始を "
-        f"{old_start} → {suggested_start} に調整"
-    )
-    return working, note
-
+    adjusted_df, cascading_notes = _resolve_time_overlaps_sequentially(working, target_day=int(day_value))
+    destination = safe_text(adjusted_df.at[next_idx, "destination"], "")
+    note = f"Day{day_value} Seq{next_sequence} {destination} の開始を {old_start} → {suggested_start} に調整"
+    if len(cascading_notes) > 1:
+        note += f"（後続 {len(cascading_notes) - 1} 件も連動調整）"
+    return adjusted_df, note
 
 def _dismiss_time_overlap_candidate(candidate_key: str) -> None:
     dismissed = st.session_state.get("dismissed_validation_fixes") or []
@@ -1141,6 +1139,56 @@ def _drop_redundant_nodes_safely(df: pd.DataFrame) -> tuple[pd.DataFrame, List[s
     return working, notes
 
 
+def _resolve_time_overlaps_sequentially(df: pd.DataFrame, target_day: Optional[int] = None) -> tuple[pd.DataFrame, List[str]]:
+    if df is None or df.empty:
+        return df, []
+
+    working = df.copy().reset_index(drop=True)
+    notes: List[str] = []
+    if "day" not in working.columns or "sequence" not in working.columns:
+        return working, notes
+
+    day_values = sorted(working["day"].dropna().astype(int).unique().tolist())
+    if target_day is not None:
+        day_values = [day for day in day_values if int(day) == int(target_day)]
+
+    for day in day_values:
+        day_mask = working["day"] == day
+        ordered_idx = working.index[day_mask].tolist()
+        ordered_idx.sort(key=lambda i: (float(working.at[i, "sequence"]) if pd.notna(working.at[i, "sequence"]) else 0))
+
+        changed = True
+        while changed:
+            changed = False
+            for pos in range(len(ordered_idx) - 1):
+                cur_idx = ordered_idx[pos]
+                nxt_idx = ordered_idx[pos + 1]
+                cur_end = _time_to_minutes(safe_text(working.at[cur_idx, "end_time"], ""))
+                nxt_start = _time_to_minutes(safe_text(working.at[nxt_idx, "start_time"], ""))
+                if cur_end is None or nxt_start is None or nxt_start >= cur_end:
+                    continue
+
+                old_start = safe_text(working.at[nxt_idx, "start_time"], "")
+                old_end = safe_text(working.at[nxt_idx, "end_time"], "")
+                duration_minutes = 0
+                old_start_minutes = _time_to_minutes(old_start)
+                old_end_minutes = _time_to_minutes(old_end)
+                if old_start_minutes is not None and old_end_minutes is not None and old_end_minutes >= old_start_minutes:
+                    duration_minutes = old_end_minutes - old_start_minutes
+
+                new_start = safe_text(working.at[cur_idx, "end_time"], "")
+                working.at[nxt_idx, "start_time"] = new_start
+                if old_end_minutes is not None:
+                    working.at[nxt_idx, "end_time"] = _add_minutes_to_clock(new_start, duration_minutes)
+
+                destination = safe_text(working.at[nxt_idx, "destination"], "")
+                seq = safe_text(working.at[nxt_idx, "sequence"], "")
+                notes.append(f"Day{int(day)} Seq{seq} {destination} の開始を {old_start} → {new_start} に調整")
+                changed = True
+
+    return working, notes
+
+
 def _apply_phase35_safe_autofix(df: pd.DataFrame, validation_result: Dict[str, object]) -> tuple[pd.DataFrame, List[str], List[Dict[str, object]]]:
     working = df.copy().reset_index(drop=True)
     summary_notes: List[str] = []
@@ -1157,14 +1205,17 @@ def _apply_phase35_safe_autofix(df: pd.DataFrame, validation_result: Dict[str, o
         summary_notes.extend(notes or ["redundant_node を安全ルールで確認しました。"])
 
     if any(issue_type == "time_overlap" for issue_type in normalized_issue_types):
+        working, overlap_fix_notes = _resolve_time_overlaps_sequentially(working)
+        if overlap_fix_notes:
+            summary_notes.append(f"time_overlap を {len(overlap_fix_notes)} 件自動調整")
+            summary_notes.extend(overlap_fix_notes[:20])
+        else:
+            summary_notes.append("time_overlap 指摘はありましたが、自動調整は不要でした。")
         overlap_candidates = _find_time_overlap_candidates(working)
         if overlap_candidates:
-            summary_notes.append(f"time_overlap 候補を {len(overlap_candidates)} 件記録")
-        else:
-            summary_notes.append("time_overlap 指摘はありましたが、候補は検出されませんでした。")
+            summary_notes.append(f"未解消の time_overlap 候補を {len(overlap_candidates)} 件記録")
 
     return working, summary_notes, overlap_candidates
-
 
 def _normalize_location_for_compare(name: str) -> str:
     # --- 修正箇所: 同一地点移動を抑制するため、駅名・ホテル名比較用の正規化を追加 ---
