@@ -34,7 +34,7 @@ from maps.routes_api import RoutesAPI
 # - 移動開始の数分前に予約するとよい旨の案内を追加
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.37-google-directions-minimal-safe"
+APP_VERSION_NAME = "v6.2.38-google-directions-minimal-safe"
 APP_UPDATED_DATE = "2026-04-22"
 
 
@@ -4562,6 +4562,89 @@ with st.sidebar:
                                 })
             except Exception as e:
                 st.error(f"Routes診断エラー: {e}")
+
+    # --- 修正箇所: Google Directions API (Legacy) 単体診断をサイドバーに追加 ---
+    with st.expander("🧪 Google Directions診断", expanded=False):
+        gd_origin = st.text_input("Directions 出発地", value="東京駅", key="gd_diag_origin")
+        gd_destination = st.text_input("Directions 到着地", value="国立博物館", key="gd_diag_destination")
+        gd_mode = st.selectbox(
+            "Directions 移動手段",
+            options=["train", "bus", "walk", "car", "taxi"],
+            index=0,
+            key="gd_diag_mode",
+        )
+        gd_departure = st.text_input(
+            "Directions 出発日時 (YYYY-MM-DD HH:MM)",
+            value="2026-04-30 10:00",
+            key="gd_diag_departure",
+        )
+
+        if st.button("🧪 Directions診断を実行", use_container_width=True, key="run_google_directions_diag"):
+            try:
+                api_key = _get_maps_api_key()
+                st.write("APIキー状態")
+                st.json({
+                    "has_api_key": bool(api_key),
+                    "api_key_preview": (api_key[:4] + "..." + api_key[-4:]) if api_key and len(api_key) > 8 else ("***" if api_key else ""),
+                })
+                if not api_key:
+                    st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
+                else:
+                    origin_raw = str(gd_origin or "")
+                    destination_raw = str(gd_destination or "")
+                    origin_clean = _normalize_route_query_name(origin_raw)
+                    destination_clean = _normalize_route_query_name(destination_raw)
+                    query_origin = _build_google_directions_location_query({"destination": origin_clean})
+                    query_destination = _build_google_directions_location_query({"destination": destination_clean})
+                    departure_raw = str(gd_departure or "").strip()
+                    api_mode = _google_directions_mode_for_transport(gd_mode)
+
+                    st.write("入力正規化")
+                    st.json({
+                        "origin_raw": origin_raw,
+                        "origin_clean": origin_clean,
+                        "origin_query": query_origin,
+                        "destination_raw": destination_raw,
+                        "destination_clean": destination_clean,
+                        "destination_query": query_destination,
+                        "transport_mode": gd_mode,
+                        "api_mode": api_mode,
+                        "departure": departure_raw,
+                    })
+
+                    result = _fetch_google_directions_legacy(
+                        query_origin,
+                        query_destination,
+                        gd_mode,
+                        departure_raw[:10] if len(departure_raw) >= 10 else "",
+                        departure_raw[11:16] if len(departure_raw) >= 16 else "09:00",
+                    )
+                    st.write("Directions結果（整形済み）")
+                    st.json(result or {})
+
+                    if not result:
+                        st.warning("Directions API から結果を取得できませんでした。内部ログの GoogleDirections を確認してください。")
+                    else:
+                        st.markdown("**診断サマリー**")
+                        st.json({
+                            "source": result.get("source"),
+                            "mode": result.get("mode"),
+                            "minutes": result.get("minutes"),
+                            "distance_meters": result.get("distance_meters"),
+                            "fare_text": result.get("fare_text"),
+                            "summary": result.get("summary"),
+                            "steps_count": len(result.get("steps") or []),
+                            "has_transit_steps": any((step.get("travel_mode") == "TRANSIT") for step in (result.get("steps") or [])),
+                        })
+                        steps = result.get("steps") or []
+                        if steps:
+                            st.markdown("**ステップ詳細**")
+                            for idx, step in enumerate(steps, start=1):
+                                st.write(f"{idx}. {step.get('travel_mode')} / {step.get('duration_text')} / {step.get('instruction_text')}")
+                                if step.get("transit_details"):
+                                    st.json(step.get("transit_details"))
+            except Exception as e:
+                st.error(f"Directions診断エラー: {e}")
 
     if st.button("🔄 全リセット", use_container_width=True):
         reset_all()
