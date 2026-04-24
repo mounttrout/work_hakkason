@@ -35,7 +35,7 @@ from maps.routes_api import RoutesAPI
 # - UI、カード表示、フェーズ構成、既存ホテル・天候・カレンダー・実行シミュレーションは変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.42-phase2-spot-only-structuring-probe"
+APP_VERSION_NAME = "v6.2.45-phase2-llm-validation-guard"
 APP_UPDATED_DATE = "2026-04-24"
 
 
@@ -543,7 +543,11 @@ def init_session_state() -> None:
         "phase2_structuring_raw": "",
         "phase2_structuring_mode": "",
         "phase2_structuring_error": "",
-        "phase2_structuring_error": "",
+        "phase2_validation_raw": "",
+        "phase2_validation_result": {},
+        "phase2_validation_error": "",
+        "phase2_validator_model": "models/gemini-1.5-flash",
+        "phase2_validator_invalid_rows": [],
     }
 
     for key, value in defaults.items():
@@ -1733,7 +1737,7 @@ def render_transport_debug_sidebar() -> None:
         err = safe_text(st.session_state.get('phase2_structuring_error'), '')
         if err and err != '-':
             st.warning(err)
-        st.code(safe_text(st.session_state.get('phase2_structuring_raw'), ''), language="markdown")
+        st.code(safe_text(st.session_state.get('phase2_structuring_raw'), ''), language="json")
     if st.button("🧾 現在のtransport診断ログを追加", key="add_transport_debug_log", use_container_width=True):
         log_transport_debug("TransportDebug", {"source": source_name, "rows": len(df), "transport_rows": len(transport_rows), "columns": list(map(str, df.columns)), "phase2_mode": st.session_state.get('phase2_structuring_mode'), "phase2_error": st.session_state.get('phase2_structuring_error'), "preview": df[preview_cols].head(30).to_dict(orient="records") if preview_cols else []})
         st.rerun()
@@ -3207,6 +3211,22 @@ def render_phase2_phase3_fixed_debug_sidebar() -> None:
         else:
             st.info("Phase2 raw 出力はまだありません。プラン了承後に表示されます。")
 
+    with st.expander("Phase2 検証LLM結果", expanded=True):
+        validator_model = safe_text(st.session_state.get("phase2_validator_model"), PHASE2_VALIDATOR_MODEL_NAME)
+        validation_error = safe_text(st.session_state.get("phase2_validation_error"), "")
+        validation_result = st.session_state.get("phase2_validation_result") or {}
+        validation_raw = safe_text(st.session_state.get("phase2_validation_raw"), "")
+        st.caption(f"validator model: {validator_model}")
+        if validation_error and validation_error != "-":
+            st.warning(f"検証LLMエラー: {validation_error}")
+        if validation_result:
+            st.json(validation_result)
+        else:
+            st.info("Phase2 検証LLM結果はまだありません。")
+        if validation_raw and validation_raw != "-":
+            st.caption("検証LLM raw output")
+            st.code(validation_raw, language="json")
+
     with st.expander("df_phase2（スポット抽出結果）", expanded=True):
         if isinstance(df2, pd.DataFrame) and not df2.empty:
             cols = _phase_debug_preview_columns(df2)
@@ -4236,7 +4256,8 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
 # - 移動そのものは Phase2 へ入れず、Phase3 の順番ベース移動カード生成に任せる
 # - これにより「09:00 福井駅」の滞在時間に新幹線185分が混入する問題を切り分ける
 # =========================================================
-def _build_phase2_spot_only_markdown_prompt(trip_plan_text: str, planning_state: Dict[str, object]) -> str:
+def _build_phase2_spot_only_json_prompt(trip_plan_text: str, planning_state: Dict[str, object]) -> str:
+    # --- 修正箇所 v6.2.44: MarkdownテーブルではなくJSON配列だけを返させ、列ズレを防止 ---
     start_date = safe_text(planning_state.get("start_date"), datetime.now().date().strftime("%Y-%m-%d"))
     departure_place = safe_text(planning_state.get("departure_place"), "")
     return_place = safe_text(planning_state.get("return_place"), "")
@@ -4246,10 +4267,10 @@ def _build_phase2_spot_only_markdown_prompt(trip_plan_text: str, planning_state:
     return f"""
 # Role
 あなたは優秀なデータアナリストです。
-提供された旅行日程テキストから、VoyageFlow の Phase2 用テーブルを作成してください。
+提供された旅行日程テキストから、VoyageFlow の Phase2 用JSONを作成してください。
 
 # Goal
-自然文の旅行日程を、**スポット・滞在・起点/終点だけ**の構造化データに変換してください。
+自然文の旅行日程を、スポット・滞在・起点/終点だけの構造化データに変換してください。
 移動そのものは後段の Phase3 が自動生成するため、Phase2 には入れません。
 
 # Fixed Trip Context
@@ -4259,24 +4280,47 @@ def _build_phase2_spot_only_markdown_prompt(trip_plan_text: str, planning_state:
 - 帰着地: {return_place}
 - 出発時刻: {departure_time}
 
-# Output Columns
-必ず次の列名・順番の Markdown テーブルだけを出力してください。
-説明文、コードフェンス、補足文は出力しないでください。
+# Output Format
+必ずJSON配列のみを出力してください。
+Markdown、表、コードフェンス、説明文、補足文は絶対に出力しないでください。
 
-| day | sequence | date | start_time | end_time | destination | purpose | genre | duration_minutes | is_transport | transport_mode | one_point |
+各要素は必ず次のキーだけを持ってください。
+[
+  {{
+    "day": 1,
+    "sequence": 1,
+    "date": "YYYY-MM-DD",
+    "start_time": "HH:MM",
+    "end_time": "HH:MM",
+    "destination": "純粋な場所名",
+    "purpose": "departure",
+    "genre": "station",
+    "duration_minutes": 10,
+    "is_transport": false,
+    "transport_mode": "-",
+    "one_point": "短い補足"
+  }}
+]
 
-# Constraints
+# Critical Constraints
 1. 抽出対象
    - 観光、体験、食事、宿泊、出発地、到着地、帰着地など、ユーザーが見るべきスポット・滞在だけを抽出してください。
    - 「福井駅出発」「東京駅到着」のような起点・終点は、場所として抽出してください。
-   - destination は「〇〇出発」「〇〇到着」「〇〇周辺」などの動作や補足を除いた、純粋な場所名・スポット名にしてください。
+   - destination は「〇〇出発」「〇〇到着」「〇〇へ移動」「〇〇チェックイン」などの動作や補足を除いた、純粋な場所名・スポット名だけにしてください。
+   - destination に「目的:」「滞在時間:」「ワンポイント:」「旅行アドバイザー」「注意点」を入れてはいけません。
 
 2. 除外対象
-   - 「北陸新幹線での移動」「電車移動」「タクシー移動」「徒歩移動」など、移動そのものを目的とした行は Phase2 に含めないでください。
+   - 「北陸新幹線での移動」「電車移動」「タクシー移動」「徒歩移動」「東京駅へ移動」「東京駅発」など、移動そのものを目的とした行は Phase2 に含めないでください。
    - ただし、その移動の前後にある起点・到着地はスポットとして残してください。
-   - 例: 「09:00 福井駅出発 / 北陸新幹線での移動 / 185分」は、destination=福井駅, purpose=departure, duration_minutes=0 または 5 とし、185分を福井駅の滞在時間にしないでください。
+   - 例: 「09:34 - 福井駅発（北陸新幹線 かがやき） / 目的: 移動 / 滞在時間: 約190分」は除外してください。
+   - 例: 「09:00 - 福井駅 / 目的: 出発 / 滞在時間: 30分」は destination=福井駅 として残してよいですが、移動時間は入れないでください。
 
-3. purpose の値
+3. ホテル・宿泊
+   - 「ホテルチェックイン（新宿エリア推奨）」は destination="新宿周辺ホテル" または本文の具体ホテル名にしてください。
+   - ホテル行の destination に、別行のワンポイント文を入れてはいけません。
+   - 宿泊の duration_minutes は、翌朝までの場合でも 480〜720分程度でよいです。end_time が翌朝の場合は HH:MM だけを入れてください。
+
+4. purpose の値
    - departure: 出発地・ホテル出発
    - arrival: 駅や目的地への到着、帰着地
    - activity: 観光・体験・見学
@@ -4284,26 +4328,121 @@ def _build_phase2_spot_only_markdown_prompt(trip_plan_text: str, planning_state:
    - accommodation: 宿泊・ホテルチェックイン・ホテル滞在
    - shopping: 買い物
 
-4. genre の値
+5. genre の値
    - station, museum, experience, restaurant, hotel, shopping, park, general など英語の短いカテゴリにしてください。
 
-5. 時刻と滞在時間
-   - start_time は HH:MM 形式にしてください。
+6. 時刻と滞在時間
+   - start_time と end_time は HH:MM 形式にしてください。
    - duration_minutes は整数にしてください。
-   - end_time は start_time + duration_minutes で計算してください。
    - 出発・到着だけの駅ノードは duration_minutes を 0〜30分の自然な範囲にしてください。移動時間を入れないでください。
-   - 時刻が本文から読み取れない場合は、前後関係から自然に推定してください。
+   - 移動そのものの所要時間をスポットのduration_minutesに入れないでください。
 
-6. transport 固定
+7. transport 固定
    - is_transport は常に false にしてください。
-   - transport_mode は常に - にしてください。
+   - transport_mode は常に "-" にしてください。
 
-7. sequence
-   - day ごとではなく、旅程全体の通し番号で 1, 2, 3... と振ってください。
+8. sequence
+   - dayごとに 1, 2, 3... と振ってください。
 
 # Input Data
 {trip_plan_text}
 """.strip()
+
+
+def _extract_json_array(text: str) -> List[Dict[str, object]]:
+    # --- 修正箇所 v6.2.44: LLM出力からJSON配列を安全に抽出 ---
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for key in ("rows", "items", "data", "itinerary"):
+                if isinstance(data.get(key), list):
+                    return [x for x in data[key] if isinstance(x, dict)]
+    except Exception:
+        pass
+    match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(0))
+        return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _is_bad_phase2_destination(destination: str) -> bool:
+    # --- 修正箇所 v6.2.44: destinationへの説明文・ワンポイント混入を防ぐ ---
+    text = safe_text(destination, "")
+    if not text:
+        return True
+    bad_tokens = ["ワンポイント", "目的:", "目的：", "滞在時間", "旅行アドバイザー", "注意点", "※移動時間", "Input Data"]
+    if text.startswith("*") or text.startswith("-"):
+        return True
+    if any(token in text for token in bad_tokens):
+        return True
+    if len(text) > 80:
+        return True
+    return False
+
+
+def _clean_phase2_destination(destination: str, purpose: str = "", genre: str = "") -> str:
+    # --- 修正箇所 v6.2.44: 目的地表記を最低限クレンジング ---
+    text = safe_text(destination, "")
+    if not text:
+        return ""
+    text = text.strip().strip("| ").strip()
+    text = re.sub(r"^[-*・\s]+", "", text).strip()
+    text = re.sub(r"（(?:出発|到着|チェックイン|チェックアウト|移動)[^）]*）", "", text).strip()
+    text = re.sub(r"\((?:出発|到着|チェックイン|チェックアウト|移動)[^)]*\)", "", text).strip()
+    text = re.sub(r"(?:出発|到着|へ移動|に移動|チェックイン|チェックアウト)$", "", text).strip()
+    if _is_bad_phase2_destination(text):
+        return ""
+    return text
+
+
+def _repair_or_drop_phase2_rows(df: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    # --- 修正箇所 v6.2.44: Phase2崩壊行をPhase3に渡さない ---
+    if df is None or df.empty or "destination" not in df.columns:
+        return df
+    repaired = df.copy().reset_index(drop=True)
+    dropped_notes = []
+    keep_indexes = []
+    for idx, row in repaired.iterrows():
+        purpose = safe_text(row.get("purpose"), "").lower()
+        genre = safe_text(row.get("genre"), "").lower()
+        original = safe_text(row.get("destination"), "")
+        cleaned = _clean_phase2_destination(original, purpose, genre)
+        if cleaned:
+            if cleaned != original:
+                log_event("Phase2防御", f"destinationを補正: {original} -> {cleaned}", level="warning")
+                repaired.at[idx, "destination"] = cleaned
+            keep_indexes.append(idx)
+            continue
+        dropped_notes.append({
+            "idx": int(idx),
+            "day": safe_text(row.get("day"), ""),
+            "sequence": safe_text(row.get("sequence"), ""),
+            "destination": original,
+            "purpose": purpose,
+            "reason": "destinationに説明文/ワンポイント混入の疑い"
+        })
+    if dropped_notes:
+        for note in dropped_notes[:5]:
+            log_event("Phase2防御", f"崩壊疑い行を除外: {note}", level="warning")
+        st.session_state.phase2_guard_dropped_rows = dropped_notes
+    else:
+        st.session_state.phase2_guard_dropped_rows = []
+    repaired = repaired.loc[keep_indexes].reset_index(drop=True) if keep_indexes else repaired.iloc[0:0].copy()
+    if not repaired.empty and "day" in repaired.columns and "sequence" in repaired.columns:
+        repaired = repaired.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+        repaired["sequence"] = repaired.groupby("day").cumcount() + 1
+    return repaired
 
 
 def _parse_bool_false(value: object) -> bool:
@@ -4366,12 +4505,12 @@ def _coerce_phase2_records_to_df(records: List[Dict[str, object]], planning_stat
         except Exception:
             sequence = idx
 
-        destination = safe_text(rec.get("destination"), "")
-        if not destination or destination == "-":
-            continue
-
         purpose = safe_text(rec.get("purpose"), "activity").lower()
         genre = safe_text(rec.get("genre"), "general").lower()
+        destination = _clean_phase2_destination(safe_text(rec.get("destination"), ""), purpose, genre)
+        if not destination or destination == "-":
+            log_event("Phase2防御", f"destination不正のため行をスキップ: {rec}", level="warning")
+            continue
         start_time = safe_text(rec.get("start_time"), "")
         try:
             duration = int(float(safe_text(rec.get("duration_minutes"), "30")))
@@ -4415,18 +4554,204 @@ def _coerce_phase2_records_to_df(records: List[Dict[str, object]], planning_stat
     return df
 
 
+
+# =========================================================
+# 修正箇所 v6.2.45: Phase2 LLM検証レイヤー
+# - Phase2生成とは別モデルで「不正行の検出だけ」を行う
+# - 修正・採否判断はコード側で行い、LLMに勝手な書き換えはさせない
+# =========================================================
+PHASE2_VALIDATOR_MODEL_NAME = os.getenv("VOYAGEFLOW_PHASE2_VALIDATOR_MODEL", "models/gemini-1.5-flash")
+
+
+@contextmanager
+def _temporary_gemini_model_env(model_name: str):
+    """Phase1Generator が環境変数からモデル名を読む実装の場合にだけ効く安全な一時上書き。"""
+    keys = [
+        "GEMINI_MODEL",
+        "GOOGLE_GEMINI_MODEL",
+        "GOOGLE_GENAI_MODEL",
+        "MODEL_NAME",
+        "VOYAGEFLOW_GEMINI_MODEL",
+    ]
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        if model_name:
+            for key in keys:
+                os.environ[key] = model_name
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _build_phase2_validation_prompt(records: List[Dict[str, object]], planning_state: Dict[str, object]) -> str:
+    start_date = safe_text(planning_state.get("start_date"), "")
+    departure_place = safe_text(planning_state.get("departure_place"), "")
+    return_place = safe_text(planning_state.get("return_place"), "")
+    payload = json.dumps(records, ensure_ascii=False, indent=2, default=str)
+    return f"""
+# Role
+あなたは VoyageFlow の Phase2 構造化データ検証担当です。
+以下のJSON配列を確認し、不正な行だけを検出してください。
+
+# Important
+- あなたは修正後の旅程を作ってはいけません。
+- 行を追加・削除・書き換えしてはいけません。
+- 問題がある index だけを返してください。
+- index は、入力JSON配列の0始まりの配列位置です。
+- 出力はJSONオブジェクトのみ。Markdown、説明文、コードフェンスは禁止です。
+
+# Trip Context
+- 旅行開始日: {start_date}
+- 出発地: {departure_place}
+- 帰着地: {return_place}
+
+# Invalid Row Rules
+次のいずれかに該当する行を invalid_rows に入れてください。
+1. destination が場所名・スポット名ではない
+2. destination に「ワンポイント」「目的:」「滞在時間」「旅行アドバイザー」「注意点」などの本文説明が混入している
+3. destination が80文字を超える長文
+4. is_transport が true になっている
+5. transport_mode が "-" 以外になっている
+6. duration_minutes が駅の出発/到着だけなのに60分を大きく超える
+7. duration_minutes が負数、または数値ではない
+8. start_time / end_time が HH:MM 形式ではない。ただし宿泊で end_time が翌朝の HH:MM になることは許容する
+9. purpose が allowed_purposes に含まれない
+
+# Allowed purposes
+["departure", "arrival", "activity", "meal", "accommodation", "shopping"]
+
+# Output JSON schema
+{{
+  "ok": true,
+  "invalid_rows": [
+    {{"index": 0, "reason": "destinationにワンポイント文が混入"}}
+  ],
+  "warnings": ["任意の注意"],
+  "summary": "短い検証結果"
+}}
+
+# Input JSON
+{payload}
+""".strip()
+
+
+def _parse_phase2_validation_result(raw: str) -> Dict[str, object]:
+    text = str(raw or "").strip()
+    if not text:
+        return {"ok": False, "invalid_rows": [], "warnings": ["検証LLMの出力が空です。"], "summary": "empty"}
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+    data = _safe_json_extract(text)
+    if not isinstance(data, dict):
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = {}
+    invalid = data.get("invalid_rows") if isinstance(data, dict) else []
+    normalized_invalid = []
+    if isinstance(invalid, list):
+        for item in invalid:
+            if isinstance(item, dict):
+                try:
+                    idx = int(item.get("index"))
+                except Exception:
+                    continue
+                normalized_invalid.append({"index": idx, "reason": safe_text(item.get("reason"), "検証LLMが不正疑いと判定")})
+            else:
+                try:
+                    normalized_invalid.append({"index": int(item), "reason": "検証LLMが不正疑いと判定"})
+                except Exception:
+                    continue
+    warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+    return {
+        "ok": bool(data.get("ok", len(normalized_invalid) == 0)),
+        "invalid_rows": normalized_invalid,
+        "warnings": [safe_text(w, "") for w in warnings if safe_text(w, "")],
+        "summary": safe_text(data.get("summary"), "検証LLMの結果を取得しました。"),
+    }
+
+
+def _run_phase2_llm_validation(records: List[Dict[str, object]], planning_state: Dict[str, object]) -> Dict[str, object]:
+    """Phase2生成結果を別モデルで検証する。失敗時は空検証扱いにしてコードガードへ進む。"""
+    model_name = PHASE2_VALIDATOR_MODEL_NAME
+    st.session_state.phase2_validator_model = model_name
+    st.session_state.phase2_validation_raw = ""
+    st.session_state.phase2_validation_error = ""
+    st.session_state.phase2_validation_result = {}
+    st.session_state.phase2_validator_invalid_rows = []
+
+    if not records:
+        result = {"ok": False, "invalid_rows": [], "warnings": ["検証対象のPhase2 recordsが空です。"], "summary": "records empty"}
+        st.session_state.phase2_validation_result = result
+        return result
+
+    prompt = _build_phase2_validation_prompt(records, planning_state)
+    log_event("Phase2検証LLM", f"検証を開始: model={model_name} / rows={len(records)}", level="info")
+    try:
+        with _temporary_gemini_model_env(model_name):
+            generator = Phase1Generator(logger=log_event)
+            raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        result = _parse_phase2_validation_result(raw)
+        st.session_state.phase2_validation_raw = raw
+        st.session_state.phase2_validation_result = result
+        st.session_state.phase2_validator_invalid_rows = result.get("invalid_rows") or []
+        if result.get("invalid_rows"):
+            log_event("Phase2検証LLM", f"不正疑い行を検出: {result.get('invalid_rows')}", level="warning")
+        else:
+            log_event("Phase2検証LLM", "不正疑い行なし", level="info")
+        return result
+    except Exception as e:
+        result = {"ok": False, "invalid_rows": [], "warnings": ["検証LLMに失敗したためコードガードのみで継続"], "summary": "validator failed"}
+        st.session_state.phase2_validation_error = str(e)
+        st.session_state.phase2_validation_result = result
+        log_event("Phase2検証LLM", f"検証LLM失敗。コードガードのみで継続: {e}", level="warning")
+        return result
+
+
+def _drop_phase2_records_by_validator(records: List[Dict[str, object]], validation_result: Dict[str, object]) -> List[Dict[str, object]]:
+    invalid_rows = validation_result.get("invalid_rows") if isinstance(validation_result, dict) else []
+    invalid_indexes = set()
+    if isinstance(invalid_rows, list):
+        for item in invalid_rows:
+            if isinstance(item, dict):
+                try:
+                    invalid_indexes.add(int(item.get("index")))
+                except Exception:
+                    continue
+    if not invalid_indexes:
+        return records
+    kept = []
+    for idx, rec in enumerate(records):
+        if idx in invalid_indexes:
+            log_event("Phase2検証LLM", f"検証LLM判定により行を除外: index={idx} / destination={safe_text(rec.get('destination'), '')}", level="warning")
+            continue
+        kept.append(rec)
+    return kept
+
+
 def structure_trip_plan_spot_only_with_gemini(trip_plan_text: str, planning_state: Dict[str, object]) -> pd.DataFrame:
-    prompt = _build_phase2_spot_only_markdown_prompt(trip_plan_text, planning_state)
-    log_event("Phase2構造化", "スポット専用Markdownプロンプトで構造化を開始", level="info")
+    # --- 修正箇所 v6.2.45: JSON構造化 + 検証LLM + コード防御ガード ---
+    prompt = _build_phase2_spot_only_json_prompt(trip_plan_text, planning_state)
+    log_event("Phase2構造化", "スポット専用JSONプロンプトで構造化を開始", level="info")
     generator = Phase1Generator(logger=log_event)
     raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
     st.session_state.phase2_structuring_raw = raw
-    st.session_state.phase2_structuring_mode = "spot_only_markdown_prompt"
-    records = _parse_markdown_table_to_records(raw)
+    st.session_state.phase2_structuring_mode = "spot_only_json_prompt_with_llm_validator"
+    records = _extract_json_array(raw)
+
+    # 生成結果を別モデルの検証LLMでチェックする。検証LLMは検出のみ、修正判断はコード側で行う。
+    validation_result = _run_phase2_llm_validation(records, planning_state)
+    records = _drop_phase2_records_by_validator(records, validation_result)
+
     df = _coerce_phase2_records_to_df(records, planning_state)
+    df = _repair_or_drop_phase2_rows(df, planning_state)
     if df is None or df.empty:
-        raise ValueError("スポット専用Markdown構造化のパース結果が空でした。")
-    log_event("Phase2構造化", f"スポット専用構造化完了: rows={len(df)} / destinations={df['destination'].head(10).tolist()}", level="info")
+        raise ValueError("スポット専用JSON構造化のパース結果が空、または検証/防御ガードで全行が除外されました。")
+    log_event("Phase2構造化", f"スポット専用JSON構造化完了: rows={len(df)} / destinations={df['destination'].head(10).tolist()}", level="info")
     return df
 
 
@@ -4444,7 +4769,7 @@ def approve_and_build_phase2_phase3() -> None:
     except Exception as e:
         # --- 修正箇所: 診断版では新プロンプト失敗時だけ既存Phase2へ戻す ---
         st.session_state.phase2_structuring_error = str(e)
-        log_event("Phase2構造化", f"スポット専用構造化に失敗。既存Phase2へfallback: {e}", level="warning")
+        log_event("Phase2構造化", f"スポット専用JSON構造化に失敗。既存Phase2へfallback: {e}", level="warning")
         structurer = Phase2Structuring(logger=log_event)
         df2 = structurer.structure_trip_plan(trip_plan, s["start_date"])
         st.session_state.phase2_structuring_mode = "legacy_fallback"
