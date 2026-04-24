@@ -26,7 +26,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.41-transport-debug-probe
+# 【バージョン名】VoyageFlow v6.2.42-phase2-spot-only-structuring-probe
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
 # - transport行の本番推定に Gemini Transport Resolver A案（移動時間 + 手段のみ）を局所導入
@@ -35,7 +35,7 @@ from maps.routes_api import RoutesAPI
 # - UI、カード表示、フェーズ構成、既存ホテル・天候・カレンダー・実行シミュレーションは変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.41-transport-debug-probe"
+APP_VERSION_NAME = "v6.2.42-phase2-spot-only-structuring-probe"
 APP_UPDATED_DATE = "2026-04-24"
 
 
@@ -540,6 +540,10 @@ def init_session_state() -> None:
         "validation_time_overlap_candidates": [],
         "validation_source_plan_text": "",
         "validation_source_itinerary_text": "",
+        "phase2_structuring_raw": "",
+        "phase2_structuring_mode": "",
+        "phase2_structuring_error": "",
+        "phase2_structuring_error": "",
     }
 
     for key, value in defaults.items():
@@ -1724,8 +1728,14 @@ def render_transport_debug_sidebar() -> None:
                 prev_row, next_row = _find_transport_context_rows(snap_df, int(idx))
                 snapshots.append({"idx": int(idx), "current": _transport_row_debug_snapshot(snap_df.iloc[int(idx)]), "prev": _transport_row_debug_snapshot(prev_row), "next": _transport_row_debug_snapshot(next_row)})
             st.json(snapshots)
+    with st.expander("Phase2構造化 raw / mode", expanded=False):
+        st.write(f"mode: {safe_text(st.session_state.get('phase2_structuring_mode'), '-')}")
+        err = safe_text(st.session_state.get('phase2_structuring_error'), '')
+        if err and err != '-':
+            st.warning(err)
+        st.code(safe_text(st.session_state.get('phase2_structuring_raw'), ''), language="markdown")
     if st.button("🧾 現在のtransport診断ログを追加", key="add_transport_debug_log", use_container_width=True):
-        log_transport_debug("TransportDebug", {"source": source_name, "rows": len(df), "transport_rows": len(transport_rows), "columns": list(map(str, df.columns)), "preview": df[preview_cols].head(30).to_dict(orient="records") if preview_cols else []})
+        log_transport_debug("TransportDebug", {"source": source_name, "rows": len(df), "transport_rows": len(transport_rows), "columns": list(map(str, df.columns)), "phase2_mode": st.session_state.get('phase2_structuring_mode'), "phase2_error": st.session_state.get('phase2_structuring_error'), "preview": df[preview_cols].head(30).to_dict(orient="records") if preview_cols else []})
         st.rerun()
 
 
@@ -3087,6 +3097,152 @@ def resolve_planning_state() -> Dict:
     return resolved
 
 
+
+# =========================================================
+# 修正箇所: Phase2 / Phase3 診断ログ固定表示
+# - 今回の構造化バグ調査用
+# - 表示のみで、旅程データは変更しない
+# =========================================================
+def _debug_dataframe_to_records(df: pd.DataFrame, max_rows: int = 80) -> List[Dict[str, object]]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    try:
+        safe_df = df.copy().head(max_rows)
+        safe_df = safe_df.where(pd.notna(safe_df), None)
+        return safe_df.to_dict(orient="records")
+    except Exception:
+        return []
+
+
+def _debug_dataframe_summary(name: str, df: pd.DataFrame) -> Dict[str, object]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"name": name, "exists": False, "rows": 0, "columns": []}
+    transport_count = 0
+    try:
+        if "is_transport" in df.columns:
+            transport_count = int((df["is_transport"] == True).sum())  # noqa: E712
+    except Exception:
+        transport_count = -1
+    suspicious_rows = []
+    try:
+        for idx, row in df.reset_index(drop=True).iterrows():
+            destination = safe_text(row.get("destination"), "")
+            purpose = safe_text(row.get("purpose"), "")
+            duration = _debug_value(row.get("duration_minutes", ""))
+            start_time = safe_text(row.get("start_time"), "")
+            end_time = safe_text(row.get("end_time"), "")
+            is_transport = bool(row.get("is_transport", False))
+            looks_suspicious = False
+            reason_parts = []
+            if not is_transport and purpose.lower() in {"transport", "移動"}:
+                looks_suspicious = True
+                reason_parts.append("spot行なのにpurposeが移動")
+            try:
+                if not is_transport and float(duration) >= 150 and any(token in destination for token in ["駅", "空港", "港"]):
+                    looks_suspicious = True
+                    reason_parts.append("駅/空港/港スポットの滞在時間が長い")
+            except Exception:
+                pass
+            if not is_transport and any(token in destination for token in ["新幹線", "電車", "列車", "フライト", "高速バス"]):
+                looks_suspicious = True
+                reason_parts.append("スポット名に移動手段名が混入")
+            if looks_suspicious:
+                suspicious_rows.append({
+                    "idx": int(idx),
+                    "day": _debug_value(row.get("day", "")),
+                    "sequence": _debug_value(row.get("sequence", "")),
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "destination": destination,
+                    "purpose": purpose,
+                    "duration_minutes": duration,
+                    "is_transport": is_transport,
+                    "reason": " / ".join(reason_parts),
+                })
+    except Exception:
+        suspicious_rows = []
+    return {
+        "name": name,
+        "exists": True,
+        "rows": int(len(df)),
+        "columns": [str(c) for c in df.columns],
+        "transport_rows": transport_count,
+        "suspicious_rows": suspicious_rows,
+    }
+
+
+def _phase_debug_preview_columns(df: pd.DataFrame) -> List[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    preferred = [
+        "day", "sequence", "date", "start_time", "end_time",
+        "destination", "purpose", "genre", "duration_minutes",
+        "is_transport", "transport_mode", "route_from", "route_to",
+        "estimated_duration_label", "route_data_source", "one_point",
+    ]
+    return [col for col in preferred if col in df.columns]
+
+
+def render_phase2_phase3_fixed_debug_sidebar() -> None:
+    st.markdown("### 🧪 構造化データ診断")
+    st.caption("Phase2/Phase3の中身を固定表示します。表示専用で、旅程データは変更しません。")
+
+    df2 = st.session_state.get("df_phase2")
+    df3 = st.session_state.get("df_phase3")
+    raw = safe_text(st.session_state.get("phase2_structuring_raw"), "")
+    mode = safe_text(st.session_state.get("phase2_structuring_mode"), "")
+    err = safe_text(st.session_state.get("phase2_structuring_error"), "")
+
+    summary_payload = {
+        "phase2_mode": mode,
+        "phase2_error": err if err and err != "-" else "",
+        "df_phase2": _debug_dataframe_summary("df_phase2", df2),
+        "df_phase3": _debug_dataframe_summary("df_phase3", df3),
+    }
+    st.json(summary_payload)
+
+    with st.expander("Phase2 raw JSON / LLM出力", expanded=True):
+        if raw and raw != "-":
+            st.code(raw, language="json")
+        else:
+            st.info("Phase2 raw 出力はまだありません。プラン了承後に表示されます。")
+
+    with st.expander("df_phase2（スポット抽出結果）", expanded=True):
+        if isinstance(df2, pd.DataFrame) and not df2.empty:
+            cols = _phase_debug_preview_columns(df2)
+            st.dataframe(df2[cols] if cols else df2, use_container_width=True, height=260)
+            st.caption("コピー用JSON")
+            st.code(json.dumps(_debug_dataframe_to_records(df2), ensure_ascii=False, indent=2, default=str), language="json")
+        else:
+            st.info("df_phase2 はまだありません。")
+
+    with st.expander("df_phase3（transport補完後）", expanded=True):
+        if isinstance(df3, pd.DataFrame) and not df3.empty:
+            cols = _phase_debug_preview_columns(df3)
+            st.dataframe(df3[cols] if cols else df3, use_container_width=True, height=300)
+            st.caption("コピー用JSON")
+            st.code(json.dumps(_debug_dataframe_to_records(df3), ensure_ascii=False, indent=2, default=str), language="json")
+        else:
+            st.info("df_phase3 はまだありません。")
+
+    with st.expander("transport生成前後の差分サマリー", expanded=True):
+        diff_payload = {"before_phase2_rows": 0, "after_phase3_rows": 0, "added_transport_candidates": []}
+        if isinstance(df2, pd.DataFrame) and isinstance(df3, pd.DataFrame) and not df2.empty and not df3.empty:
+            diff_payload["before_phase2_rows"] = int(len(df2))
+            diff_payload["after_phase3_rows"] = int(len(df3))
+            if "is_transport" in df3.columns:
+                transport_rows = df3[df3["is_transport"] == True].reset_index(drop=True)  # noqa: E712
+                diff_payload["added_transport_count"] = int(len(transport_rows))
+                diff_payload["added_transport_candidates"] = _debug_dataframe_to_records(
+                    transport_rows[[c for c in _phase_debug_preview_columns(transport_rows) if c in transport_rows.columns]],
+                    max_rows=50,
+                )
+        st.json(diff_payload)
+
+    if st.button("🧾 Phase2/Phase3診断を内部ログへ保存", key="add_phase2_phase3_debug_log", use_container_width=True):
+        log_transport_debug("Phase2Phase3Debug", summary_payload)
+        st.rerun()
+
 def render_internal_logs_sidebar() -> None:
     logs = st.session_state.get("app_logs", [])
     resolved = st.session_state.get("resolved_conditions", {})
@@ -4072,6 +4228,208 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
     return df3
 
 
+
+
+# =========================================================
+# 修正箇所: Phase2 構造化プロンプト診断版
+# - 自然文旅程から「スポット・滞在」だけを抽出する
+# - 移動そのものは Phase2 へ入れず、Phase3 の順番ベース移動カード生成に任せる
+# - これにより「09:00 福井駅」の滞在時間に新幹線185分が混入する問題を切り分ける
+# =========================================================
+def _build_phase2_spot_only_markdown_prompt(trip_plan_text: str, planning_state: Dict[str, object]) -> str:
+    start_date = safe_text(planning_state.get("start_date"), datetime.now().date().strftime("%Y-%m-%d"))
+    departure_place = safe_text(planning_state.get("departure_place"), "")
+    return_place = safe_text(planning_state.get("return_place"), "")
+    departure_time = safe_text(planning_state.get("departure_time"), "09:00")
+    trip_days = safe_text(planning_state.get("trip_days"), "")
+
+    return f"""
+# Role
+あなたは優秀なデータアナリストです。
+提供された旅行日程テキストから、VoyageFlow の Phase2 用テーブルを作成してください。
+
+# Goal
+自然文の旅行日程を、**スポット・滞在・起点/終点だけ**の構造化データに変換してください。
+移動そのものは後段の Phase3 が自動生成するため、Phase2 には入れません。
+
+# Fixed Trip Context
+- 旅行開始日: {start_date}
+- 旅行日数: {trip_days}
+- 出発地: {departure_place}
+- 帰着地: {return_place}
+- 出発時刻: {departure_time}
+
+# Output Columns
+必ず次の列名・順番の Markdown テーブルだけを出力してください。
+説明文、コードフェンス、補足文は出力しないでください。
+
+| day | sequence | date | start_time | end_time | destination | purpose | genre | duration_minutes | is_transport | transport_mode | one_point |
+
+# Constraints
+1. 抽出対象
+   - 観光、体験、食事、宿泊、出発地、到着地、帰着地など、ユーザーが見るべきスポット・滞在だけを抽出してください。
+   - 「福井駅出発」「東京駅到着」のような起点・終点は、場所として抽出してください。
+   - destination は「〇〇出発」「〇〇到着」「〇〇周辺」などの動作や補足を除いた、純粋な場所名・スポット名にしてください。
+
+2. 除外対象
+   - 「北陸新幹線での移動」「電車移動」「タクシー移動」「徒歩移動」など、移動そのものを目的とした行は Phase2 に含めないでください。
+   - ただし、その移動の前後にある起点・到着地はスポットとして残してください。
+   - 例: 「09:00 福井駅出発 / 北陸新幹線での移動 / 185分」は、destination=福井駅, purpose=departure, duration_minutes=0 または 5 とし、185分を福井駅の滞在時間にしないでください。
+
+3. purpose の値
+   - departure: 出発地・ホテル出発
+   - arrival: 駅や目的地への到着、帰着地
+   - activity: 観光・体験・見学
+   - meal: 食事
+   - accommodation: 宿泊・ホテルチェックイン・ホテル滞在
+   - shopping: 買い物
+
+4. genre の値
+   - station, museum, experience, restaurant, hotel, shopping, park, general など英語の短いカテゴリにしてください。
+
+5. 時刻と滞在時間
+   - start_time は HH:MM 形式にしてください。
+   - duration_minutes は整数にしてください。
+   - end_time は start_time + duration_minutes で計算してください。
+   - 出発・到着だけの駅ノードは duration_minutes を 0〜30分の自然な範囲にしてください。移動時間を入れないでください。
+   - 時刻が本文から読み取れない場合は、前後関係から自然に推定してください。
+
+6. transport 固定
+   - is_transport は常に false にしてください。
+   - transport_mode は常に - にしてください。
+
+7. sequence
+   - day ごとではなく、旅程全体の通し番号で 1, 2, 3... と振ってください。
+
+# Input Data
+{trip_plan_text}
+""".strip()
+
+
+def _parse_bool_false(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"true", "1", "yes"}
+
+
+def _add_minutes_to_hhmm(start_time: str, minutes: int) -> str:
+    text = safe_text(start_time, "")
+    try:
+        base = datetime.strptime(text, "%H:%M")
+        return (base + timedelta(minutes=max(0, int(minutes)))).strftime("%H:%M")
+    except Exception:
+        return text or ""
+
+
+def _parse_markdown_table_to_records(markdown_text: str) -> List[Dict[str, object]]:
+    raw = str(markdown_text or "").strip()
+    if not raw:
+        return []
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            lines.append(stripped)
+    if len(lines) < 2:
+        return []
+
+    header = [c.strip() for c in lines[0].strip("|").split("|")]
+    header_norm = [c.strip().lower() for c in header]
+    records: List[Dict[str, object]] = []
+    for line in lines[1:]:
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if not cells or all(re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells):
+            continue
+        if len(cells) < len(header_norm):
+            cells = cells + [""] * (len(header_norm) - len(cells))
+        row = {header_norm[i]: cells[i] for i in range(min(len(header_norm), len(cells)))}
+        records.append(row)
+    return records
+
+
+def _coerce_phase2_records_to_df(records: List[Dict[str, object]], planning_state: Dict[str, object]) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    start_date_text = safe_text(planning_state.get("start_date"), datetime.now().date().strftime("%Y-%m-%d"))
+    try:
+        start_date = datetime.strptime(start_date_text, "%Y-%m-%d").date()
+    except Exception:
+        start_date = datetime.now().date()
+
+    for idx, rec in enumerate(records, start=1):
+        try:
+            day = int(float(safe_text(rec.get("day"), "1")))
+        except Exception:
+            day = 1
+        try:
+            sequence = int(float(safe_text(rec.get("sequence"), str(idx))))
+        except Exception:
+            sequence = idx
+
+        destination = safe_text(rec.get("destination"), "")
+        if not destination or destination == "-":
+            continue
+
+        purpose = safe_text(rec.get("purpose"), "activity").lower()
+        genre = safe_text(rec.get("genre"), "general").lower()
+        start_time = safe_text(rec.get("start_time"), "")
+        try:
+            duration = int(float(safe_text(rec.get("duration_minutes"), "30")))
+        except Exception:
+            duration = 30
+        duration = max(0, duration)
+        end_time = safe_text(rec.get("end_time"), "")
+        if not end_time or end_time == "-":
+            end_time = _add_minutes_to_hhmm(start_time, duration)
+
+        date_value = safe_text(rec.get("date"), "")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value or ""):
+            date_value = (start_date + timedelta(days=max(0, day - 1))).strftime("%Y-%m-%d")
+
+        rows.append({
+            "day": day,
+            "sequence": sequence,
+            "date": date_value,
+            "start_time": start_time,
+            "end_time": end_time,
+            "destination": destination,
+            "purpose": purpose,
+            "genre": genre,
+            "duration_minutes": duration,
+            "is_transport": False,
+            "transport_mode": "-",
+            "one_point": safe_text(rec.get("one_point"), ""),
+            "address": "",
+            "route_from": "",
+            "route_to": "",
+            "route_url": "",
+            "route_data_source": "phase2_spot_only_prompt",
+            "estimated_duration_label": "",
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+    df["sequence"] = range(1, len(df) + 1)
+    return df
+
+
+def structure_trip_plan_spot_only_with_gemini(trip_plan_text: str, planning_state: Dict[str, object]) -> pd.DataFrame:
+    prompt = _build_phase2_spot_only_markdown_prompt(trip_plan_text, planning_state)
+    log_event("Phase2構造化", "スポット専用Markdownプロンプトで構造化を開始", level="info")
+    generator = Phase1Generator(logger=log_event)
+    raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+    st.session_state.phase2_structuring_raw = raw
+    st.session_state.phase2_structuring_mode = "spot_only_markdown_prompt"
+    records = _parse_markdown_table_to_records(raw)
+    df = _coerce_phase2_records_to_df(records, planning_state)
+    if df is None or df.empty:
+        raise ValueError("スポット専用Markdown構造化のパース結果が空でした。")
+    log_event("Phase2構造化", f"スポット専用構造化完了: rows={len(df)} / destinations={df['destination'].head(10).tolist()}", level="info")
+    return df
+
+
 def approve_and_build_phase2_phase3() -> None:
     if not st.session_state.trip_plan_draft:
         raise ValueError("了承対象の旅程案がありません。")
@@ -4080,8 +4438,16 @@ def approve_and_build_phase2_phase3() -> None:
     trip_plan = st.session_state.trip_plan_draft
 
     log_event("Phase2", "構造化を開始")
-    structurer = Phase2Structuring(logger=log_event)
-    df2 = structurer.structure_trip_plan(trip_plan, s["start_date"])
+    try:
+        df2 = structure_trip_plan_spot_only_with_gemini(trip_plan, s)
+        st.session_state.phase2_structuring_error = ""
+    except Exception as e:
+        # --- 修正箇所: 診断版では新プロンプト失敗時だけ既存Phase2へ戻す ---
+        st.session_state.phase2_structuring_error = str(e)
+        log_event("Phase2構造化", f"スポット専用構造化に失敗。既存Phase2へfallback: {e}", level="warning")
+        structurer = Phase2Structuring(logger=log_event)
+        df2 = structurer.structure_trip_plan(trip_plan, s["start_date"])
+        st.session_state.phase2_structuring_mode = "legacy_fallback"
     if df2 is None or df2.empty:
         raise ValueError("フェーズ2で構造化データを生成できませんでした。")
 
@@ -4686,6 +5052,9 @@ with st.sidebar:
     st.title("⚙️ 設定")
     st.session_state.temperature = st.slider("Gemini 生成温度", 0.0, 1.0, st.session_state.temperature, 0.1)
     st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
+
+    st.divider()
+    render_phase2_phase3_fixed_debug_sidebar()
 
     st.divider()
     render_internal_logs_sidebar()
