@@ -26,17 +26,16 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.39-gemini-transport-ab-test-sidebar
+# 【バージョン名】VoyageFlow v6.2.40-transport-gemini-a-minimal-integration
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
-# - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
-# - A案: 移動時間 + 手段だけをGeminiで推定
-# - B案: 経路詳細もGeminiで推定
-# - 既存の旅程生成・完成旅程・実行シミュレーションには未接続の診断専用実装
-# - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
+# - transport行の本番推定に Gemini Transport Resolver A案（移動時間 + 手段のみ）を局所導入
+# - train / transit / bus など公共交通系は Gemini A案を優先し、失敗時は距離推定へfallback
+# - walk / taxi / car は既存 Google Directions API を優先し、失敗時のみ Gemini A案または距離推定へfallback
+# - UI、カード表示、フェーズ構成、既存ホテル・天候・カレンダー・実行シミュレーションは変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.39-gemini-transport-ab-test-sidebar"
+APP_VERSION_NAME = "v6.2.40-transport-gemini-a-minimal-integration"
 APP_UPDATED_DATE = "2026-04-24"
 
 
@@ -1993,6 +1992,132 @@ minutes を出せない場合:
 
 
 # =========================================================
+# 修正箇所: Gemini Transport Resolver A案（本番transport統合用）
+# - 返す情報は duration_minutes / mode / summary の最小限に限定
+# - train / transit / bus 等の公共交通で優先利用
+# - walk / taxi / car は Google Directions API を優先し、失敗時のみ補助利用
+# =========================================================
+def _is_public_transport_mode(mode: str) -> bool:
+    key = safe_text(mode, "").lower()
+    return key in {"train", "transit", "rail", "bus", "public_transport", "電車", "公共交通", "新幹線"}
+
+
+def _is_api_first_ground_mode(mode: str) -> bool:
+    key = safe_text(mode, "").lower()
+    return key in {"walk", "walking", "徒歩", "taxi", "タクシー", "car", "drive", "driving", "private_car", "rental_car", "bike", "bicycle"}
+
+
+def _normalize_transport_mode_for_resolver(mode: str) -> str:
+    key = safe_text(mode, "").lower()
+    if key in {"電車", "新幹線", "rail", "public_transport", "公共交通"}:
+        return "train"
+    if key in {"walking", "徒歩"}:
+        return "walk"
+    if key in {"タクシー"}:
+        return "taxi"
+    if key in {"drive", "driving", "private_car", "rental_car"}:
+        return "car"
+    if key in {"bicycle"}:
+        return "bike"
+    return key or "unknown"
+
+
+def _build_gemini_transport_a_prompt(origin_name: str, destination_name: str, mode: str, departure_date: str, departure_time: str, distance_km: float) -> str:
+    mode_hint = _normalize_transport_mode_for_resolver(mode)
+    departure_datetime = f"{safe_text(departure_date, '')} {safe_text(departure_time, '')}".strip()
+    return f"""
+あなたは旅行AIエージェント VoyageFlow の transport resolver です。
+旅程内の transport 行に使う「移動時間」と「移動手段」だけを、破綻しない範囲で推定してください。
+
+重要ルール:
+- 出力は必ずJSONのみ。Markdown、説明文、コードフェンスは禁止。
+- API実測ではなく推定なので、不確かな場合は confidence を low にしてください。
+- duration_minutes は整数。出せない場合は null。
+- 路線名・駅名・乗換は、確度が高い場合だけ summary に1行で含めてください。
+- 明らかに短すぎる移動時間は禁止です。
+- 直線距離が長い場合に都市内移動のような短時間を出さないでください。
+- 例: 福井駅→京都駅が20分、福井駅→東京駅が30分のような値は禁止です。
+- walk / taxi / car はGoogle Directions API失敗時の補助なので、断定せず控えめにしてください。
+
+入力:
+- 出発地: {origin_name}
+- 到着地: {destination_name}
+- 出発日時: {departure_datetime}
+- 手段ヒント: {mode_hint}
+- 直線距離km: {distance_km:.2f}
+
+出力JSON形式:
+{{
+  "ok": true,
+  "confidence": "high|medium|low",
+  "duration_minutes": 165,
+  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
+  "summary": "北陸新幹線などを利用する想定。乗換がある場合は1行で補足。",
+  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
+}}
+
+推定できない場合:
+{{
+  "ok": false,
+  "confidence": "low",
+  "duration_minutes": null,
+  "mode": "unknown",
+  "summary": "情報不足で妥当な概算を出せない",
+  "evidence_note": "Google Maps等で最終確認が必要。"
+}}
+""".strip()
+
+
+def _resolve_transport_with_gemini_a_minimal(origin_name: str, destination_name: str, mode: str, departure_date: str, departure_time: str, distance_km: float) -> Optional[Dict[str, object]]:
+    prompt = _build_gemini_transport_a_prompt(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        data = _safe_json_extract(raw) or {}
+        if not isinstance(data, dict):
+            return None
+        duration = data.get("duration_minutes")
+        if duration is None or duration == "":
+            return None
+        minutes = int(float(duration))
+        if minutes <= 0 or minutes > 24 * 60:
+            return None
+        confidence = safe_text(data.get("confidence"), "low").lower()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "low"
+        resolved_mode = _normalize_transport_mode_for_resolver(safe_text(data.get("mode"), mode))
+        if resolved_mode not in {"train", "bus", "walk", "taxi", "car", "air", "ship", "unknown", "bike"}:
+            resolved_mode = _normalize_transport_mode_for_resolver(mode)
+        return {
+            "minutes": minutes,
+            "confidence": confidence,
+            "mode": resolved_mode,
+            "summary": safe_text(data.get("summary"), ""),
+            "evidence_note": safe_text(data.get("evidence_note"), "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"),
+            "raw": raw,
+        }
+    except Exception as e:
+        log_event("GeminiTransport", f"A案resolver失敗: {origin_name} → {destination_name} / {e}", level="warning")
+        return None
+
+
+def _apply_transport_resolution_to_row(enriched: pd.DataFrame, idx: int, minutes: int, label: str, source: str, origin_name: str, destination_name: str, departure_date: str, departure_time: str, mode: str, route_line_simple: str = "", one_point: str = "") -> None:
+    enriched.at[idx, "route_data_source"] = source
+    enriched.at[idx, "estimated_duration_label"] = label
+    enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+    enriched.at[idx, "duration_minutes"] = int(minutes)
+    enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, int(minutes))
+    enriched.at[idx, "route_line_simple"] = route_line_simple or label
+    enriched.at[idx, "route_from"] = origin_name
+    enriched.at[idx, "route_to"] = destination_name
+    normalized_mode = _normalize_transport_mode_for_resolver(mode)
+    if normalized_mode and normalized_mode != "unknown":
+        enriched.at[idx, "transport_mode"] = normalized_mode
+    if one_point:
+        enriched.at[idx, "one_point"] = one_point[:180]
+
+
+# =========================================================
 # 修正箇所: Google Directions API（Legacy）最小導入
 # - Routes API の transit ではなく Directions API の transit を局所利用
 # - 失敗時は既存のLLM概算/距離推定へ安全にフォールバック
@@ -2249,15 +2374,11 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
     """
     完成旅程の transport row に対して、必要最小限の推定値だけを付与する。
 
-    方針:
-    - 短距離の地上移動だけ app.py 側で LLM概算 / 距離推定を行う
-    - 航空・空港・国際移動は app.py 側では一切上書きしない
-      （未実装・未解決課題。Phase2/Phase3 側で構造保持すべき領域）
-
-    TODO:
-    - 実移動時間は現在まだ推測中心
-    - 飛行機を含む移動は構造化層で transport type を保持しないと安全に扱えない
-    - app.py 表示層での後付け推定は地上短距離のみで運用する
+    v6.2.40 方針:
+    - train / transit / bus など公共交通系は Gemini Transport Resolver A案を優先
+    - walk / taxi / car などAPIで取りやすい地上移動は Google Directions API を優先
+    - いずれも失敗したら、既存の安全な距離推定へfallback
+    - UI・カード表示・既存フェーズ構成は変更しない
     """
     if df is None or df.empty or "is_transport" not in df.columns:
         return df
@@ -2270,13 +2391,10 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
 
         origin_name = safe_text(prev_row.get("destination"), "出発地")
         destination_name = safe_text(next_row.get("destination"), "目的地")
-
         departure_date = safe_text(enriched.at[idx, "date"], safe_text(planning_state.get("start_date"), ""))
         departure_time = safe_text(enriched.at[idx, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
 
         # --- 安全策: 航空・空港・国際移動は app.py で再計算しない ---
-        # ここを無理に上書きすると「電車30分」等の破綻が起きるため、
-        # 現時点では元の構造化結果を尊重してスキップする。
         if _is_air_transport_context(enriched.iloc[idx], prev_row, next_row):
             enriched.at[idx, "route_data_source"] = "non_ground_skipped"
             enriched.at[idx, "estimated_duration_label"] = ""
@@ -2285,19 +2403,6 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             safety_note = "未実装・未解決課題: 実移動時間はまだ推測中心で、飛行機を含む移動は app.py では再計算しません。"
             if safety_note not in existing_note:
                 enriched.at[idx, "one_point"] = (existing_note + " / " + safety_note).strip(" /")[:180]
-            continue
-
-        # --- 新幹線や列車名そのものを destination にした行は、app.py では無理に再計算しない ---
-        # TODO: 本来は Phase2 / Phase3 側で「列車サービス名」「便名」を transport type として保持すべき。
-        rail_service_like = any(token in f"{origin_name} {destination_name}" for token in ["新幹線", "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "サンダーバード", "しらさぎ", "つるぎ"])
-        if rail_service_like:
-            enriched.at[idx, "route_data_source"] = "kept_existing_schedule"
-            enriched.at[idx, "estimated_duration_label"] = ""
-            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
-            existing_note = safe_text(enriched.at[idx, "one_point"], "")
-            note = "未解決課題: 列車サービス名を含む移動は、構造化層で transport type を保持してから再計算すべきです。"
-            if note not in existing_note:
-                enriched.at[idx, "one_point"] = (existing_note + " / " + note).strip(" /")[:180]
             continue
 
         origin_lat = prev_row.get("latitude")
@@ -2329,110 +2434,87 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             }.get(preferred, "train" if distance_km >= 2.0 else "walk")
             enriched.at[idx, "transport_mode"] = mode
         elif mode in {"car", "private_car"} and preferred == "電車メイン":
-            # 表示だけでもユーザー意図に寄せる
             mode = "train"
             enriched.at[idx, "transport_mode"] = mode
 
-        google_result = None
-        origin_query = _build_google_directions_location_query(origin_name, origin_lat, origin_lng)
-        destination_query = _build_google_directions_location_query(destination_name, destination_lat, destination_lng)
-        # Google Directions API は最小導入。train/bus/walk/taxi/car の現実的な移動時間取得を優先する。
-        if origin_query and destination_query:
-            google_result = _fetch_google_directions_legacy(
-                origin_query=origin_query,
-                destination_query=destination_query,
-                mode=mode,
-                departure_date=departure_date,
-                departure_time=departure_time,
-            )
+        mode = _normalize_transport_mode_for_resolver(mode)
+        public_transport_first = _is_public_transport_mode(mode)
+        api_first_ground = _is_api_first_ground_mode(mode)
 
-        if google_result and _validate_google_route_minutes(
-            distance_km=distance_km,
-            minutes=int(google_result["minutes"]),
-            mode=mode,
-            origin_name=origin_name,
-            destination_name=destination_name,
-        ):
-            minutes = int(google_result["minutes"])
-            label = f"約{minutes}分"
-            line_parts = [label]
-            if google_result.get("transit_summary"):
-                line_parts.append(str(google_result["transit_summary"]))
-            if google_result.get("fare_text") and google_result.get("fare_text") != "-":
-                line_parts.append(f"運賃 {google_result['fare_text']}")
-            enriched.at[idx, "route_data_source"] = str(google_result.get("source", "google_directions_legacy"))
-            enriched.at[idx, "estimated_duration_label"] = label
-            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
-            enriched.at[idx, "duration_minutes"] = minutes
-            enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-            enriched.at[idx, "route_line_simple"] = " / ".join(line_parts[:3])
-            enriched.at[idx, "route_from"] = origin_name
-            enriched.at[idx, "route_to"] = destination_name
-            note_parts = []
-            if google_result.get("distance_text") and google_result.get("distance_text") != "-":
-                note_parts.append(f"Google Directions 推定距離 {google_result['distance_text']}")
-            if google_result.get("transit_summary"):
-                note_parts.append(str(google_result["transit_summary"]))
-            if google_result.get("fare_text") and google_result.get("fare_text") != "-":
-                note_parts.append(f"運賃 {google_result['fare_text']}")
-            if note_parts:
-                enriched.at[idx, "one_point"] = " / ".join(note_parts)[:160]
-        else:
+        # v6.2.40: train/transit/bus は Google Directions transit が不安定な前提で Gemini A案を優先する。
+        if public_transport_first:
+            gemini_result = _resolve_transport_with_gemini_a_minimal(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
+            if gemini_result and gemini_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(gemini_result["minutes"]), origin_name, destination_name):
+                minutes = int(gemini_result["minutes"])
+                label = f"約{minutes}分"
+                summary = safe_text(gemini_result.get("summary"), "")
+                evidence_note = safe_text(gemini_result.get("evidence_note"), "")
+                confidence = safe_text(gemini_result.get("confidence"), "")
+                note_parts = [part for part in [summary, evidence_note, f"Gemini推定 confidence={confidence}" if confidence else ""] if part]
+                _apply_transport_resolution_to_row(enriched, idx, minutes, label, "gemini_transport_a_minimal", origin_name, destination_name, departure_date, departure_time, safe_text(gemini_result.get("mode"), mode), f"{label} / {summary}" if summary else label, " / ".join(note_parts))
+                continue
+            if gemini_result and gemini_result.get("minutes"):
+                log_event("GeminiTransport", f"A案結果を棄却: {origin_name} → {destination_name} / {gemini_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+
+        # v6.2.40: walk/taxi/car などはAPI優先。公共交通はGemini失敗後に無理なtransit再試行をしない。
+        if api_first_ground:
+            google_result = None
+            origin_query = _build_google_directions_location_query(origin_name, origin_lat, origin_lng)
+            destination_query = _build_google_directions_location_query(destination_name, destination_lat, destination_lng)
+            if origin_query and destination_query:
+                google_result = _fetch_google_directions_legacy(origin_query, destination_query, mode, departure_date, departure_time)
+
+            if google_result and _validate_google_route_minutes(distance_km, int(google_result["minutes"]), mode, origin_name, destination_name):
+                minutes = int(google_result["minutes"])
+                label = f"約{minutes}分"
+                line_parts = [label]
+                if google_result.get("transit_summary"):
+                    line_parts.append(str(google_result["transit_summary"]))
+                if google_result.get("fare_text") and google_result.get("fare_text") != "-":
+                    line_parts.append(f"運賃 {google_result['fare_text']}")
+                note_parts = []
+                if google_result.get("distance_text") and google_result.get("distance_text") != "-":
+                    note_parts.append(f"Google Directions 推定距離 {google_result['distance_text']}")
+                if google_result.get("transit_summary"):
+                    note_parts.append(str(google_result["transit_summary"]))
+                if google_result.get("fare_text") and google_result.get("fare_text") != "-":
+                    note_parts.append(f"運賃 {google_result['fare_text']}")
+                _apply_transport_resolution_to_row(enriched, idx, minutes, label, str(google_result.get("source", "google_directions_legacy")), origin_name, destination_name, departure_date, departure_time, mode, " / ".join(line_parts[:3]), " / ".join(note_parts))
+                continue
             if google_result:
                 log_event("移動時間推定", f"Google Directions 結果を棄却: {origin_name} → {destination_name} / {google_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
-            llm_result = _llm_transport_duration_estimate(
-                origin_name=origin_name,
-                destination_name=destination_name,
-                mode=mode,
-                departure_date=departure_date,
-                departure_time=departure_time,
-                distance_km=distance_km,
-                origin_lat=float(origin_lat),
-                origin_lng=float(origin_lng),
-                destination_lat=float(destination_lat),
-                destination_lng=float(destination_lng),
-            )
 
-            if llm_result and llm_result.get("minutes") and _validate_llm_minutes(
-                distance_km=distance_km,
-                mode=mode,
-                minutes=int(llm_result["minutes"]),
-                origin_name=origin_name,
-                destination_name=destination_name,
-            ):
-                minutes = int(llm_result["minutes"])
+            # APIで取れなかった walk/taxi/car だけ Gemini A案を補助利用する。
+            gemini_result = _resolve_transport_with_gemini_a_minimal(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
+            if gemini_result and gemini_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(gemini_result["minutes"]), origin_name, destination_name):
+                minutes = int(gemini_result["minutes"])
                 label = f"約{minutes}分"
-                enriched.at[idx, "route_data_source"] = "llm_estimate"
-                enriched.at[idx, "estimated_duration_label"] = label
-                enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
-                enriched.at[idx, "duration_minutes"] = minutes
-                enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-                enriched.at[idx, "route_line_simple"] = f"{label}"
-                enriched.at[idx, "route_from"] = origin_name
-                enriched.at[idx, "route_to"] = destination_name
-                reason = str(llm_result.get("reason", "")).strip()
-                if reason:
-                    enriched.at[idx, "one_point"] = reason[:120]
-            else:
-                if llm_result and llm_result.get("minutes"):
-                    log_event("移動時間推定", f"LLM概算を棄却: {origin_name} → {destination_name} / {llm_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
-                fallback = _build_safe_distance_fallback(distance_km, mode, origin_name, destination_name)
-                minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
-                label = str(fallback.get("label", f"約{minutes}分（推測）"))
-                enriched.at[idx, "route_data_source"] = str(fallback.get("source", "distance_estimate"))
-                enriched.at[idx, "estimated_duration_label"] = label
-                enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
-                enriched.at[idx, "duration_minutes"] = minutes
-                enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
-                enriched.at[idx, "route_line_simple"] = f"{label}"
-                enriched.at[idx, "route_from"] = origin_name
-                enriched.at[idx, "route_to"] = destination_name
-                note = str(fallback.get("note", "")).strip()
-                if note:
-                    enriched.at[idx, "one_point"] = note[:120]
+                summary = safe_text(gemini_result.get("summary"), "")
+                evidence_note = safe_text(gemini_result.get("evidence_note"), "")
+                confidence = safe_text(gemini_result.get("confidence"), "")
+                note_parts = [part for part in [summary, evidence_note, f"Gemini推定 confidence={confidence}" if confidence else ""] if part]
+                _apply_transport_resolution_to_row(enriched, idx, minutes, label, "gemini_transport_a_minimal_after_api_failure", origin_name, destination_name, departure_date, departure_time, safe_text(gemini_result.get("mode"), mode), f"{label} / {summary}" if summary else label, " / ".join(note_parts))
+                continue
+            if gemini_result and gemini_result.get("minutes"):
+                log_event("GeminiTransport", f"API失敗後A案結果を棄却: {origin_name} → {destination_name} / {gemini_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+
+        # unknown 等はまずGemini A案を試す。
+        if not public_transport_first and not api_first_ground:
+            gemini_result = _resolve_transport_with_gemini_a_minimal(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
+            if gemini_result and gemini_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(gemini_result["minutes"]), origin_name, destination_name):
+                minutes = int(gemini_result["minutes"])
+                label = f"約{minutes}分"
+                summary = safe_text(gemini_result.get("summary"), "")
+                _apply_transport_resolution_to_row(enriched, idx, minutes, label, "gemini_transport_a_minimal_unknown_mode", origin_name, destination_name, departure_date, departure_time, safe_text(gemini_result.get("mode"), mode), f"{label} / {summary}" if summary else label, summary)
+                continue
+
+        # 最終fallback: 既存の安全な距離推定
+        fallback = _build_safe_distance_fallback(distance_km, mode, origin_name, destination_name)
+        minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
+        label = str(fallback.get("label", f"約{minutes}分（推測）"))
+        _apply_transport_resolution_to_row(enriched, idx, minutes, label, str(fallback.get("source", "distance_estimate")), origin_name, destination_name, departure_date, departure_time, mode, label, str(fallback.get("note", "")).strip())
 
     return enriched
-
 
 
 def extract_trip_days_from_text(text: str) -> Optional[int]:
@@ -4501,320 +4583,6 @@ def status_emoji(status: str) -> str:
     return mapping.get(status, "⏳")
 
 
-
-
-# =========================================================
-# 修正箇所: Gemini transport resolver A/Bテスト（サイドバー診断専用）
-# - 本番のtransport行にはまだ接続しない
-# - A案: 移動時間 + 手段だけを取得
-# - B案: 経路詳細も取得
-# - 失敗しても既存旅程・UI・カード表示には影響しない
-# =========================================================
-def _build_gemini_transport_resolver_prompt(
-    origin: str,
-    destination: str,
-    departure_datetime: str,
-    mode_hint: str,
-    detail_level: str,
-) -> str:
-    origin_text = safe_text(origin, "")
-    destination_text = safe_text(destination, "")
-    departure_text = safe_text(departure_datetime, "")
-    mode_text = safe_text(mode_hint, "自動")
-    detail_text = "minimal" if detail_level == "minimal" else "detailed"
-
-    if detail_text == "minimal":
-        output_schema = """
-{
-  "ok": true,
-  "confidence": "high|medium|low",
-  "duration_minutes": 165,
-  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
-  "summary": "北陸新幹線などを利用する想定。乗換がある場合は1行で補足。",
-  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
-}
-""".strip()
-        instruction = """
-返す情報は最小限にしてください。
-駅名・路線名・乗換駅などの詳細は、確度が高い場合のみsummaryに1行で含めてください。
-duration_minutes は現実的な移動時間にしてください。
-例: 福井駅→京都駅が20分のような明らかに不自然な値は禁止です。
-""".strip()
-    else:
-        output_schema = """
-{
-  "ok": true,
-  "confidence": "high|medium|low",
-  "duration_minutes": 165,
-  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
-  "summary": "全体の経路要約",
-  "route_title": "推定ルート名",
-  "steps": [
-    {
-      "from": "出発地または駅",
-      "to": "到着地または駅",
-      "mode": "walk|train|bus|taxi|car|air|ship|unknown",
-      "line": "路線名・便名。なければ空文字",
-      "duration_minutes": 10,
-      "note": "乗換・徒歩などの補足"
-    }
-  ],
-  "transfer_count": 1,
-  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
-}
-""".strip()
-        instruction = """
-経路詳細も返してください。
-ただし、不明な駅名・路線名・乗換駅を断定しないでください。
-不確実な場合は confidence を low にし、line や note に「要確認」と明示してください。
-duration_minutes は steps の合計と大きく矛盾しないようにしてください。
-例: 福井駅→京都駅が20分のような明らかに不自然な値は禁止です。
-""".strip()
-
-    return f"""
-あなたは旅行AIエージェント VoyageFlow の transport resolver です。
-目的は、旅程内の transport 行に使う移動時間と移動手段を、破綻しない範囲で推定することです。
-
-重要:
-- あなたの出力はAPI実測ではなく推定です。
-- 不確かな情報は断定しないでください。
-- 既存コード側で制御するため、出力は必ずJSONのみ。
-- Markdown、説明文、コードフェンスは禁止。
-- 日本国内の公共交通は、常識的な所要時間にしてください。
-- 明らかに短すぎる移動時間を出さないでください。
-- 指定時刻に運行がありそうか不明な場合は、その旨を evidence_note に書いてください。
-
-入力:
-- 出発地: {origin_text}
-- 到着地: {destination_text}
-- 出発日時: {departure_text}
-- 手段ヒント: {mode_text}
-- 詳細レベル: {detail_text}
-
-追加指示:
-{instruction}
-
-出力JSON形式:
-{output_schema}
-""".strip()
-
-
-def _normalize_gemini_transport_result(data: Dict[str, object], detail_level: str) -> Dict[str, object]:
-    if not isinstance(data, dict):
-        data = {}
-
-    def _safe_int(value, default: Optional[int] = None) -> Optional[int]:
-        try:
-            if value is None or value == "":
-                return default
-            return int(float(value))
-        except Exception:
-            return default
-
-    allowed_modes = {"train", "bus", "walk", "taxi", "car", "air", "ship", "unknown"}
-    allowed_confidence = {"high", "medium", "low"}
-
-    mode = safe_text(data.get("mode"), "unknown").lower()
-    if mode not in allowed_modes:
-        mode = _infer_mode_from_service_hint(mode, "unknown")
-        if mode not in allowed_modes:
-            mode = "unknown"
-
-    confidence = safe_text(data.get("confidence"), "low").lower()
-    if confidence not in allowed_confidence:
-        confidence = "low"
-
-    duration_minutes = _safe_int(data.get("duration_minutes"), None)
-    if duration_minutes is not None:
-        duration_minutes = max(1, min(duration_minutes, 24 * 60))
-
-    normalized: Dict[str, object] = {
-        "ok": bool(data.get("ok", True)) if data else False,
-        "resolver": "gemini_transport_resolver",
-        "detail_level": detail_level,
-        "confidence": confidence,
-        "duration_minutes": duration_minutes,
-        "mode": mode,
-        "summary": safe_text(data.get("summary"), ""),
-        "evidence_note": safe_text(data.get("evidence_note"), "Gemini推定のため、Google Maps等で最終確認してください。"),
-    }
-
-    if detail_level == "detailed":
-        raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
-        steps = []
-        total_from_steps = 0
-        for step in raw_steps[:12]:
-            if not isinstance(step, dict):
-                continue
-            step_minutes = _safe_int(step.get("duration_minutes"), None)
-            if step_minutes is not None:
-                step_minutes = max(1, min(step_minutes, 24 * 60))
-                total_from_steps += step_minutes
-            step_mode = safe_text(step.get("mode"), "unknown").lower()
-            if step_mode not in allowed_modes:
-                step_mode = _infer_mode_from_service_hint(step_mode, "unknown")
-                if step_mode not in allowed_modes:
-                    step_mode = "unknown"
-            steps.append({
-                "from": safe_text(step.get("from"), ""),
-                "to": safe_text(step.get("to"), ""),
-                "mode": step_mode,
-                "line": safe_text(step.get("line"), ""),
-                "duration_minutes": step_minutes,
-                "note": safe_text(step.get("note"), ""),
-            })
-        normalized["route_title"] = safe_text(data.get("route_title"), "")
-        normalized["steps"] = steps
-        normalized["transfer_count"] = _safe_int(data.get("transfer_count"), None)
-        normalized["steps_duration_total"] = total_from_steps or None
-
-    return normalized
-
-
-def resolve_transport_with_gemini_for_test(
-    origin: str,
-    destination: str,
-    departure_datetime: str,
-    mode_hint: str = "自動",
-    detail_level: str = "minimal",
-) -> Dict[str, object]:
-    prompt = _build_gemini_transport_resolver_prompt(
-        origin=origin,
-        destination=destination,
-        departure_datetime=departure_datetime,
-        mode_hint=mode_hint,
-        detail_level=detail_level,
-    )
-    started_at = datetime.now()
-    try:
-        generator = Phase1Generator(logger=log_event)
-        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
-        parsed = _safe_json_extract(raw) or {}
-        normalized = _normalize_gemini_transport_result(parsed, detail_level=detail_level)
-        normalized["raw"] = raw
-        normalized["elapsed_seconds"] = round((datetime.now() - started_at).total_seconds(), 2)
-        normalized["fallback_used"] = False
-        return normalized
-    except Exception as e:
-        log_event("GeminiTransport診断", f"{detail_level} resolver失敗: {e}", level="warning")
-        return {
-            "ok": False,
-            "resolver": "gemini_transport_resolver",
-            "detail_level": detail_level,
-            "confidence": "low",
-            "duration_minutes": None,
-            "mode": "unknown",
-            "summary": "",
-            "evidence_note": "Gemini resolver の実行に失敗しました。本番実装時は既存Routes/Directions/距離推定へfallbackします。",
-            "error": str(e),
-            "elapsed_seconds": round((datetime.now() - started_at).total_seconds(), 2),
-            "fallback_used": True,
-        }
-
-
-def _render_gemini_transport_result_card(title: str, result: Dict[str, object]) -> None:
-    st.markdown(f"**{title}**")
-    if not result:
-        st.caption("まだ実行結果がありません。")
-        return
-
-    summary_payload = {
-        "ok": result.get("ok"),
-        "detail_level": result.get("detail_level"),
-        "confidence": result.get("confidence"),
-        "duration_minutes": result.get("duration_minutes"),
-        "mode": result.get("mode"),
-        "summary": result.get("summary"),
-        "evidence_note": result.get("evidence_note"),
-        "elapsed_seconds": result.get("elapsed_seconds"),
-        "fallback_used": result.get("fallback_used"),
-    }
-    if result.get("error"):
-        summary_payload["error"] = result.get("error")
-    if result.get("route_title"):
-        summary_payload["route_title"] = result.get("route_title")
-    if result.get("transfer_count") is not None:
-        summary_payload["transfer_count"] = result.get("transfer_count")
-    if result.get("steps_duration_total") is not None:
-        summary_payload["steps_duration_total"] = result.get("steps_duration_total")
-
-    st.json(summary_payload)
-
-    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
-    if steps:
-        st.markdown("**推定ステップ**")
-        for idx, step in enumerate(steps, start=1):
-            st.write(
-                f"{idx}. {safe_text(step.get('from'), '')} → {safe_text(step.get('to'), '')} / "
-                f"{safe_text(step.get('mode'), 'unknown')} / {safe_text(step.get('line'), '')} / "
-                f"{safe_text(step.get('duration_minutes'), '-')}分"
-            )
-            note = safe_text(step.get("note"), "")
-            if note and note != "-":
-                st.caption(note)
-
-    with st.expander("Gemini raw output", expanded=False):
-        st.code(safe_text(result.get("raw"), ""), language="json")
-
-
-def render_gemini_transport_ab_test_panel() -> None:
-    # --- 修正箇所: 左側固定スペースでA/B両方を検証するだけ。本番transportには未接続。 ---
-    with st.expander("🧪 Gemini Transport A/Bテスト", expanded=False):
-        st.caption("診断専用です。ここでの結果は完成旅程・実行シミュレーションへ自動反映しません。")
-        ab_origin = st.text_input("Gemini 出発地", value="福井駅", key="gemini_transport_ab_origin")
-        ab_destination = st.text_input("Gemini 到着地", value="京都駅", key="gemini_transport_ab_destination")
-        ab_departure = st.text_input(
-            "Gemini 出発日時 (YYYY-MM-DD HH:MM)",
-            value="2026-04-30 13:00",
-            key="gemini_transport_ab_departure",
-        )
-        ab_mode_hint = st.selectbox(
-            "Gemini 手段ヒント",
-            options=["自動", "train", "bus", "walk", "taxi", "car", "air", "ship"],
-            index=0,
-            key="gemini_transport_ab_mode_hint",
-        )
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            run_minimal = st.button("A案: 時間+手段だけ", use_container_width=True, key="run_gemini_transport_minimal")
-        with col_b:
-            run_detailed = st.button("B案: 経路詳細も取得", use_container_width=True, key="run_gemini_transport_detailed")
-
-        if st.button("A/B両方を実行", use_container_width=True, key="run_gemini_transport_both"):
-            run_minimal = True
-            run_detailed = True
-
-        if run_minimal:
-            st.session_state["gemini_transport_minimal_result"] = resolve_transport_with_gemini_for_test(
-                origin=ab_origin,
-                destination=ab_destination,
-                departure_datetime=ab_departure,
-                mode_hint=ab_mode_hint,
-                detail_level="minimal",
-            )
-
-        if run_detailed:
-            st.session_state["gemini_transport_detailed_result"] = resolve_transport_with_gemini_for_test(
-                origin=ab_origin,
-                destination=ab_destination,
-                departure_datetime=ab_departure,
-                mode_hint=ab_mode_hint,
-                detail_level="detailed",
-            )
-
-        st.divider()
-        _render_gemini_transport_result_card(
-            "A案: 移動時間 + 手段だけ",
-            st.session_state.get("gemini_transport_minimal_result", {}),
-        )
-        st.divider()
-        _render_gemini_transport_result_card(
-            "B案: 経路詳細も取得",
-            st.session_state.get("gemini_transport_detailed_result", {}),
-        )
-
-
 # =========================================================
 # サイドバー
 # =========================================================
@@ -4829,9 +4597,6 @@ with st.sidebar:
     st.divider()
     st.markdown("### VoyageFlow")
     st.caption("モデル: models/gemini-3.1-flash-lite-preview")
-
-    # --- 修正箇所: Gemini transport resolver A/Bテストをサイドバー固定スペースへ追加 ---
-    render_gemini_transport_ab_test_panel()
 
     # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
     with st.expander("🛠 Routes診断", expanded=False):
