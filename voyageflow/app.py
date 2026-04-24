@@ -26,16 +26,18 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.37-google-directions-minimal-safe
-# 【制作日】2026-04-22
+# 【バージョン名】VoyageFlow v6.2.39-gemini-transport-ab-test-sidebar
+# 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
-# - タクシー移動カードのときだけ Uber 導線を追加
-# - Uber は安全なリンク導線のみ追加し、既存の旅程・ホテル・カレンダー・天候ロジックは変更しない
-# - 移動開始の数分前に予約するとよい旨の案内を追加
+# - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
+# - A案: 移動時間 + 手段だけをGeminiで推定
+# - B案: 経路詳細もGeminiで推定
+# - 既存の旅程生成・完成旅程・実行シミュレーションには未接続の診断専用実装
+# - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.38-google-directions-minimal-safe"
-APP_UPDATED_DATE = "2026-04-22"
+APP_VERSION_NAME = "v6.2.39-gemini-transport-ab-test-sidebar"
+APP_UPDATED_DATE = "2026-04-24"
 
 
 # =========================================================
@@ -4499,6 +4501,320 @@ def status_emoji(status: str) -> str:
     return mapping.get(status, "⏳")
 
 
+
+
+# =========================================================
+# 修正箇所: Gemini transport resolver A/Bテスト（サイドバー診断専用）
+# - 本番のtransport行にはまだ接続しない
+# - A案: 移動時間 + 手段だけを取得
+# - B案: 経路詳細も取得
+# - 失敗しても既存旅程・UI・カード表示には影響しない
+# =========================================================
+def _build_gemini_transport_resolver_prompt(
+    origin: str,
+    destination: str,
+    departure_datetime: str,
+    mode_hint: str,
+    detail_level: str,
+) -> str:
+    origin_text = safe_text(origin, "")
+    destination_text = safe_text(destination, "")
+    departure_text = safe_text(departure_datetime, "")
+    mode_text = safe_text(mode_hint, "自動")
+    detail_text = "minimal" if detail_level == "minimal" else "detailed"
+
+    if detail_text == "minimal":
+        output_schema = """
+{
+  "ok": true,
+  "confidence": "high|medium|low",
+  "duration_minutes": 165,
+  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
+  "summary": "北陸新幹線などを利用する想定。乗換がある場合は1行で補足。",
+  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
+}
+""".strip()
+        instruction = """
+返す情報は最小限にしてください。
+駅名・路線名・乗換駅などの詳細は、確度が高い場合のみsummaryに1行で含めてください。
+duration_minutes は現実的な移動時間にしてください。
+例: 福井駅→京都駅が20分のような明らかに不自然な値は禁止です。
+""".strip()
+    else:
+        output_schema = """
+{
+  "ok": true,
+  "confidence": "high|medium|low",
+  "duration_minutes": 165,
+  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
+  "summary": "全体の経路要約",
+  "route_title": "推定ルート名",
+  "steps": [
+    {
+      "from": "出発地または駅",
+      "to": "到着地または駅",
+      "mode": "walk|train|bus|taxi|car|air|ship|unknown",
+      "line": "路線名・便名。なければ空文字",
+      "duration_minutes": 10,
+      "note": "乗換・徒歩などの補足"
+    }
+  ],
+  "transfer_count": 1,
+  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
+}
+""".strip()
+        instruction = """
+経路詳細も返してください。
+ただし、不明な駅名・路線名・乗換駅を断定しないでください。
+不確実な場合は confidence を low にし、line や note に「要確認」と明示してください。
+duration_minutes は steps の合計と大きく矛盾しないようにしてください。
+例: 福井駅→京都駅が20分のような明らかに不自然な値は禁止です。
+""".strip()
+
+    return f"""
+あなたは旅行AIエージェント VoyageFlow の transport resolver です。
+目的は、旅程内の transport 行に使う移動時間と移動手段を、破綻しない範囲で推定することです。
+
+重要:
+- あなたの出力はAPI実測ではなく推定です。
+- 不確かな情報は断定しないでください。
+- 既存コード側で制御するため、出力は必ずJSONのみ。
+- Markdown、説明文、コードフェンスは禁止。
+- 日本国内の公共交通は、常識的な所要時間にしてください。
+- 明らかに短すぎる移動時間を出さないでください。
+- 指定時刻に運行がありそうか不明な場合は、その旨を evidence_note に書いてください。
+
+入力:
+- 出発地: {origin_text}
+- 到着地: {destination_text}
+- 出発日時: {departure_text}
+- 手段ヒント: {mode_text}
+- 詳細レベル: {detail_text}
+
+追加指示:
+{instruction}
+
+出力JSON形式:
+{output_schema}
+""".strip()
+
+
+def _normalize_gemini_transport_result(data: Dict[str, object], detail_level: str) -> Dict[str, object]:
+    if not isinstance(data, dict):
+        data = {}
+
+    def _safe_int(value, default: Optional[int] = None) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return default
+            return int(float(value))
+        except Exception:
+            return default
+
+    allowed_modes = {"train", "bus", "walk", "taxi", "car", "air", "ship", "unknown"}
+    allowed_confidence = {"high", "medium", "low"}
+
+    mode = safe_text(data.get("mode"), "unknown").lower()
+    if mode not in allowed_modes:
+        mode = _infer_mode_from_service_hint(mode, "unknown")
+        if mode not in allowed_modes:
+            mode = "unknown"
+
+    confidence = safe_text(data.get("confidence"), "low").lower()
+    if confidence not in allowed_confidence:
+        confidence = "low"
+
+    duration_minutes = _safe_int(data.get("duration_minutes"), None)
+    if duration_minutes is not None:
+        duration_minutes = max(1, min(duration_minutes, 24 * 60))
+
+    normalized: Dict[str, object] = {
+        "ok": bool(data.get("ok", True)) if data else False,
+        "resolver": "gemini_transport_resolver",
+        "detail_level": detail_level,
+        "confidence": confidence,
+        "duration_minutes": duration_minutes,
+        "mode": mode,
+        "summary": safe_text(data.get("summary"), ""),
+        "evidence_note": safe_text(data.get("evidence_note"), "Gemini推定のため、Google Maps等で最終確認してください。"),
+    }
+
+    if detail_level == "detailed":
+        raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        steps = []
+        total_from_steps = 0
+        for step in raw_steps[:12]:
+            if not isinstance(step, dict):
+                continue
+            step_minutes = _safe_int(step.get("duration_minutes"), None)
+            if step_minutes is not None:
+                step_minutes = max(1, min(step_minutes, 24 * 60))
+                total_from_steps += step_minutes
+            step_mode = safe_text(step.get("mode"), "unknown").lower()
+            if step_mode not in allowed_modes:
+                step_mode = _infer_mode_from_service_hint(step_mode, "unknown")
+                if step_mode not in allowed_modes:
+                    step_mode = "unknown"
+            steps.append({
+                "from": safe_text(step.get("from"), ""),
+                "to": safe_text(step.get("to"), ""),
+                "mode": step_mode,
+                "line": safe_text(step.get("line"), ""),
+                "duration_minutes": step_minutes,
+                "note": safe_text(step.get("note"), ""),
+            })
+        normalized["route_title"] = safe_text(data.get("route_title"), "")
+        normalized["steps"] = steps
+        normalized["transfer_count"] = _safe_int(data.get("transfer_count"), None)
+        normalized["steps_duration_total"] = total_from_steps or None
+
+    return normalized
+
+
+def resolve_transport_with_gemini_for_test(
+    origin: str,
+    destination: str,
+    departure_datetime: str,
+    mode_hint: str = "自動",
+    detail_level: str = "minimal",
+) -> Dict[str, object]:
+    prompt = _build_gemini_transport_resolver_prompt(
+        origin=origin,
+        destination=destination,
+        departure_datetime=departure_datetime,
+        mode_hint=mode_hint,
+        detail_level=detail_level,
+    )
+    started_at = datetime.now()
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        parsed = _safe_json_extract(raw) or {}
+        normalized = _normalize_gemini_transport_result(parsed, detail_level=detail_level)
+        normalized["raw"] = raw
+        normalized["elapsed_seconds"] = round((datetime.now() - started_at).total_seconds(), 2)
+        normalized["fallback_used"] = False
+        return normalized
+    except Exception as e:
+        log_event("GeminiTransport診断", f"{detail_level} resolver失敗: {e}", level="warning")
+        return {
+            "ok": False,
+            "resolver": "gemini_transport_resolver",
+            "detail_level": detail_level,
+            "confidence": "low",
+            "duration_minutes": None,
+            "mode": "unknown",
+            "summary": "",
+            "evidence_note": "Gemini resolver の実行に失敗しました。本番実装時は既存Routes/Directions/距離推定へfallbackします。",
+            "error": str(e),
+            "elapsed_seconds": round((datetime.now() - started_at).total_seconds(), 2),
+            "fallback_used": True,
+        }
+
+
+def _render_gemini_transport_result_card(title: str, result: Dict[str, object]) -> None:
+    st.markdown(f"**{title}**")
+    if not result:
+        st.caption("まだ実行結果がありません。")
+        return
+
+    summary_payload = {
+        "ok": result.get("ok"),
+        "detail_level": result.get("detail_level"),
+        "confidence": result.get("confidence"),
+        "duration_minutes": result.get("duration_minutes"),
+        "mode": result.get("mode"),
+        "summary": result.get("summary"),
+        "evidence_note": result.get("evidence_note"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "fallback_used": result.get("fallback_used"),
+    }
+    if result.get("error"):
+        summary_payload["error"] = result.get("error")
+    if result.get("route_title"):
+        summary_payload["route_title"] = result.get("route_title")
+    if result.get("transfer_count") is not None:
+        summary_payload["transfer_count"] = result.get("transfer_count")
+    if result.get("steps_duration_total") is not None:
+        summary_payload["steps_duration_total"] = result.get("steps_duration_total")
+
+    st.json(summary_payload)
+
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    if steps:
+        st.markdown("**推定ステップ**")
+        for idx, step in enumerate(steps, start=1):
+            st.write(
+                f"{idx}. {safe_text(step.get('from'), '')} → {safe_text(step.get('to'), '')} / "
+                f"{safe_text(step.get('mode'), 'unknown')} / {safe_text(step.get('line'), '')} / "
+                f"{safe_text(step.get('duration_minutes'), '-')}分"
+            )
+            note = safe_text(step.get("note"), "")
+            if note and note != "-":
+                st.caption(note)
+
+    with st.expander("Gemini raw output", expanded=False):
+        st.code(safe_text(result.get("raw"), ""), language="json")
+
+
+def render_gemini_transport_ab_test_panel() -> None:
+    # --- 修正箇所: 左側固定スペースでA/B両方を検証するだけ。本番transportには未接続。 ---
+    with st.expander("🧪 Gemini Transport A/Bテスト", expanded=False):
+        st.caption("診断専用です。ここでの結果は完成旅程・実行シミュレーションへ自動反映しません。")
+        ab_origin = st.text_input("Gemini 出発地", value="福井駅", key="gemini_transport_ab_origin")
+        ab_destination = st.text_input("Gemini 到着地", value="京都駅", key="gemini_transport_ab_destination")
+        ab_departure = st.text_input(
+            "Gemini 出発日時 (YYYY-MM-DD HH:MM)",
+            value="2026-04-30 13:00",
+            key="gemini_transport_ab_departure",
+        )
+        ab_mode_hint = st.selectbox(
+            "Gemini 手段ヒント",
+            options=["自動", "train", "bus", "walk", "taxi", "car", "air", "ship"],
+            index=0,
+            key="gemini_transport_ab_mode_hint",
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            run_minimal = st.button("A案: 時間+手段だけ", use_container_width=True, key="run_gemini_transport_minimal")
+        with col_b:
+            run_detailed = st.button("B案: 経路詳細も取得", use_container_width=True, key="run_gemini_transport_detailed")
+
+        if st.button("A/B両方を実行", use_container_width=True, key="run_gemini_transport_both"):
+            run_minimal = True
+            run_detailed = True
+
+        if run_minimal:
+            st.session_state["gemini_transport_minimal_result"] = resolve_transport_with_gemini_for_test(
+                origin=ab_origin,
+                destination=ab_destination,
+                departure_datetime=ab_departure,
+                mode_hint=ab_mode_hint,
+                detail_level="minimal",
+            )
+
+        if run_detailed:
+            st.session_state["gemini_transport_detailed_result"] = resolve_transport_with_gemini_for_test(
+                origin=ab_origin,
+                destination=ab_destination,
+                departure_datetime=ab_departure,
+                mode_hint=ab_mode_hint,
+                detail_level="detailed",
+            )
+
+        st.divider()
+        _render_gemini_transport_result_card(
+            "A案: 移動時間 + 手段だけ",
+            st.session_state.get("gemini_transport_minimal_result", {}),
+        )
+        st.divider()
+        _render_gemini_transport_result_card(
+            "B案: 経路詳細も取得",
+            st.session_state.get("gemini_transport_detailed_result", {}),
+        )
+
+
 # =========================================================
 # サイドバー
 # =========================================================
@@ -4513,6 +4829,9 @@ with st.sidebar:
     st.divider()
     st.markdown("### VoyageFlow")
     st.caption("モデル: models/gemini-3.1-flash-lite-preview")
+
+    # --- 修正箇所: Gemini transport resolver A/Bテストをサイドバー固定スペースへ追加 ---
+    render_gemini_transport_ab_test_panel()
 
     # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
     with st.expander("🛠 Routes診断", expanded=False):
