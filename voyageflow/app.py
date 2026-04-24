@@ -26,7 +26,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.40-transport-gemini-a-minimal-integration
+# 【バージョン名】VoyageFlow v6.2.41-transport-debug-probe
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
 # - transport行の本番推定に Gemini Transport Resolver A案（移動時間 + 手段のみ）を局所導入
@@ -35,7 +35,7 @@ from maps.routes_api import RoutesAPI
 # - UI、カード表示、フェーズ構成、既存ホテル・天候・カレンダー・実行シミュレーションは変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.40-transport-gemini-a-minimal-integration"
+APP_VERSION_NAME = "v6.2.41-transport-debug-probe"
 APP_UPDATED_DATE = "2026-04-24"
 
 
@@ -1638,11 +1638,95 @@ def log_event(stage: str, message: str, level: str = "info") -> None:
         "level": level,
         "message": str(message),
     })
-    st.session_state.app_logs = logs[-200:]
+    st.session_state.app_logs = logs[-500:]
 
 
 def clear_logs() -> None:
     st.session_state.app_logs = []
+
+
+# =========================================================
+# 修正箇所: transport内部データ検証ログ（v6.2.41）
+# - 旅程処理そのものは変更せず、どの変数に何が入り、どの分岐で採用/棄却されたかを確認する
+# =========================================================
+def _debug_value(value, default=""):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, float) and pd.isna(value):
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def _transport_row_debug_snapshot(row) -> Dict[str, object]:
+    if row is None:
+        return {}
+    return {
+        "day": _debug_value(_row_value(row, "day", "")),
+        "sequence": _debug_value(_row_value(row, "sequence", "")),
+        "date": safe_text(_row_value(row, "date", ""), ""),
+        "start_time": safe_text(_row_value(row, "start_time", ""), ""),
+        "end_time": safe_text(_row_value(row, "end_time", ""), ""),
+        "destination": safe_text(_row_value(row, "destination", ""), ""),
+        "purpose": safe_text(_row_value(row, "purpose", ""), ""),
+        "genre": safe_text(_row_value(row, "genre", ""), ""),
+        "is_transport": bool(_row_value(row, "is_transport", False)),
+        "transport_mode": safe_text(_row_value(row, "transport_mode", ""), ""),
+        "route_from": safe_text(_row_value(row, "route_from", ""), ""),
+        "route_to": safe_text(_row_value(row, "route_to", ""), ""),
+        "duration_minutes": _debug_value(_row_value(row, "duration_minutes", "")),
+        "route_data_source": safe_text(_row_value(row, "route_data_source", ""), ""),
+        "estimated_duration_label": safe_text(_row_value(row, "estimated_duration_label", ""), ""),
+        "lat": _debug_value(_row_value(row, "latitude", "")),
+        "lng": _debug_value(_row_value(row, "longitude", "")),
+    }
+
+
+def log_transport_debug(stage: str, payload: Dict[str, object], level: str = "info") -> None:
+    try:
+        safe_payload = json.dumps(payload, ensure_ascii=False, default=str)
+        if len(safe_payload) > 1600:
+            safe_payload = safe_payload[:1600] + " ...<truncated>"
+        log_event(stage, safe_payload, level=level)
+    except Exception as e:
+        log_event(stage, f"transport debug payload logging failed: {e}", level="warning")
+
+
+def render_transport_debug_sidebar() -> None:
+    st.markdown("### 🧪 Transport内部データ検証")
+    st.caption("表示だけの診断欄です。旅程データは変更しません。")
+    df = st.session_state.get("df_phase3")
+    source_name = "df_phase3"
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        df = st.session_state.get("df_phase2")
+        source_name = "df_phase2"
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.caption("まだ検証できる旅程DataFrameがありません。")
+        return
+    try:
+        transport_rows = df[df.get("is_transport", False) == True].copy() if "is_transport" in df.columns else pd.DataFrame()
+    except Exception:
+        transport_rows = pd.DataFrame()
+    st.write(f"対象: {source_name} / 行数: {len(df)} / transport行: {len(transport_rows)}")
+    with st.expander("DataFrame列一覧", expanded=False):
+        st.code(", ".join([str(c) for c in df.columns]), language="text")
+    preview_cols = [c for c in ["day", "sequence", "date", "start_time", "end_time", "destination", "purpose", "genre", "is_transport", "transport_mode", "route_from", "route_to", "duration_minutes", "estimated_duration_label", "route_data_source", "route_line_simple", "one_point"] if c in df.columns]
+    if preview_cols:
+        with st.expander("transport前後の主要列プレビュー", expanded=False):
+            st.dataframe(df[preview_cols], use_container_width=True, height=220)
+    if not transport_rows.empty:
+        with st.expander("transport行の変数スナップショット", expanded=True):
+            snap_df = df.reset_index(drop=True)
+            snapshots = []
+            for idx in snap_df.index[snap_df["is_transport"] == True].tolist():
+                prev_row, next_row = _find_transport_context_rows(snap_df, int(idx))
+                snapshots.append({"idx": int(idx), "current": _transport_row_debug_snapshot(snap_df.iloc[int(idx)]), "prev": _transport_row_debug_snapshot(prev_row), "next": _transport_row_debug_snapshot(next_row)})
+            st.json(snapshots)
+    if st.button("🧾 現在のtransport診断ログを追加", key="add_transport_debug_log", use_container_width=True):
+        log_transport_debug("TransportDebug", {"source": source_name, "rows": len(df), "transport_rows": len(transport_rows), "columns": list(map(str, df.columns)), "preview": df[preview_cols].head(30).to_dict(orient="records") if preview_cols else []})
+        st.rerun()
 
 
 def _safe_json_extract(text: str) -> Optional[Dict[str, object]]:
@@ -2384,15 +2468,20 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
         return df
 
     enriched = df.copy().reset_index(drop=True)
-    for idx in enriched.index[enriched["is_transport"] == True].tolist():
+    transport_indexes = enriched.index[enriched["is_transport"] == True].tolist()
+    log_transport_debug("TransportEnrichStart", {"use_case": use_case, "rows": len(enriched), "transport_indexes": transport_indexes, "planning_state": {"start_date": safe_text(planning_state.get("start_date"), ""), "departure_time": safe_text(planning_state.get("departure_time"), ""), "transport_style": safe_text(planning_state.get("transport_style"), ""), "departure_place": safe_text(planning_state.get("departure_place"), ""), "return_place": safe_text(planning_state.get("return_place"), "")}})
+    for idx in transport_indexes:
         prev_row, next_row = _find_transport_context_rows(enriched, idx)
         if prev_row is None or next_row is None:
+            log_transport_debug("TransportContextMissing", {"idx": int(idx), "current": _transport_row_debug_snapshot(enriched.iloc[idx])}, level="warning")
             continue
 
         origin_name = safe_text(prev_row.get("destination"), "出発地")
         destination_name = safe_text(next_row.get("destination"), "目的地")
         departure_date = safe_text(enriched.at[idx, "date"], safe_text(planning_state.get("start_date"), ""))
         departure_time = safe_text(enriched.at[idx, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
+
+        log_transport_debug("TransportContext", {"idx": int(idx), "current_before": _transport_row_debug_snapshot(enriched.iloc[idx]), "prev": _transport_row_debug_snapshot(prev_row), "next": _transport_row_debug_snapshot(next_row), "origin_name": origin_name, "destination_name": destination_name, "departure_date": departure_date, "departure_time": departure_time})
 
         # --- 安全策: 航空・空港・国際移動は app.py で再計算しない ---
         if _is_air_transport_context(enriched.iloc[idx], prev_row, next_row):
@@ -2410,6 +2499,7 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
         destination_lat = next_row.get("latitude")
         destination_lng = next_row.get("longitude")
         if any(pd.isna(v) for v in [origin_lat, origin_lng, destination_lat, destination_lng]):
+            log_transport_debug("TransportSkipMissingCoordinates", {"idx": int(idx), "origin": origin_name, "destination": destination_name, "origin_lat": origin_lat, "origin_lng": origin_lng, "destination_lat": destination_lat, "destination_lng": destination_lng}, level="warning")
             enriched.at[idx, "route_data_source"] = "kept_existing_schedule"
             enriched.at[idx, "estimated_duration_label"] = ""
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
@@ -2440,10 +2530,12 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
         mode = _normalize_transport_mode_for_resolver(mode)
         public_transport_first = _is_public_transport_mode(mode)
         api_first_ground = _is_api_first_ground_mode(mode)
+        log_transport_debug("TransportBranchDecision", {"idx": int(idx), "origin": origin_name, "destination": destination_name, "distance_km": round(float(distance_km), 3), "mode": mode, "public_transport_first": public_transport_first, "api_first_ground": api_first_ground})
 
         # v6.2.40: train/transit/bus は Google Directions transit が不安定な前提で Gemini A案を優先する。
         if public_transport_first:
             gemini_result = _resolve_transport_with_gemini_a_minimal(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
+            log_transport_debug("GeminiAResult", {"idx": int(idx), "origin": origin_name, "destination": destination_name, "mode": mode, "distance_km": round(float(distance_km), 3), "result": gemini_result})
             if gemini_result and gemini_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(gemini_result["minutes"]), origin_name, destination_name):
                 minutes = int(gemini_result["minutes"])
                 label = f"約{minutes}分"
@@ -2452,6 +2544,7 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
                 confidence = safe_text(gemini_result.get("confidence"), "")
                 note_parts = [part for part in [summary, evidence_note, f"Gemini推定 confidence={confidence}" if confidence else ""] if part]
                 _apply_transport_resolution_to_row(enriched, idx, minutes, label, "gemini_transport_a_minimal", origin_name, destination_name, departure_date, departure_time, safe_text(gemini_result.get("mode"), mode), f"{label} / {summary}" if summary else label, " / ".join(note_parts))
+                log_transport_debug("TransportApplied", {"idx": int(idx), "source": "gemini_transport_a_minimal", "after": _transport_row_debug_snapshot(enriched.iloc[idx])})
                 continue
             if gemini_result and gemini_result.get("minutes"):
                 log_event("GeminiTransport", f"A案結果を棄却: {origin_name} → {destination_name} / {gemini_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
@@ -2463,6 +2556,7 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             destination_query = _build_google_directions_location_query(destination_name, destination_lat, destination_lng)
             if origin_query and destination_query:
                 google_result = _fetch_google_directions_legacy(origin_query, destination_query, mode, departure_date, departure_time)
+            log_transport_debug("GoogleDirectionsResult", {"idx": int(idx), "origin_query": origin_query if 'origin_query' in locals() else "", "destination_query": destination_query if 'destination_query' in locals() else "", "mode": mode, "result": google_result})
 
             if google_result and _validate_google_route_minutes(distance_km, int(google_result["minutes"]), mode, origin_name, destination_name):
                 minutes = int(google_result["minutes"])
@@ -2513,7 +2607,9 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
         minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
         label = str(fallback.get("label", f"約{minutes}分（推測）"))
         _apply_transport_resolution_to_row(enriched, idx, minutes, label, str(fallback.get("source", "distance_estimate")), origin_name, destination_name, departure_date, departure_time, mode, label, str(fallback.get("note", "")).strip())
+        log_transport_debug("TransportApplied", {"idx": int(idx), "source": str(fallback.get("source", "distance_estimate")), "fallback": fallback, "after": _transport_row_debug_snapshot(enriched.iloc[idx])})
 
+    log_transport_debug("TransportEnrichEnd", {"rows": len(enriched), "transport_rows": len(enriched.index[enriched["is_transport"] == True].tolist())})
     return enriched
 
 
@@ -4593,6 +4689,9 @@ with st.sidebar:
 
     st.divider()
     render_internal_logs_sidebar()
+
+    st.divider()
+    render_transport_debug_sidebar()
 
     st.divider()
     st.markdown("### VoyageFlow")
