@@ -34,10 +34,11 @@ from maps.routes_api import RoutesAPI
 # - B案: 経路詳細もGeminiで推定
 # - 既存の旅程生成・完成旅程・実行シミュレーションには未接続の診断専用実装
 # - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
+# - v6.2.40: スポットカード下部に「🔎 最新情報」公式確認リンクを安全に追加
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.39-gemini-transport-ab-test-sidebar"
-APP_UPDATED_DATE = "2026-04-24"
+APP_VERSION_NAME = "v6.2.40-spot-latest-info-links"
+APP_UPDATED_DATE = "2026-04-26"
 
 
 # =========================================================
@@ -4257,6 +4258,97 @@ def _format_highlight_comment_html(text: str) -> str:
     )
 
 
+# =========================================================
+# 修正箇所: スポット最新情報リンク（安全版）
+# - Phase2 / Phase3 の構造化データには一切触らない
+# - LLMにイベント名を作らせず、まずは公式確認リンクだけをスポットカード下部に表示
+# - 固定辞書にないスポットはカテゴリ推定 + Google検索リンクでフォールバック
+# =========================================================
+SPOT_INFO_SOURCES = {
+    "東京国立博物館": {"type": "museum", "url": "https://www.tnm.jp/modules/r_calender/index.php", "label": "展示・イベント情報を見る"},
+    "国立西洋美術館": {"type": "museum", "url": "https://www.nmwa.go.jp/jp/exhibitions/", "label": "展覧会情報を見る"},
+    "歌舞伎座": {"type": "theater", "url": "https://www.kabuki-bito.jp/theaters/kabukiza/", "label": "公演・演目を見る"},
+    "GINZA SIX": {"type": "commercial_complex", "url": "https://ginza6.tokyo/news/news_category/events", "label": "イベント情報を見る"},
+    "東京ディズニーリゾート": {"type": "theme_park", "url": "https://www.tokyodisneyresort.jp/tdr/event.html", "label": "イベント情報を見る"},
+    "東京ディズニーランド": {"type": "theme_park", "url": "https://www.tokyodisneyresort.jp/tdl/event.html", "label": "イベント情報を見る"},
+    "東京ディズニーシー": {"type": "theme_park", "url": "https://www.tokyodisneyresort.jp/tds/event.html", "label": "イベント情報を見る"},
+    "東京スカイツリー": {"type": "commercial_complex", "url": "https://www.tokyo-skytree.jp/event/", "label": "イベント情報を見る"},
+    "東京ソラマチ": {"type": "commercial_complex", "url": "https://www.tokyo-solamachi.jp/event/", "label": "イベント情報を見る"},
+    "上野恩賜公園": {"type": "park", "url": "https://www.tokyo-park.or.jp/park/ueno/", "label": "公園情報を見る"},
+    "浅草寺": {"type": "shrine_temple", "url": "https://www.senso-ji.jp/", "label": "公式情報を見る"},
+}
+
+
+def _guess_spot_category(name: str) -> str:
+    text = safe_text(name, "")
+    if not text:
+        return "other"
+    if any(token in text for token in ["美術館", "博物館", "ミュージアム", "資料館"]):
+        return "museum"
+    if any(token in text for token in ["劇場", "歌舞伎", "座", "シアター", "ホール"]):
+        return "theater"
+    if any(token in text for token in ["パーク", "公園", "庭園", "植物園", "動物園", "水族館"]):
+        return "park"
+    if any(token in text for token in ["寺", "神社", "大社", "宮", "院"]):
+        return "shrine_temple"
+    if any(token in text for token in ["モール", "百貨店", "デパート", "商店街", "市場", "SIX", "タウン", "シティ", "プラザ"]):
+        return "commercial_complex"
+    if any(token in text for token in ["レストラン", "食堂", "カフェ", "喫茶", "寿司", "ラーメン", "居酒屋"]):
+        return "restaurant"
+    return "other"
+
+
+def _spot_latest_info_search_url(destination: str, visit_date: str, category: str) -> tuple[str, str]:
+    name = safe_text(destination, "")
+    date_text = safe_text(visit_date, "")
+    date_suffix = f" {date_text}" if date_text and date_text != "-" else ""
+
+    if category == "museum":
+        query = f"{name} 展覧会 イベント 公式{date_suffix}"
+        label = "展示・イベント情報を調べる"
+    elif category == "theater":
+        query = f"{name} 公演 演目 公式{date_suffix}"
+        label = "公演・演目情報を調べる"
+    elif category == "commercial_complex":
+        query = f"{name} イベント 公式{date_suffix}"
+        label = "イベント情報を調べる"
+    elif category == "park":
+        query = f"{name} イベント 見頃 公式{date_suffix}"
+        label = "イベント・見頃情報を調べる"
+    elif category == "shrine_temple":
+        query = f"{name} 行事 拝観時間 公式{date_suffix}"
+        label = "行事・拝観情報を調べる"
+    elif category == "restaurant":
+        query = f"{name} 営業時間 予約 公式{date_suffix}"
+        label = "営業・予約情報を調べる"
+    else:
+        query = f"{name} 公式 最新情報{date_suffix}"
+        label = "公式情報を調べる"
+
+    return label, "https://www.google.com/search?q=" + urllib.parse.quote(query)
+
+
+def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
+    name = safe_text(destination, "")
+    if not name or name == "-":
+        return
+
+    # ホテル行は既存のホテル導線と混ざるため、この軽量リンク表示では対象外にする。
+    if _is_hotel_like_name(name):
+        return
+
+    for key, info in SPOT_INFO_SOURCES.items():
+        if key in name:
+            st.markdown("**🔎 最新情報**")
+            st.link_button(safe_text(info.get("label"), "公式情報を見る"), safe_text(info.get("url"), ""), use_container_width=True)
+            return
+
+    category = _guess_spot_category(name)
+    label, url = _spot_latest_info_search_url(name, visit_date, category)
+    st.markdown("**🔎 最新情報**")
+    st.link_button(label, url, use_container_width=True)
+
+
 def render_itinerary_cards(
     df: pd.DataFrame,
     current_step: int | None = None,
@@ -4437,6 +4529,8 @@ def render_itinerary_cards(
                     if note:
                         st.markdown(f"<div class='vf-card-note'>差分: {note}</div>", unsafe_allow_html=True)
                     st.link_button("📍 Google Mapsで場所を見る", place_url, use_container_width=True)
+                    # 修正箇所: スポットカード下部に最新情報の公式確認リンクだけを追加
+                    render_spot_latest_info(safe_text(row_dict.get("destination"), ""), safe_text(row_dict.get("date"), ""))
 
                     if transport_edit_scope == "plan" and absolute_idx is not None:
                         activity_position = _activity_position_from_phase3(df, absolute_idx)
