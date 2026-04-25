@@ -26,16 +26,17 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.42-phase2-spot-only-structuring-probe
+# 【バージョン名】VoyageFlow v6.2.39-gemini-transport-ab-test-sidebar
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
-# - transport行の本番推定に Gemini Transport Resolver A案（移動時間 + 手段のみ）を局所導入
-# - train / transit / bus など公共交通系は Gemini A案を優先し、失敗時は距離推定へfallback
-# - walk / taxi / car は既存 Google Directions API を優先し、失敗時のみ Gemini A案または距離推定へfallback
-# - UI、カード表示、フェーズ構成、既存ホテル・天候・カレンダー・実行シミュレーションは変更しない
+# - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
+# - A案: 移動時間 + 手段だけをGeminiで推定
+# - B案: 経路詳細もGeminiで推定
+# - 既存の旅程生成・完成旅程・実行シミュレーションには未接続の診断専用実装
+# - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.46-correction-visibility-hotel-complement"
+APP_VERSION_NAME = "v6.2.39-gemini-transport-ab-test-sidebar"
 APP_UPDATED_DATE = "2026-04-24"
 
 
@@ -540,16 +541,6 @@ def init_session_state() -> None:
         "validation_time_overlap_candidates": [],
         "validation_source_plan_text": "",
         "validation_source_itinerary_text": "",
-        "phase2_structuring_raw": "",
-        "phase2_structuring_mode": "",
-        "phase2_structuring_error": "",
-        "phase2_validation_raw": "",
-        "phase2_validation_result": {},
-        "phase2_validation_error": "",
-        "phase2_validator_model": "models/gemini-1.5-flash",
-        "phase2_validator_invalid_rows": [],
-        "phase2_quality_corrections": [],
-        "phase2_hotel_candidate_rows": [],
     }
 
     for key, value in defaults.items():
@@ -1648,101 +1639,11 @@ def log_event(stage: str, message: str, level: str = "info") -> None:
         "level": level,
         "message": str(message),
     })
-    st.session_state.app_logs = logs[-500:]
+    st.session_state.app_logs = logs[-200:]
 
 
 def clear_logs() -> None:
     st.session_state.app_logs = []
-
-
-# =========================================================
-# 修正箇所: transport内部データ検証ログ（v6.2.41）
-# - 旅程処理そのものは変更せず、どの変数に何が入り、どの分岐で採用/棄却されたかを確認する
-# =========================================================
-def _debug_value(value, default=""):
-    try:
-        if value is None:
-            return default
-        if isinstance(value, float) and pd.isna(value):
-            return default
-        return value
-    except Exception:
-        return default
-
-
-def _transport_row_debug_snapshot(row) -> Dict[str, object]:
-    if row is None:
-        return {}
-    return {
-        "day": _debug_value(_row_value(row, "day", "")),
-        "sequence": _debug_value(_row_value(row, "sequence", "")),
-        "date": safe_text(_row_value(row, "date", ""), ""),
-        "start_time": safe_text(_row_value(row, "start_time", ""), ""),
-        "end_time": safe_text(_row_value(row, "end_time", ""), ""),
-        "destination": safe_text(_row_value(row, "destination", ""), ""),
-        "purpose": safe_text(_row_value(row, "purpose", ""), ""),
-        "genre": safe_text(_row_value(row, "genre", ""), ""),
-        "is_transport": bool(_row_value(row, "is_transport", False)),
-        "transport_mode": safe_text(_row_value(row, "transport_mode", ""), ""),
-        "route_from": safe_text(_row_value(row, "route_from", ""), ""),
-        "route_to": safe_text(_row_value(row, "route_to", ""), ""),
-        "duration_minutes": _debug_value(_row_value(row, "duration_minutes", "")),
-        "route_data_source": safe_text(_row_value(row, "route_data_source", ""), ""),
-        "estimated_duration_label": safe_text(_row_value(row, "estimated_duration_label", ""), ""),
-        "lat": _debug_value(_row_value(row, "latitude", "")),
-        "lng": _debug_value(_row_value(row, "longitude", "")),
-    }
-
-
-def log_transport_debug(stage: str, payload: Dict[str, object], level: str = "info") -> None:
-    try:
-        safe_payload = json.dumps(payload, ensure_ascii=False, default=str)
-        if len(safe_payload) > 1600:
-            safe_payload = safe_payload[:1600] + " ...<truncated>"
-        log_event(stage, safe_payload, level=level)
-    except Exception as e:
-        log_event(stage, f"transport debug payload logging failed: {e}", level="warning")
-
-
-def render_transport_debug_sidebar() -> None:
-    st.markdown("### 🧪 Transport内部データ検証")
-    st.caption("表示だけの診断欄です。旅程データは変更しません。")
-    df = st.session_state.get("df_phase3")
-    source_name = "df_phase3"
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        df = st.session_state.get("df_phase2")
-        source_name = "df_phase2"
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        st.caption("まだ検証できる旅程DataFrameがありません。")
-        return
-    try:
-        transport_rows = df[df.get("is_transport", False) == True].copy() if "is_transport" in df.columns else pd.DataFrame()
-    except Exception:
-        transport_rows = pd.DataFrame()
-    st.write(f"対象: {source_name} / 行数: {len(df)} / transport行: {len(transport_rows)}")
-    with st.expander("DataFrame列一覧", expanded=False):
-        st.code(", ".join([str(c) for c in df.columns]), language="text")
-    preview_cols = [c for c in ["day", "sequence", "date", "start_time", "end_time", "destination", "purpose", "genre", "is_transport", "transport_mode", "route_from", "route_to", "duration_minutes", "estimated_duration_label", "route_data_source", "route_line_simple", "one_point"] if c in df.columns]
-    if preview_cols:
-        with st.expander("transport前後の主要列プレビュー", expanded=False):
-            st.dataframe(df[preview_cols], use_container_width=True, height=220)
-    if not transport_rows.empty:
-        with st.expander("transport行の変数スナップショット", expanded=True):
-            snap_df = df.reset_index(drop=True)
-            snapshots = []
-            for idx in snap_df.index[snap_df["is_transport"] == True].tolist():
-                prev_row, next_row = _find_transport_context_rows(snap_df, int(idx))
-                snapshots.append({"idx": int(idx), "current": _transport_row_debug_snapshot(snap_df.iloc[int(idx)]), "prev": _transport_row_debug_snapshot(prev_row), "next": _transport_row_debug_snapshot(next_row)})
-            st.json(snapshots)
-    with st.expander("Phase2構造化 raw / mode", expanded=False):
-        st.write(f"mode: {safe_text(st.session_state.get('phase2_structuring_mode'), '-')}")
-        err = safe_text(st.session_state.get('phase2_structuring_error'), '')
-        if err and err != '-':
-            st.warning(err)
-        st.code(safe_text(st.session_state.get('phase2_structuring_raw'), ''), language="json")
-    if st.button("🧾 現在のtransport診断ログを追加", key="add_transport_debug_log", use_container_width=True):
-        log_transport_debug("TransportDebug", {"source": source_name, "rows": len(df), "transport_rows": len(transport_rows), "columns": list(map(str, df.columns)), "phase2_mode": st.session_state.get('phase2_structuring_mode'), "phase2_error": st.session_state.get('phase2_structuring_error'), "preview": df[preview_cols].head(30).to_dict(orient="records") if preview_cols else []})
-        st.rerun()
 
 
 def _safe_json_extract(text: str) -> Optional[Dict[str, object]]:
@@ -2092,132 +1993,6 @@ minutes を出せない場合:
 
 
 # =========================================================
-# 修正箇所: Gemini Transport Resolver A案（本番transport統合用）
-# - 返す情報は duration_minutes / mode / summary の最小限に限定
-# - train / transit / bus 等の公共交通で優先利用
-# - walk / taxi / car は Google Directions API を優先し、失敗時のみ補助利用
-# =========================================================
-def _is_public_transport_mode(mode: str) -> bool:
-    key = safe_text(mode, "").lower()
-    return key in {"train", "transit", "rail", "bus", "public_transport", "電車", "公共交通", "新幹線"}
-
-
-def _is_api_first_ground_mode(mode: str) -> bool:
-    key = safe_text(mode, "").lower()
-    return key in {"walk", "walking", "徒歩", "taxi", "タクシー", "car", "drive", "driving", "private_car", "rental_car", "bike", "bicycle"}
-
-
-def _normalize_transport_mode_for_resolver(mode: str) -> str:
-    key = safe_text(mode, "").lower()
-    if key in {"電車", "新幹線", "rail", "public_transport", "公共交通"}:
-        return "train"
-    if key in {"walking", "徒歩"}:
-        return "walk"
-    if key in {"タクシー"}:
-        return "taxi"
-    if key in {"drive", "driving", "private_car", "rental_car"}:
-        return "car"
-    if key in {"bicycle"}:
-        return "bike"
-    return key or "unknown"
-
-
-def _build_gemini_transport_a_prompt(origin_name: str, destination_name: str, mode: str, departure_date: str, departure_time: str, distance_km: float) -> str:
-    mode_hint = _normalize_transport_mode_for_resolver(mode)
-    departure_datetime = f"{safe_text(departure_date, '')} {safe_text(departure_time, '')}".strip()
-    return f"""
-あなたは旅行AIエージェント VoyageFlow の transport resolver です。
-旅程内の transport 行に使う「移動時間」と「移動手段」だけを、破綻しない範囲で推定してください。
-
-重要ルール:
-- 出力は必ずJSONのみ。Markdown、説明文、コードフェンスは禁止。
-- API実測ではなく推定なので、不確かな場合は confidence を low にしてください。
-- duration_minutes は整数。出せない場合は null。
-- 路線名・駅名・乗換は、確度が高い場合だけ summary に1行で含めてください。
-- 明らかに短すぎる移動時間は禁止です。
-- 直線距離が長い場合に都市内移動のような短時間を出さないでください。
-- 例: 福井駅→京都駅が20分、福井駅→東京駅が30分のような値は禁止です。
-- walk / taxi / car はGoogle Directions API失敗時の補助なので、断定せず控えめにしてください。
-
-入力:
-- 出発地: {origin_name}
-- 到着地: {destination_name}
-- 出発日時: {departure_datetime}
-- 手段ヒント: {mode_hint}
-- 直線距離km: {distance_km:.2f}
-
-出力JSON形式:
-{{
-  "ok": true,
-  "confidence": "high|medium|low",
-  "duration_minutes": 165,
-  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
-  "summary": "北陸新幹線などを利用する想定。乗換がある場合は1行で補足。",
-  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
-}}
-
-推定できない場合:
-{{
-  "ok": false,
-  "confidence": "low",
-  "duration_minutes": null,
-  "mode": "unknown",
-  "summary": "情報不足で妥当な概算を出せない",
-  "evidence_note": "Google Maps等で最終確認が必要。"
-}}
-""".strip()
-
-
-def _resolve_transport_with_gemini_a_minimal(origin_name: str, destination_name: str, mode: str, departure_date: str, departure_time: str, distance_km: float) -> Optional[Dict[str, object]]:
-    prompt = _build_gemini_transport_a_prompt(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
-    try:
-        generator = Phase1Generator(logger=log_event)
-        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
-        data = _safe_json_extract(raw) or {}
-        if not isinstance(data, dict):
-            return None
-        duration = data.get("duration_minutes")
-        if duration is None or duration == "":
-            return None
-        minutes = int(float(duration))
-        if minutes <= 0 or minutes > 24 * 60:
-            return None
-        confidence = safe_text(data.get("confidence"), "low").lower()
-        if confidence not in {"high", "medium", "low"}:
-            confidence = "low"
-        resolved_mode = _normalize_transport_mode_for_resolver(safe_text(data.get("mode"), mode))
-        if resolved_mode not in {"train", "bus", "walk", "taxi", "car", "air", "ship", "unknown", "bike"}:
-            resolved_mode = _normalize_transport_mode_for_resolver(mode)
-        return {
-            "minutes": minutes,
-            "confidence": confidence,
-            "mode": resolved_mode,
-            "summary": safe_text(data.get("summary"), ""),
-            "evidence_note": safe_text(data.get("evidence_note"), "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"),
-            "raw": raw,
-        }
-    except Exception as e:
-        log_event("GeminiTransport", f"A案resolver失敗: {origin_name} → {destination_name} / {e}", level="warning")
-        return None
-
-
-def _apply_transport_resolution_to_row(enriched: pd.DataFrame, idx: int, minutes: int, label: str, source: str, origin_name: str, destination_name: str, departure_date: str, departure_time: str, mode: str, route_line_simple: str = "", one_point: str = "") -> None:
-    enriched.at[idx, "route_data_source"] = source
-    enriched.at[idx, "estimated_duration_label"] = label
-    enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
-    enriched.at[idx, "duration_minutes"] = int(minutes)
-    enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, int(minutes))
-    enriched.at[idx, "route_line_simple"] = route_line_simple or label
-    enriched.at[idx, "route_from"] = origin_name
-    enriched.at[idx, "route_to"] = destination_name
-    normalized_mode = _normalize_transport_mode_for_resolver(mode)
-    if normalized_mode and normalized_mode != "unknown":
-        enriched.at[idx, "transport_mode"] = normalized_mode
-    if one_point:
-        enriched.at[idx, "one_point"] = one_point[:180]
-
-
-# =========================================================
 # 修正箇所: Google Directions API（Legacy）最小導入
 # - Routes API の transit ではなく Directions API の transit を局所利用
 # - 失敗時は既存のLLM概算/距離推定へ安全にフォールバック
@@ -2474,32 +2249,34 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
     """
     完成旅程の transport row に対して、必要最小限の推定値だけを付与する。
 
-    v6.2.40 方針:
-    - train / transit / bus など公共交通系は Gemini Transport Resolver A案を優先
-    - walk / taxi / car などAPIで取りやすい地上移動は Google Directions API を優先
-    - いずれも失敗したら、既存の安全な距離推定へfallback
-    - UI・カード表示・既存フェーズ構成は変更しない
+    方針:
+    - 短距離の地上移動だけ app.py 側で LLM概算 / 距離推定を行う
+    - 航空・空港・国際移動は app.py 側では一切上書きしない
+      （未実装・未解決課題。Phase2/Phase3 側で構造保持すべき領域）
+
+    TODO:
+    - 実移動時間は現在まだ推測中心
+    - 飛行機を含む移動は構造化層で transport type を保持しないと安全に扱えない
+    - app.py 表示層での後付け推定は地上短距離のみで運用する
     """
     if df is None or df.empty or "is_transport" not in df.columns:
         return df
 
     enriched = df.copy().reset_index(drop=True)
-    transport_indexes = enriched.index[enriched["is_transport"] == True].tolist()
-    log_transport_debug("TransportEnrichStart", {"use_case": use_case, "rows": len(enriched), "transport_indexes": transport_indexes, "planning_state": {"start_date": safe_text(planning_state.get("start_date"), ""), "departure_time": safe_text(planning_state.get("departure_time"), ""), "transport_style": safe_text(planning_state.get("transport_style"), ""), "departure_place": safe_text(planning_state.get("departure_place"), ""), "return_place": safe_text(planning_state.get("return_place"), "")}})
-    for idx in transport_indexes:
+    for idx in enriched.index[enriched["is_transport"] == True].tolist():
         prev_row, next_row = _find_transport_context_rows(enriched, idx)
         if prev_row is None or next_row is None:
-            log_transport_debug("TransportContextMissing", {"idx": int(idx), "current": _transport_row_debug_snapshot(enriched.iloc[idx])}, level="warning")
             continue
 
         origin_name = safe_text(prev_row.get("destination"), "出発地")
         destination_name = safe_text(next_row.get("destination"), "目的地")
+
         departure_date = safe_text(enriched.at[idx, "date"], safe_text(planning_state.get("start_date"), ""))
         departure_time = safe_text(enriched.at[idx, "start_time"], safe_text(planning_state.get("departure_time"), "09:00"))
 
-        log_transport_debug("TransportContext", {"idx": int(idx), "current_before": _transport_row_debug_snapshot(enriched.iloc[idx]), "prev": _transport_row_debug_snapshot(prev_row), "next": _transport_row_debug_snapshot(next_row), "origin_name": origin_name, "destination_name": destination_name, "departure_date": departure_date, "departure_time": departure_time})
-
         # --- 安全策: 航空・空港・国際移動は app.py で再計算しない ---
+        # ここを無理に上書きすると「電車30分」等の破綻が起きるため、
+        # 現時点では元の構造化結果を尊重してスキップする。
         if _is_air_transport_context(enriched.iloc[idx], prev_row, next_row):
             enriched.at[idx, "route_data_source"] = "non_ground_skipped"
             enriched.at[idx, "estimated_duration_label"] = ""
@@ -2510,12 +2287,24 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
                 enriched.at[idx, "one_point"] = (existing_note + " / " + safety_note).strip(" /")[:180]
             continue
 
+        # --- 新幹線や列車名そのものを destination にした行は、app.py では無理に再計算しない ---
+        # TODO: 本来は Phase2 / Phase3 側で「列車サービス名」「便名」を transport type として保持すべき。
+        rail_service_like = any(token in f"{origin_name} {destination_name}" for token in ["新幹線", "かがやき", "はくたか", "のぞみ", "ひかり", "こだま", "サンダーバード", "しらさぎ", "つるぎ"])
+        if rail_service_like:
+            enriched.at[idx, "route_data_source"] = "kept_existing_schedule"
+            enriched.at[idx, "estimated_duration_label"] = ""
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+            existing_note = safe_text(enriched.at[idx, "one_point"], "")
+            note = "未解決課題: 列車サービス名を含む移動は、構造化層で transport type を保持してから再計算すべきです。"
+            if note not in existing_note:
+                enriched.at[idx, "one_point"] = (existing_note + " / " + note).strip(" /")[:180]
+            continue
+
         origin_lat = prev_row.get("latitude")
         origin_lng = prev_row.get("longitude")
         destination_lat = next_row.get("latitude")
         destination_lng = next_row.get("longitude")
         if any(pd.isna(v) for v in [origin_lat, origin_lng, destination_lat, destination_lng]):
-            log_transport_debug("TransportSkipMissingCoordinates", {"idx": int(idx), "origin": origin_name, "destination": destination_name, "origin_lat": origin_lat, "origin_lng": origin_lng, "destination_lat": destination_lat, "destination_lng": destination_lng}, level="warning")
             enriched.at[idx, "route_data_source"] = "kept_existing_schedule"
             enriched.at[idx, "estimated_duration_label"] = ""
             enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
@@ -2540,93 +2329,110 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
             }.get(preferred, "train" if distance_km >= 2.0 else "walk")
             enriched.at[idx, "transport_mode"] = mode
         elif mode in {"car", "private_car"} and preferred == "電車メイン":
+            # 表示だけでもユーザー意図に寄せる
             mode = "train"
             enriched.at[idx, "transport_mode"] = mode
 
-        mode = _normalize_transport_mode_for_resolver(mode)
-        public_transport_first = _is_public_transport_mode(mode)
-        api_first_ground = _is_api_first_ground_mode(mode)
-        log_transport_debug("TransportBranchDecision", {"idx": int(idx), "origin": origin_name, "destination": destination_name, "distance_km": round(float(distance_km), 3), "mode": mode, "public_transport_first": public_transport_first, "api_first_ground": api_first_ground})
+        google_result = None
+        origin_query = _build_google_directions_location_query(origin_name, origin_lat, origin_lng)
+        destination_query = _build_google_directions_location_query(destination_name, destination_lat, destination_lng)
+        # Google Directions API は最小導入。train/bus/walk/taxi/car の現実的な移動時間取得を優先する。
+        if origin_query and destination_query:
+            google_result = _fetch_google_directions_legacy(
+                origin_query=origin_query,
+                destination_query=destination_query,
+                mode=mode,
+                departure_date=departure_date,
+                departure_time=departure_time,
+            )
 
-        # v6.2.40: train/transit/bus は Google Directions transit が不安定な前提で Gemini A案を優先する。
-        if public_transport_first:
-            gemini_result = _resolve_transport_with_gemini_a_minimal(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
-            log_transport_debug("GeminiAResult", {"idx": int(idx), "origin": origin_name, "destination": destination_name, "mode": mode, "distance_km": round(float(distance_km), 3), "result": gemini_result})
-            if gemini_result and gemini_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(gemini_result["minutes"]), origin_name, destination_name):
-                minutes = int(gemini_result["minutes"])
-                label = f"約{minutes}分"
-                summary = safe_text(gemini_result.get("summary"), "")
-                evidence_note = safe_text(gemini_result.get("evidence_note"), "")
-                confidence = safe_text(gemini_result.get("confidence"), "")
-                note_parts = [part for part in [summary, evidence_note, f"Gemini推定 confidence={confidence}" if confidence else ""] if part]
-                _apply_transport_resolution_to_row(enriched, idx, minutes, label, "gemini_transport_a_minimal", origin_name, destination_name, departure_date, departure_time, safe_text(gemini_result.get("mode"), mode), f"{label} / {summary}" if summary else label, " / ".join(note_parts))
-                log_transport_debug("TransportApplied", {"idx": int(idx), "source": "gemini_transport_a_minimal", "after": _transport_row_debug_snapshot(enriched.iloc[idx])})
-                continue
-            if gemini_result and gemini_result.get("minutes"):
-                log_event("GeminiTransport", f"A案結果を棄却: {origin_name} → {destination_name} / {gemini_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
-
-        # v6.2.40: walk/taxi/car などはAPI優先。公共交通はGemini失敗後に無理なtransit再試行をしない。
-        if api_first_ground:
-            google_result = None
-            origin_query = _build_google_directions_location_query(origin_name, origin_lat, origin_lng)
-            destination_query = _build_google_directions_location_query(destination_name, destination_lat, destination_lng)
-            if origin_query and destination_query:
-                google_result = _fetch_google_directions_legacy(origin_query, destination_query, mode, departure_date, departure_time)
-            log_transport_debug("GoogleDirectionsResult", {"idx": int(idx), "origin_query": origin_query if 'origin_query' in locals() else "", "destination_query": destination_query if 'destination_query' in locals() else "", "mode": mode, "result": google_result})
-
-            if google_result and _validate_google_route_minutes(distance_km, int(google_result["minutes"]), mode, origin_name, destination_name):
-                minutes = int(google_result["minutes"])
-                label = f"約{minutes}分"
-                line_parts = [label]
-                if google_result.get("transit_summary"):
-                    line_parts.append(str(google_result["transit_summary"]))
-                if google_result.get("fare_text") and google_result.get("fare_text") != "-":
-                    line_parts.append(f"運賃 {google_result['fare_text']}")
-                note_parts = []
-                if google_result.get("distance_text") and google_result.get("distance_text") != "-":
-                    note_parts.append(f"Google Directions 推定距離 {google_result['distance_text']}")
-                if google_result.get("transit_summary"):
-                    note_parts.append(str(google_result["transit_summary"]))
-                if google_result.get("fare_text") and google_result.get("fare_text") != "-":
-                    note_parts.append(f"運賃 {google_result['fare_text']}")
-                _apply_transport_resolution_to_row(enriched, idx, minutes, label, str(google_result.get("source", "google_directions_legacy")), origin_name, destination_name, departure_date, departure_time, mode, " / ".join(line_parts[:3]), " / ".join(note_parts))
-                continue
+        if google_result and _validate_google_route_minutes(
+            distance_km=distance_km,
+            minutes=int(google_result["minutes"]),
+            mode=mode,
+            origin_name=origin_name,
+            destination_name=destination_name,
+        ):
+            minutes = int(google_result["minutes"])
+            label = f"約{minutes}分"
+            line_parts = [label]
+            if google_result.get("transit_summary"):
+                line_parts.append(str(google_result["transit_summary"]))
+            if google_result.get("fare_text") and google_result.get("fare_text") != "-":
+                line_parts.append(f"運賃 {google_result['fare_text']}")
+            enriched.at[idx, "route_data_source"] = str(google_result.get("source", "google_directions_legacy"))
+            enriched.at[idx, "estimated_duration_label"] = label
+            enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+            enriched.at[idx, "duration_minutes"] = minutes
+            enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+            enriched.at[idx, "route_line_simple"] = " / ".join(line_parts[:3])
+            enriched.at[idx, "route_from"] = origin_name
+            enriched.at[idx, "route_to"] = destination_name
+            note_parts = []
+            if google_result.get("distance_text") and google_result.get("distance_text") != "-":
+                note_parts.append(f"Google Directions 推定距離 {google_result['distance_text']}")
+            if google_result.get("transit_summary"):
+                note_parts.append(str(google_result["transit_summary"]))
+            if google_result.get("fare_text") and google_result.get("fare_text") != "-":
+                note_parts.append(f"運賃 {google_result['fare_text']}")
+            if note_parts:
+                enriched.at[idx, "one_point"] = " / ".join(note_parts)[:160]
+        else:
             if google_result:
                 log_event("移動時間推定", f"Google Directions 結果を棄却: {origin_name} → {destination_name} / {google_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+            llm_result = _llm_transport_duration_estimate(
+                origin_name=origin_name,
+                destination_name=destination_name,
+                mode=mode,
+                departure_date=departure_date,
+                departure_time=departure_time,
+                distance_km=distance_km,
+                origin_lat=float(origin_lat),
+                origin_lng=float(origin_lng),
+                destination_lat=float(destination_lat),
+                destination_lng=float(destination_lng),
+            )
 
-            # APIで取れなかった walk/taxi/car だけ Gemini A案を補助利用する。
-            gemini_result = _resolve_transport_with_gemini_a_minimal(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
-            if gemini_result and gemini_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(gemini_result["minutes"]), origin_name, destination_name):
-                minutes = int(gemini_result["minutes"])
+            if llm_result and llm_result.get("minutes") and _validate_llm_minutes(
+                distance_km=distance_km,
+                mode=mode,
+                minutes=int(llm_result["minutes"]),
+                origin_name=origin_name,
+                destination_name=destination_name,
+            ):
+                minutes = int(llm_result["minutes"])
                 label = f"約{minutes}分"
-                summary = safe_text(gemini_result.get("summary"), "")
-                evidence_note = safe_text(gemini_result.get("evidence_note"), "")
-                confidence = safe_text(gemini_result.get("confidence"), "")
-                note_parts = [part for part in [summary, evidence_note, f"Gemini推定 confidence={confidence}" if confidence else ""] if part]
-                _apply_transport_resolution_to_row(enriched, idx, minutes, label, "gemini_transport_a_minimal_after_api_failure", origin_name, destination_name, departure_date, departure_time, safe_text(gemini_result.get("mode"), mode), f"{label} / {summary}" if summary else label, " / ".join(note_parts))
-                continue
-            if gemini_result and gemini_result.get("minutes"):
-                log_event("GeminiTransport", f"API失敗後A案結果を棄却: {origin_name} → {destination_name} / {gemini_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+                enriched.at[idx, "route_data_source"] = "llm_estimate"
+                enriched.at[idx, "estimated_duration_label"] = label
+                enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+                enriched.at[idx, "duration_minutes"] = minutes
+                enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+                enriched.at[idx, "route_line_simple"] = f"{label}"
+                enriched.at[idx, "route_from"] = origin_name
+                enriched.at[idx, "route_to"] = destination_name
+                reason = str(llm_result.get("reason", "")).strip()
+                if reason:
+                    enriched.at[idx, "one_point"] = reason[:120]
+            else:
+                if llm_result and llm_result.get("minutes"):
+                    log_event("移動時間推定", f"LLM概算を棄却: {origin_name} → {destination_name} / {llm_result.get('minutes')}分 / {distance_km:.1f}km", level="warning")
+                fallback = _build_safe_distance_fallback(distance_km, mode, origin_name, destination_name)
+                minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
+                label = str(fallback.get("label", f"約{minutes}分（推測）"))
+                enriched.at[idx, "route_data_source"] = str(fallback.get("source", "distance_estimate"))
+                enriched.at[idx, "estimated_duration_label"] = label
+                enriched.at[idx, "route_departure_at"] = f"{departure_date} {departure_time}".strip()
+                enriched.at[idx, "duration_minutes"] = minutes
+                enriched.at[idx, "end_time"] = _add_minutes_to_clock(departure_time, minutes)
+                enriched.at[idx, "route_line_simple"] = f"{label}"
+                enriched.at[idx, "route_from"] = origin_name
+                enriched.at[idx, "route_to"] = destination_name
+                note = str(fallback.get("note", "")).strip()
+                if note:
+                    enriched.at[idx, "one_point"] = note[:120]
 
-        # unknown 等はまずGemini A案を試す。
-        if not public_transport_first and not api_first_ground:
-            gemini_result = _resolve_transport_with_gemini_a_minimal(origin_name, destination_name, mode, departure_date, departure_time, distance_km)
-            if gemini_result and gemini_result.get("minutes") and _validate_llm_minutes(distance_km, mode, int(gemini_result["minutes"]), origin_name, destination_name):
-                minutes = int(gemini_result["minutes"])
-                label = f"約{minutes}分"
-                summary = safe_text(gemini_result.get("summary"), "")
-                _apply_transport_resolution_to_row(enriched, idx, minutes, label, "gemini_transport_a_minimal_unknown_mode", origin_name, destination_name, departure_date, departure_time, safe_text(gemini_result.get("mode"), mode), f"{label} / {summary}" if summary else label, summary)
-                continue
-
-        # 最終fallback: 既存の安全な距離推定
-        fallback = _build_safe_distance_fallback(distance_km, mode, origin_name, destination_name)
-        minutes = int(fallback.get("minutes", max(1, _estimate_minutes_from_distance(distance_km, mode))))
-        label = str(fallback.get("label", f"約{minutes}分（推測）"))
-        _apply_transport_resolution_to_row(enriched, idx, minutes, label, str(fallback.get("source", "distance_estimate")), origin_name, destination_name, departure_date, departure_time, mode, label, str(fallback.get("note", "")).strip())
-        log_transport_debug("TransportApplied", {"idx": int(idx), "source": str(fallback.get("source", "distance_estimate")), "fallback": fallback, "after": _transport_row_debug_snapshot(enriched.iloc[idx])})
-
-    log_transport_debug("TransportEnrichEnd", {"rows": len(enriched), "transport_rows": len(enriched.index[enriched["is_transport"] == True].tolist())})
     return enriched
+
 
 
 def extract_trip_days_from_text(text: str) -> Optional[int]:
@@ -3102,195 +2908,6 @@ def resolve_planning_state() -> Dict:
     }
     return resolved
 
-
-
-# =========================================================
-# 修正箇所: Phase2 / Phase3 診断ログ固定表示
-# - 今回の構造化バグ調査用
-# - 表示のみで、旅程データは変更しない
-# =========================================================
-def _debug_dataframe_to_records(df: pd.DataFrame, max_rows: int = 80) -> List[Dict[str, object]]:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return []
-    try:
-        safe_df = df.copy().head(max_rows)
-        safe_df = safe_df.where(pd.notna(safe_df), None)
-        return safe_df.to_dict(orient="records")
-    except Exception:
-        return []
-
-
-def _debug_dataframe_summary(name: str, df: pd.DataFrame) -> Dict[str, object]:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {"name": name, "exists": False, "rows": 0, "columns": []}
-    transport_count = 0
-    try:
-        if "is_transport" in df.columns:
-            transport_count = int((df["is_transport"] == True).sum())  # noqa: E712
-    except Exception:
-        transport_count = -1
-    suspicious_rows = []
-    try:
-        for idx, row in df.reset_index(drop=True).iterrows():
-            destination = safe_text(row.get("destination"), "")
-            purpose = safe_text(row.get("purpose"), "")
-            duration = _debug_value(row.get("duration_minutes", ""))
-            start_time = safe_text(row.get("start_time"), "")
-            end_time = safe_text(row.get("end_time"), "")
-            is_transport = bool(row.get("is_transport", False))
-            looks_suspicious = False
-            reason_parts = []
-            if not is_transport and purpose.lower() in {"transport", "移動"}:
-                looks_suspicious = True
-                reason_parts.append("spot行なのにpurposeが移動")
-            try:
-                if not is_transport and float(duration) >= 150 and any(token in destination for token in ["駅", "空港", "港"]):
-                    looks_suspicious = True
-                    reason_parts.append("駅/空港/港スポットの滞在時間が長い")
-            except Exception:
-                pass
-            if not is_transport and any(token in destination for token in ["新幹線", "電車", "列車", "フライト", "高速バス"]):
-                looks_suspicious = True
-                reason_parts.append("スポット名に移動手段名が混入")
-            if looks_suspicious:
-                suspicious_rows.append({
-                    "idx": int(idx),
-                    "day": _debug_value(row.get("day", "")),
-                    "sequence": _debug_value(row.get("sequence", "")),
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "destination": destination,
-                    "purpose": purpose,
-                    "duration_minutes": duration,
-                    "is_transport": is_transport,
-                    "reason": " / ".join(reason_parts),
-                })
-    except Exception:
-        suspicious_rows = []
-    return {
-        "name": name,
-        "exists": True,
-        "rows": int(len(df)),
-        "columns": [str(c) for c in df.columns],
-        "transport_rows": transport_count,
-        "suspicious_rows": suspicious_rows,
-    }
-
-
-def _phase_debug_preview_columns(df: pd.DataFrame) -> List[str]:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return []
-    preferred = [
-        "day", "sequence", "date", "start_time", "end_time",
-        "destination", "purpose", "genre", "duration_minutes",
-        "is_transport", "transport_mode", "route_from", "route_to",
-        "estimated_duration_label", "route_data_source", "one_point",
-    ]
-    return [col for col in preferred if col in df.columns]
-
-
-def render_phase2_phase3_fixed_debug_sidebar() -> None:
-    st.markdown("### 🧪 構造化データ診断")
-    st.caption("Phase2/Phase3の中身を固定表示します。表示専用で、旅程データは変更しません。")
-
-    df2 = st.session_state.get("df_phase2")
-    df3 = st.session_state.get("df_phase3")
-    raw = safe_text(st.session_state.get("phase2_structuring_raw"), "")
-    mode = safe_text(st.session_state.get("phase2_structuring_mode"), "")
-    err = safe_text(st.session_state.get("phase2_structuring_error"), "")
-
-    summary_payload = {
-        "phase2_mode": mode,
-        "phase2_error": err if err and err != "-" else "",
-        "df_phase2": _debug_dataframe_summary("df_phase2", df2),
-        "df_phase3": _debug_dataframe_summary("df_phase3", df3),
-    }
-    st.json(summary_payload)
-
-    with st.expander("データ品質・補正メモ", expanded=True):
-        corrections = st.session_state.get("phase2_quality_corrections") or []
-        hotel_rows = st.session_state.get("phase2_hotel_candidate_rows") or []
-        if not corrections and not hotel_rows:
-            st.success("自動補正・注意対象はありません。")
-        else:
-            st.caption("Phase2生成後に検出・補正した内容です。旅程の透明性確認用です。")
-            for idx, item in enumerate(corrections, start=1):
-                severity = safe_text(item.get("severity"), "info")
-                msg = safe_text(item.get("message"), "")
-                kind = safe_text(item.get("kind"), "correction")
-                if severity == "error":
-                    st.error(f"{idx}. [{kind}] {msg}")
-                elif severity == "warning":
-                    st.warning(f"{idx}. [{kind}] {msg}")
-                else:
-                    st.info(f"{idx}. [{kind}] {msg}")
-            if hotel_rows:
-                st.markdown("**ホテル候補リンク**")
-                for idx, row in enumerate(hotel_rows, start=1):
-                    label = f"Day{safe_text(row.get('day'), '')}: {safe_text(row.get('suggested_destination'), '')}"
-                    url = safe_text(row.get("search_url"), "")
-                    if url and url != "-":
-                        st.link_button(label, url, use_container_width=True)
-                    else:
-                        st.write(f"- {label}")
-
-    with st.expander("Phase2 raw JSON / LLM出力", expanded=True):
-        if raw and raw != "-":
-            st.code(raw, language="json")
-        else:
-            st.info("Phase2 raw 出力はまだありません。プラン了承後に表示されます。")
-
-    with st.expander("Phase2 検証LLM結果", expanded=True):
-        validator_model = safe_text(st.session_state.get("phase2_validator_model"), PHASE2_VALIDATOR_MODEL_NAME)
-        validation_error = safe_text(st.session_state.get("phase2_validation_error"), "")
-        validation_result = st.session_state.get("phase2_validation_result") or {}
-        validation_raw = safe_text(st.session_state.get("phase2_validation_raw"), "")
-        st.caption(f"validator model: {validator_model}")
-        if validation_error and validation_error != "-":
-            st.warning(f"検証LLMエラー: {validation_error}")
-        if validation_result:
-            st.json(validation_result)
-        else:
-            st.info("Phase2 検証LLM結果はまだありません。")
-        if validation_raw and validation_raw != "-":
-            st.caption("検証LLM raw output")
-            st.code(validation_raw, language="json")
-
-    with st.expander("df_phase2（スポット抽出結果）", expanded=True):
-        if isinstance(df2, pd.DataFrame) and not df2.empty:
-            cols = _phase_debug_preview_columns(df2)
-            st.dataframe(df2[cols] if cols else df2, use_container_width=True, height=260)
-            st.caption("コピー用JSON")
-            st.code(json.dumps(_debug_dataframe_to_records(df2), ensure_ascii=False, indent=2, default=str), language="json")
-        else:
-            st.info("df_phase2 はまだありません。")
-
-    with st.expander("df_phase3（transport補完後）", expanded=True):
-        if isinstance(df3, pd.DataFrame) and not df3.empty:
-            cols = _phase_debug_preview_columns(df3)
-            st.dataframe(df3[cols] if cols else df3, use_container_width=True, height=300)
-            st.caption("コピー用JSON")
-            st.code(json.dumps(_debug_dataframe_to_records(df3), ensure_ascii=False, indent=2, default=str), language="json")
-        else:
-            st.info("df_phase3 はまだありません。")
-
-    with st.expander("transport生成前後の差分サマリー", expanded=True):
-        diff_payload = {"before_phase2_rows": 0, "after_phase3_rows": 0, "added_transport_candidates": []}
-        if isinstance(df2, pd.DataFrame) and isinstance(df3, pd.DataFrame) and not df2.empty and not df3.empty:
-            diff_payload["before_phase2_rows"] = int(len(df2))
-            diff_payload["after_phase3_rows"] = int(len(df3))
-            if "is_transport" in df3.columns:
-                transport_rows = df3[df3["is_transport"] == True].reset_index(drop=True)  # noqa: E712
-                diff_payload["added_transport_count"] = int(len(transport_rows))
-                diff_payload["added_transport_candidates"] = _debug_dataframe_to_records(
-                    transport_rows[[c for c in _phase_debug_preview_columns(transport_rows) if c in transport_rows.columns]],
-                    max_rows=50,
-                )
-        st.json(diff_payload)
-
-    if st.button("🧾 Phase2/Phase3診断を内部ログへ保存", key="add_phase2_phase3_debug_log", use_container_width=True):
-        log_transport_debug("Phase2Phase3Debug", summary_payload)
-        st.rerun()
 
 def render_internal_logs_sidebar() -> None:
     logs = st.session_state.get("app_logs", [])
@@ -4277,736 +3894,6 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
     return df3
 
 
-
-
-# =========================================================
-# 修正箇所: Phase2 構造化プロンプト診断版
-# - 自然文旅程から「スポット・滞在」だけを抽出する
-# - 移動そのものは Phase2 へ入れず、Phase3 の順番ベース移動カード生成に任せる
-# - これにより「09:00 福井駅」の滞在時間に新幹線185分が混入する問題を切り分ける
-# =========================================================
-def _build_phase2_spot_only_json_prompt(trip_plan_text: str, planning_state: Dict[str, object]) -> str:
-    # --- 修正箇所 v6.2.44: MarkdownテーブルではなくJSON配列だけを返させ、列ズレを防止 ---
-    start_date = safe_text(planning_state.get("start_date"), datetime.now().date().strftime("%Y-%m-%d"))
-    departure_place = safe_text(planning_state.get("departure_place"), "")
-    return_place = safe_text(planning_state.get("return_place"), "")
-    departure_time = safe_text(planning_state.get("departure_time"), "09:00")
-    trip_days = safe_text(planning_state.get("trip_days"), "")
-
-    return f"""
-# Role
-あなたは優秀なデータアナリストです。
-提供された旅行日程テキストから、VoyageFlow の Phase2 用JSONを作成してください。
-
-# Goal
-自然文の旅行日程を、スポット・滞在・起点/終点だけの構造化データに変換してください。
-移動そのものは後段の Phase3 が自動生成するため、Phase2 には入れません。
-
-# Fixed Trip Context
-- 旅行開始日: {start_date}
-- 旅行日数: {trip_days}
-- 出発地: {departure_place}
-- 帰着地: {return_place}
-- 出発時刻: {departure_time}
-
-# Output Format
-必ずJSON配列のみを出力してください。
-Markdown、表、コードフェンス、説明文、補足文は絶対に出力しないでください。
-
-各要素は必ず次のキーだけを持ってください。
-[
-  {{
-    "day": 1,
-    "sequence": 1,
-    "date": "YYYY-MM-DD",
-    "start_time": "HH:MM",
-    "end_time": "HH:MM",
-    "destination": "純粋な場所名",
-    "purpose": "departure",
-    "genre": "station",
-    "duration_minutes": 10,
-    "is_transport": false,
-    "transport_mode": "-",
-    "one_point": "短い補足"
-  }}
-]
-
-# Critical Constraints
-1. 抽出対象
-   - 観光、体験、食事、宿泊、出発地、到着地、帰着地など、ユーザーが見るべきスポット・滞在だけを抽出してください。
-   - 「福井駅出発」「東京駅到着」のような起点・終点は、場所として抽出してください。
-   - destination は「〇〇出発」「〇〇到着」「〇〇へ移動」「〇〇チェックイン」などの動作や補足を除いた、純粋な場所名・スポット名だけにしてください。
-   - destination に「目的:」「滞在時間:」「ワンポイント:」「旅行アドバイザー」「注意点」を入れてはいけません。
-
-2. 除外対象
-   - 「北陸新幹線での移動」「電車移動」「タクシー移動」「徒歩移動」「東京駅へ移動」「東京駅発」など、移動そのものを目的とした行は Phase2 に含めないでください。
-   - ただし、その移動の前後にある起点・到着地はスポットとして残してください。
-   - 例: 「09:34 - 福井駅発（北陸新幹線 かがやき） / 目的: 移動 / 滞在時間: 約190分」は除外してください。
-   - 例: 「09:00 - 福井駅 / 目的: 出発 / 滞在時間: 30分」は destination=福井駅 として残してよいですが、移動時間は入れないでください。
-
-3. ホテル・宿泊
-   - 「ホテルチェックイン（新宿エリア推奨）」は destination="新宿周辺ホテル" または本文の具体ホテル名にしてください。
-   - ホテル行の destination に、別行のワンポイント文を入れてはいけません。
-   - 宿泊の duration_minutes は、翌朝までの場合でも 480〜720分程度でよいです。end_time が翌朝の場合は HH:MM だけを入れてください。
-
-4. purpose の値
-   - departure: 出発地・ホテル出発
-   - arrival: 駅や目的地への到着、帰着地
-   - activity: 観光・体験・見学
-   - meal: 食事
-   - accommodation: 宿泊・ホテルチェックイン・ホテル滞在
-   - shopping: 買い物
-
-5. genre の値
-   - station, museum, experience, restaurant, hotel, shopping, park, general など英語の短いカテゴリにしてください。
-
-6. 時刻と滞在時間
-   - start_time と end_time は HH:MM 形式にしてください。
-   - duration_minutes は整数にしてください。
-   - 出発・到着だけの駅ノードは duration_minutes を 0〜30分の自然な範囲にしてください。移動時間を入れないでください。
-   - 移動そのものの所要時間をスポットのduration_minutesに入れないでください。
-
-7. transport 固定
-   - is_transport は常に false にしてください。
-   - transport_mode は常に "-" にしてください。
-
-8. sequence
-   - dayごとに 1, 2, 3... と振ってください。
-
-# Input Data
-{trip_plan_text}
-""".strip()
-
-
-def _extract_json_array(text: str) -> List[Dict[str, object]]:
-    # --- 修正箇所 v6.2.44: LLM出力からJSON配列を安全に抽出 ---
-    raw = str(text or "").strip()
-    if not raw:
-        return []
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
-    raw = re.sub(r"\s*```$", "", raw).strip()
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-        if isinstance(data, dict):
-            for key in ("rows", "items", "data", "itinerary"):
-                if isinstance(data.get(key), list):
-                    return [x for x in data[key] if isinstance(x, dict)]
-    except Exception:
-        pass
-    match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
-    if not match:
-        return []
-    try:
-        data = json.loads(match.group(0))
-        return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-
-# =========================================================
-# 修正箇所 v6.2.46: Phase2補正の可視化 + generic hotel補完
-# - LLM検証やコードガードで補正/除外した内容をサイドバーで見える化
-# - 「銀座エリアのホテル」など具体ホテル名でない宿泊先を、仮ホテルとして明示
-# =========================================================
-def _phase2_reset_quality_corrections() -> None:
-    st.session_state.phase2_quality_corrections = []
-    st.session_state.phase2_hotel_candidate_rows = []
-
-
-def _phase2_add_quality_correction(kind: str, message: str, row: Optional[Dict[str, object]] = None, severity: str = "info") -> None:
-    items = st.session_state.setdefault("phase2_quality_corrections", [])
-    payload = {
-        "kind": safe_text(kind, "correction"),
-        "severity": safe_text(severity, "info"),
-        "message": safe_text(message, ""),
-    }
-    if row is not None:
-        payload["row"] = {k: safe_text(v, "") for k, v in dict(row).items() if k in {"day", "sequence", "destination", "purpose", "genre", "start_time", "end_time"}}
-    items.append(payload)
-
-
-def _extract_hotel_area_hint(destination: str, planning_state: Dict[str, object]) -> str:
-    text = safe_text(destination, "")
-    for token in ["エリアのホテル", "周辺ホテル", "エリア周辺ホテル", "ホテル"]:
-        if token in text:
-            left = text.split(token)[0].strip(" ・、,（）()【】[]")
-            if left:
-                return left
-    area = _extract_area_hint(text)
-    if area:
-        return area
-    primary = safe_text(planning_state.get("primary_destination"), "")
-    if primary:
-        return primary
-    return safe_text(planning_state.get("return_place"), "") or safe_text(planning_state.get("departure_place"), "")
-
-
-def _is_generic_or_area_hotel_label(destination: str, purpose: str = "", genre: str = "") -> bool:
-    text = safe_text(destination, "")
-    low_purpose = safe_text(purpose, "").lower()
-    low_genre = safe_text(genre, "").lower()
-    if low_purpose not in {"accommodation", "hotel", "stay", "lodging", "departure"} and low_genre != "hotel" and "ホテル" not in text.lower():
-        return False
-    if _is_generic_hotel_label(text):
-        return True
-    generic_patterns = [
-        r".+エリアのホテル$",
-        r".+エリア周辺ホテル$",
-        r".+周辺ホテル$",
-        r".+近くのホテル$",
-        r".+ホテル\s*\(?推奨\)?$",
-        r"ホテルチェックイン.*",
-        r"宿泊先.*",
-    ]
-    return any(re.fullmatch(pattern, text) for pattern in generic_patterns)
-
-
-def _build_hotel_search_url(area_hint: str) -> str:
-    query = urllib.parse.quote(f"{safe_text(area_hint, '')} ホテル")
-    return f"https://www.google.com/maps/search/?api=1&query={query}"
-
-
-def _complement_generic_hotel_label(destination: str, purpose: str, genre: str, planning_state: Dict[str, object], day: int) -> tuple[str, str]:
-    """具体ホテル名ではない宿泊先を、仮候補であることが分かる表記にする。"""
-    text = safe_text(destination, "")
-    if not _is_generic_or_area_hotel_label(text, purpose, genre):
-        return text, ""
-    area_hint = _extract_hotel_area_hint(text, planning_state)
-    if not area_hint or area_hint == "-":
-        area_hint = "目的地周辺"
-    label = f"{area_hint}周辺ホテル（候補未確定）"
-    note = f"宿泊先は仮候補です。{area_hint}周辺で具体ホテルを選択してください。"
-    st.session_state.setdefault("phase2_hotel_candidate_rows", []).append({
-        "day": int(day) if str(day).isdigit() else day,
-        "original_destination": text,
-        "suggested_destination": label,
-        "area_hint": area_hint,
-        "search_url": _build_hotel_search_url(area_hint),
-    })
-    _phase2_add_quality_correction(
-        "hotel_complement",
-        f"具体ホテル名ではない宿泊先を仮候補として明示: {text} -> {label}",
-        {"day": day, "destination": text, "purpose": purpose, "genre": genre},
-        severity="warning",
-    )
-    return label, note
-
-
-def _is_bad_phase2_destination(destination: str) -> bool:
-    # --- 修正箇所 v6.2.44: destinationへの説明文・ワンポイント混入を防ぐ ---
-    text = safe_text(destination, "")
-    if not text:
-        return True
-    bad_tokens = ["ワンポイント", "目的:", "目的：", "滞在時間", "旅行アドバイザー", "注意点", "※移動時間", "Input Data"]
-    if text.startswith("*") or text.startswith("-"):
-        return True
-    if any(token in text for token in bad_tokens):
-        return True
-    if len(text) > 80:
-        return True
-    return False
-
-
-def _clean_phase2_destination(destination: str, purpose: str = "", genre: str = "") -> str:
-    # --- 修正箇所 v6.2.44: 目的地表記を最低限クレンジング ---
-    text = safe_text(destination, "")
-    if not text:
-        return ""
-    text = text.strip().strip("| ").strip()
-    text = re.sub(r"^[-*・\s]+", "", text).strip()
-    text = re.sub(r"（(?:出発|到着|チェックイン|チェックアウト|移動)[^）]*）", "", text).strip()
-    text = re.sub(r"\((?:出発|到着|チェックイン|チェックアウト|移動)[^)]*\)", "", text).strip()
-    text = re.sub(r"(?:出発|到着|へ移動|に移動|チェックイン|チェックアウト)$", "", text).strip()
-    if _is_bad_phase2_destination(text):
-        return ""
-    return text
-
-
-def _repair_or_drop_phase2_rows(df: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
-    # --- 修正箇所 v6.2.44: Phase2崩壊行をPhase3に渡さない ---
-    if df is None or df.empty or "destination" not in df.columns:
-        return df
-    repaired = df.copy().reset_index(drop=True)
-    dropped_notes = []
-    keep_indexes = []
-    for idx, row in repaired.iterrows():
-        purpose = safe_text(row.get("purpose"), "").lower()
-        genre = safe_text(row.get("genre"), "").lower()
-        original = safe_text(row.get("destination"), "")
-        cleaned = _clean_phase2_destination(original, purpose, genre)
-        if cleaned:
-            if cleaned != original:
-                log_event("Phase2防御", f"destinationを補正: {original} -> {cleaned}", level="warning")
-                _phase2_add_quality_correction("destination_clean", f"destinationを補正: {original} -> {cleaned}", row.to_dict(), severity="warning")
-                repaired.at[idx, "destination"] = cleaned
-            keep_indexes.append(idx)
-            continue
-        dropped_notes.append({
-            "idx": int(idx),
-            "day": safe_text(row.get("day"), ""),
-            "sequence": safe_text(row.get("sequence"), ""),
-            "destination": original,
-            "purpose": purpose,
-            "reason": "destinationに説明文/ワンポイント混入の疑い"
-        })
-        _phase2_add_quality_correction("guard_drop", f"destination不正のため行を除外: {original}", row.to_dict(), severity="error")
-    if dropped_notes:
-        for note in dropped_notes[:5]:
-            log_event("Phase2防御", f"崩壊疑い行を除外: {note}", level="warning")
-        st.session_state.phase2_guard_dropped_rows = dropped_notes
-    else:
-        st.session_state.phase2_guard_dropped_rows = []
-    repaired = repaired.loc[keep_indexes].reset_index(drop=True) if keep_indexes else repaired.iloc[0:0].copy()
-    if not repaired.empty and "day" in repaired.columns and "sequence" in repaired.columns:
-        repaired = repaired.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
-        repaired["sequence"] = repaired.groupby("day").cumcount() + 1
-    return repaired
-
-
-def _parse_bool_false(value: object) -> bool:
-    text = str(value or "").strip().lower()
-    return text in {"true", "1", "yes"}
-
-
-def _add_minutes_to_hhmm(start_time: str, minutes: int) -> str:
-    text = safe_text(start_time, "")
-    try:
-        base = datetime.strptime(text, "%H:%M")
-        return (base + timedelta(minutes=max(0, int(minutes)))).strftime("%H:%M")
-    except Exception:
-        return text or ""
-
-
-def _parse_markdown_table_to_records(markdown_text: str) -> List[Dict[str, object]]:
-    raw = str(markdown_text or "").strip()
-    if not raw:
-        return []
-    lines = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            continue
-        if stripped.startswith("|") and stripped.endswith("|"):
-            lines.append(stripped)
-    if len(lines) < 2:
-        return []
-
-    header = [c.strip() for c in lines[0].strip("|").split("|")]
-    header_norm = [c.strip().lower() for c in header]
-    records: List[Dict[str, object]] = []
-    for line in lines[1:]:
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        if not cells or all(re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells):
-            continue
-        if len(cells) < len(header_norm):
-            cells = cells + [""] * (len(header_norm) - len(cells))
-        row = {header_norm[i]: cells[i] for i in range(min(len(header_norm), len(cells)))}
-        records.append(row)
-    return records
-
-
-def _coerce_phase2_records_to_df(records: List[Dict[str, object]], planning_state: Dict[str, object]) -> pd.DataFrame:
-    rows: List[Dict[str, object]] = []
-    start_date_text = safe_text(planning_state.get("start_date"), datetime.now().date().strftime("%Y-%m-%d"))
-    try:
-        start_date = datetime.strptime(start_date_text, "%Y-%m-%d").date()
-    except Exception:
-        start_date = datetime.now().date()
-
-    for idx, rec in enumerate(records, start=1):
-        try:
-            day = int(float(safe_text(rec.get("day"), "1")))
-        except Exception:
-            day = 1
-        try:
-            sequence = int(float(safe_text(rec.get("sequence"), str(idx))))
-        except Exception:
-            sequence = idx
-
-        purpose = safe_text(rec.get("purpose"), "activity").lower()
-        genre = safe_text(rec.get("genre"), "general").lower()
-        destination = _clean_phase2_destination(safe_text(rec.get("destination"), ""), purpose, genre)
-        if not destination or destination == "-":
-            log_event("Phase2防御", f"destination不正のため行をスキップ: {rec}", level="warning")
-            _phase2_add_quality_correction("guard_drop", f"destination不正のため行をスキップ: {safe_text(rec.get('destination'), '')}", rec, severity="error")
-            continue
-
-        # v6.2.46: 具体ホテル名ではない宿泊先は、仮候補であることをデータに明示する。
-        destination, hotel_note = _complement_generic_hotel_label(destination, purpose, genre, planning_state, day)
-
-        start_time = safe_text(rec.get("start_time"), "")
-        try:
-            duration = int(float(safe_text(rec.get("duration_minutes"), "30")))
-        except Exception:
-            duration = 30
-        duration = max(0, duration)
-        end_time = safe_text(rec.get("end_time"), "")
-        if not end_time or end_time == "-":
-            end_time = _add_minutes_to_hhmm(start_time, duration)
-
-        date_value = safe_text(rec.get("date"), "")
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value or ""):
-            date_value = (start_date + timedelta(days=max(0, day - 1))).strftime("%Y-%m-%d")
-
-        rows.append({
-            "day": day,
-            "sequence": sequence,
-            "date": date_value,
-            "start_time": start_time,
-            "end_time": end_time,
-            "destination": destination,
-            "purpose": purpose,
-            "genre": genre,
-            "duration_minutes": duration,
-            "is_transport": False,
-            "transport_mode": "-",
-            "one_point": (safe_text(rec.get("one_point"), "") + (f" / {hotel_note}" if hotel_note else "")).strip(" /"),
-            "address": "",
-            "route_from": "",
-            "route_to": "",
-            "route_url": "",
-            "route_data_source": "phase2_spot_only_prompt",
-            "estimated_duration_label": "",
-        })
-
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df = df.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
-    df["sequence"] = range(1, len(df) + 1)
-    return df
-
-
-
-# =========================================================
-# 修正箇所 v6.2.45: Phase2 LLM検証レイヤー
-# - Phase2生成とは別モデルで「不正行の検出だけ」を行う
-# - 修正・採否判断はコード側で行い、LLMに勝手な書き換えはさせない
-# =========================================================
-PHASE2_VALIDATOR_MODEL_NAME = os.getenv("VOYAGEFLOW_PHASE2_VALIDATOR_MODEL", "models/gemini-1.5-flash")
-
-
-@contextmanager
-def _temporary_gemini_model_env(model_name: str):
-    """Phase1Generator が環境変数からモデル名を読む実装の場合にだけ効く安全な一時上書き。"""
-    keys = [
-        "GEMINI_MODEL",
-        "GOOGLE_GEMINI_MODEL",
-        "GOOGLE_GENAI_MODEL",
-        "MODEL_NAME",
-        "VOYAGEFLOW_GEMINI_MODEL",
-    ]
-    previous = {key: os.environ.get(key) for key in keys}
-    try:
-        if model_name:
-            for key in keys:
-                os.environ[key] = model_name
-        yield
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
-def _build_phase2_validation_prompt(records: List[Dict[str, object]], planning_state: Dict[str, object]) -> str:
-    start_date = safe_text(planning_state.get("start_date"), "")
-    departure_place = safe_text(planning_state.get("departure_place"), "")
-    return_place = safe_text(planning_state.get("return_place"), "")
-    payload = json.dumps(records, ensure_ascii=False, indent=2, default=str)
-    return f"""
-# Role
-あなたは VoyageFlow の Phase2 構造化データ検証担当です。
-以下のJSON配列を確認し、不正な行だけを検出してください。
-
-# Important
-- あなたは修正後の旅程を作ってはいけません。
-- 行を追加・削除・書き換えしてはいけません。
-- 問題がある index だけを返してください。
-- index は、入力JSON配列の0始まりの配列位置です。
-- 出力はJSONオブジェクトのみ。Markdown、説明文、コードフェンスは禁止です。
-
-# Trip Context
-- 旅行開始日: {start_date}
-- 出発地: {departure_place}
-- 帰着地: {return_place}
-
-# Invalid Row Rules
-次のいずれかに該当する行を invalid_rows に入れてください。
-1. destination が場所名・スポット名ではない
-2. destination に「ワンポイント」「目的:」「滞在時間」「旅行アドバイザー」「注意点」などの本文説明が混入している
-3. destination が80文字を超える長文
-4. is_transport が true になっている
-5. transport_mode が "-" 以外になっている
-6. duration_minutes が駅の出発/到着だけなのに60分を大きく超える
-7. duration_minutes が負数、または数値ではない
-8. start_time / end_time が HH:MM 形式ではない。ただし宿泊で end_time が翌朝の HH:MM になることは許容する
-9. purpose が allowed_purposes に含まれない
-
-# Allowed purposes
-["departure", "arrival", "activity", "meal", "accommodation", "shopping"]
-
-# Output JSON schema
-{{
-  "ok": true,
-  "invalid_rows": [
-    {{"index": 0, "reason": "destinationにワンポイント文が混入"}}
-  ],
-  "warnings": ["任意の注意"],
-  "summary": "短い検証結果"
-}}
-
-# Input JSON
-{payload}
-""".strip()
-
-
-def _parse_phase2_validation_result(raw: str) -> Dict[str, object]:
-    text = str(raw or "").strip()
-    if not text:
-        return {"ok": False, "invalid_rows": [], "warnings": ["検証LLMの出力が空です。"], "summary": "empty"}
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"\s*```$", "", text).strip()
-    data = _safe_json_extract(text)
-    if not isinstance(data, dict):
-        try:
-            data = json.loads(text)
-        except Exception:
-            data = {}
-    invalid = data.get("invalid_rows") if isinstance(data, dict) else []
-    normalized_invalid = []
-    if isinstance(invalid, list):
-        for item in invalid:
-            if isinstance(item, dict):
-                try:
-                    idx = int(item.get("index"))
-                except Exception:
-                    continue
-                normalized_invalid.append({"index": idx, "reason": safe_text(item.get("reason"), "検証LLMが不正疑いと判定")})
-            else:
-                try:
-                    normalized_invalid.append({"index": int(item), "reason": "検証LLMが不正疑いと判定"})
-                except Exception:
-                    continue
-    warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
-    return {
-        "ok": bool(data.get("ok", len(normalized_invalid) == 0)),
-        "invalid_rows": normalized_invalid,
-        "warnings": [safe_text(w, "") for w in warnings if safe_text(w, "")],
-        "summary": safe_text(data.get("summary"), "検証LLMの結果を取得しました。"),
-    }
-
-
-def _run_phase2_llm_validation(records: List[Dict[str, object]], planning_state: Dict[str, object]) -> Dict[str, object]:
-    """Phase2生成結果を別モデルで検証する。失敗時は空検証扱いにしてコードガードへ進む。"""
-    model_name = PHASE2_VALIDATOR_MODEL_NAME
-    st.session_state.phase2_validator_model = model_name
-    st.session_state.phase2_validation_raw = ""
-    st.session_state.phase2_validation_error = ""
-    st.session_state.phase2_validation_result = {}
-    st.session_state.phase2_validator_invalid_rows = []
-
-    if not records:
-        result = {"ok": False, "invalid_rows": [], "warnings": ["検証対象のPhase2 recordsが空です。"], "summary": "records empty"}
-        st.session_state.phase2_validation_result = result
-        return result
-
-    prompt = _build_phase2_validation_prompt(records, planning_state)
-    log_event("Phase2検証LLM", f"検証を開始: model={model_name} / rows={len(records)}", level="info")
-    try:
-        with _temporary_gemini_model_env(model_name):
-            generator = Phase1Generator(logger=log_event)
-            raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
-        result = _parse_phase2_validation_result(raw)
-        st.session_state.phase2_validation_raw = raw
-        st.session_state.phase2_validation_result = result
-        st.session_state.phase2_validator_invalid_rows = result.get("invalid_rows") or []
-        if result.get("invalid_rows"):
-            log_event("Phase2検証LLM", f"不正疑い行を検出: {result.get('invalid_rows')}", level="warning")
-        else:
-            log_event("Phase2検証LLM", "不正疑い行なし", level="info")
-        return result
-    except Exception as e:
-        result = {"ok": False, "invalid_rows": [], "warnings": ["検証LLMに失敗したためコードガードのみで継続"], "summary": "validator failed"}
-        st.session_state.phase2_validation_error = str(e)
-        st.session_state.phase2_validation_result = result
-        log_event("Phase2検証LLM", f"検証LLM失敗。コードガードのみで継続: {e}", level="warning")
-        return result
-
-
-def _drop_phase2_records_by_validator(records: List[Dict[str, object]], validation_result: Dict[str, object]) -> List[Dict[str, object]]:
-    invalid_rows = validation_result.get("invalid_rows") if isinstance(validation_result, dict) else []
-    invalid_indexes = set()
-    if isinstance(invalid_rows, list):
-        for item in invalid_rows:
-            if isinstance(item, dict):
-                try:
-                    invalid_indexes.add(int(item.get("index")))
-                except Exception:
-                    continue
-    if not invalid_indexes:
-        return records
-    kept = []
-    for idx, rec in enumerate(records):
-        if idx in invalid_indexes:
-            log_event("Phase2検証LLM", f"検証LLM判定により行を除外: index={idx} / destination={safe_text(rec.get('destination'), '')}", level="warning")
-            _phase2_add_quality_correction(
-                "validator_drop",
-                f"検証LLM判定により不正疑い行を除外: index={idx} / destination={safe_text(rec.get('destination'), '')}",
-                rec,
-                severity="warning",
-            )
-            continue
-        kept.append(rec)
-    return kept
-
-
-def _split_trip_plan_text_by_day(trip_plan_text: str, planning_state: Dict[str, object]) -> List[Dict[str, object]]:
-    # --- 修正箇所 v6.2.48: 長いJSONが途中で切れないよう、Phase2構造化を日別に分割する ---
-    text = str(trip_plan_text or "").strip()
-    if not text:
-        return []
-
-    lines = text.splitlines()
-    heading_indexes: List[tuple[int, Optional[int]]] = []
-    day_counter = 0
-    for idx, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        explicit_day = None
-        m_day = re.search(r"Day\s*(\d+)", stripped, flags=re.IGNORECASE)
-        if m_day:
-            explicit_day = int(m_day.group(1))
-        is_heading = bool(m_day) or bool(re.match(r"^【[^】]*(?:\d{1,2}月\d{1,2}日|第?\d+日|Day\s*\d+)[^】]*】", stripped))
-        if is_heading:
-            day_counter += 1
-            heading_indexes.append((idx, explicit_day or day_counter))
-
-    if not heading_indexes:
-        try:
-            trip_days = max(1, int(planning_state.get("trip_days", 1) or 1))
-        except Exception:
-            trip_days = 1
-        return [{"day": None, "date": "", "text": text, "label": f"whole_plan_{trip_days}days"}]
-
-    start_date_text = safe_text(planning_state.get("start_date"), datetime.now().date().strftime("%Y-%m-%d"))
-    try:
-        start_date = datetime.strptime(start_date_text, "%Y-%m-%d").date()
-    except Exception:
-        start_date = datetime.now().date()
-
-    sections: List[Dict[str, object]] = []
-    for pos, (start_idx, day_no) in enumerate(heading_indexes):
-        end_idx = heading_indexes[pos + 1][0] if pos + 1 < len(heading_indexes) else len(lines)
-        section_text = "\n".join(lines[start_idx:end_idx]).strip()
-        if not section_text:
-            continue
-        date_value = (start_date + timedelta(days=max(0, int(day_no) - 1))).strftime("%Y-%m-%d")
-        sections.append({
-            "day": int(day_no),
-            "date": date_value,
-            "text": section_text,
-            "label": f"Day{int(day_no)}",
-        })
-    return sections
-
-
-def _build_phase2_spot_only_json_prompt_for_section(
-    section_text: str,
-    planning_state: Dict[str, object],
-    target_day: Optional[int] = None,
-    target_date: str = "",
-) -> str:
-    base_prompt = _build_phase2_spot_only_json_prompt(section_text, planning_state)
-    if target_day is None:
-        return base_prompt
-    target_date_text = safe_text(target_date, "")
-    section_rule = f"""
-
-# Day Split Rule
-この入力データは、旅行全体ではなく Day {target_day} だけを切り出したテキストです。
-- 出力する全行の day は必ず {target_day} にしてください。
-- 出力する全行の date は必ず {target_date_text} にしてください。
-- sequence はこのDay内で 1, 2, 3... と振ってください。
-- このDay内のスポット・滞在・起点/終点を、途中で省略せず最後まで抽出してください。
-- 他の日の行を推測で追加しないでください。
-""".strip()
-    return base_prompt + "\n\n" + section_rule
-
-
-def structure_trip_plan_spot_only_with_gemini(trip_plan_text: str, planning_state: Dict[str, object]) -> pd.DataFrame:
-    # --- 修正箇所 v6.2.48: Phase2 JSON構造化を日別分割し、長文JSONの途中切れを抑制 ---
-    _phase2_reset_quality_corrections()
-    generator = Phase1Generator(logger=log_event)
-    sections = _split_trip_plan_text_by_day(trip_plan_text, planning_state)
-    if not sections:
-        raise ValueError("Phase2日別分割対象の旅程テキストが空です。")
-
-    all_records: List[Dict[str, object]] = []
-    raw_by_day: List[Dict[str, object]] = []
-    log_event("Phase2構造化", f"日別分割JSON構造化を開始: sections={len(sections)}", level="info")
-
-    for section in sections:
-        target_day = section.get("day") if isinstance(section.get("day"), int) else None
-        target_date = safe_text(section.get("date"), "")
-        label = safe_text(section.get("label"), f"Day{target_day}" if target_day else "whole_plan")
-        prompt = _build_phase2_spot_only_json_prompt_for_section(
-            safe_text(section.get("text"), ""),
-            planning_state,
-            target_day=target_day,
-            target_date=target_date,
-        )
-        log_event("Phase2構造化", f"{label} のJSON構造化を開始", level="info")
-        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
-        records = _extract_json_array(raw)
-        if target_day is not None:
-            for rec in records:
-                rec["day"] = target_day
-                if target_date:
-                    rec["date"] = target_date
-        raw_by_day.append({
-            "label": label,
-            "day": target_day,
-            "date": target_date,
-            "raw": raw,
-            "record_count": len(records),
-        })
-        log_event("Phase2構造化", f"{label} 構造化結果: records={len(records)}", level="info")
-        all_records.extend(records)
-
-    st.session_state.phase2_structuring_raw_by_day = raw_by_day
-    st.session_state.phase2_structuring_raw = json.dumps(raw_by_day, ensure_ascii=False, indent=2, default=str)
-    st.session_state.phase2_structuring_mode = "day_split_json_prompt_with_llm_validator"
-
-    # 生成結果を別モデルの検証LLMでチェックする。検証LLMは検出のみ、修正判断はコード側で行う。
-    validation_result = _run_phase2_llm_validation(all_records, planning_state)
-    records = _drop_phase2_records_by_validator(all_records, validation_result)
-
-    df = _coerce_phase2_records_to_df(records, planning_state)
-    df = _repair_or_drop_phase2_rows(df, planning_state)
-    if df is None or df.empty:
-        raise ValueError("日別分割JSON構造化のパース結果が空、または検証/防御ガードで全行が除外されました。")
-
-    try:
-        expected_days = max(1, int(planning_state.get("trip_days", 1) or 1))
-        actual_days = sorted([int(x) for x in df["day"].dropna().unique().tolist()]) if "day" in df.columns else []
-        missing_days = [day for day in range(1, expected_days + 1) if day not in actual_days]
-        st.session_state.phase2_missing_days = missing_days
-        if missing_days:
-            log_event("Phase2構造化", f"構造化結果に不足Dayがあります: {missing_days}", level="warning")
-            _phase2_add_quality_correction("missing_day", f"Phase2構造化結果に不足Dayがあります: {missing_days}", severity="warning")
-    except Exception:
-        st.session_state.phase2_missing_days = []
-
-    log_event("Phase2構造化", f"日別分割JSON構造化完了: rows={len(df)} / destinations={df['destination'].head(10).tolist()}", level="info")
-    return df
-
-
 def approve_and_build_phase2_phase3() -> None:
     if not st.session_state.trip_plan_draft:
         raise ValueError("了承対象の旅程案がありません。")
@@ -5015,16 +3902,8 @@ def approve_and_build_phase2_phase3() -> None:
     trip_plan = st.session_state.trip_plan_draft
 
     log_event("Phase2", "構造化を開始")
-    try:
-        df2 = structure_trip_plan_spot_only_with_gemini(trip_plan, s)
-        st.session_state.phase2_structuring_error = ""
-    except Exception as e:
-        # --- 修正箇所: 診断版では新プロンプト失敗時だけ既存Phase2へ戻す ---
-        st.session_state.phase2_structuring_error = str(e)
-        log_event("Phase2構造化", f"スポット専用JSON構造化に失敗。既存Phase2へfallback: {e}", level="warning")
-        structurer = Phase2Structuring(logger=log_event)
-        df2 = structurer.structure_trip_plan(trip_plan, s["start_date"])
-        st.session_state.phase2_structuring_mode = "legacy_fallback"
+    structurer = Phase2Structuring(logger=log_event)
+    df2 = structurer.structure_trip_plan(trip_plan, s["start_date"])
     if df2 is None or df2.empty:
         raise ValueError("フェーズ2で構造化データを生成できませんでした。")
 
@@ -5622,6 +4501,320 @@ def status_emoji(status: str) -> str:
     return mapping.get(status, "⏳")
 
 
+
+
+# =========================================================
+# 修正箇所: Gemini transport resolver A/Bテスト（サイドバー診断専用）
+# - 本番のtransport行にはまだ接続しない
+# - A案: 移動時間 + 手段だけを取得
+# - B案: 経路詳細も取得
+# - 失敗しても既存旅程・UI・カード表示には影響しない
+# =========================================================
+def _build_gemini_transport_resolver_prompt(
+    origin: str,
+    destination: str,
+    departure_datetime: str,
+    mode_hint: str,
+    detail_level: str,
+) -> str:
+    origin_text = safe_text(origin, "")
+    destination_text = safe_text(destination, "")
+    departure_text = safe_text(departure_datetime, "")
+    mode_text = safe_text(mode_hint, "自動")
+    detail_text = "minimal" if detail_level == "minimal" else "detailed"
+
+    if detail_text == "minimal":
+        output_schema = """
+{
+  "ok": true,
+  "confidence": "high|medium|low",
+  "duration_minutes": 165,
+  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
+  "summary": "北陸新幹線などを利用する想定。乗換がある場合は1行で補足。",
+  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
+}
+""".strip()
+        instruction = """
+返す情報は最小限にしてください。
+駅名・路線名・乗換駅などの詳細は、確度が高い場合のみsummaryに1行で含めてください。
+duration_minutes は現実的な移動時間にしてください。
+例: 福井駅→京都駅が20分のような明らかに不自然な値は禁止です。
+""".strip()
+    else:
+        output_schema = """
+{
+  "ok": true,
+  "confidence": "high|medium|low",
+  "duration_minutes": 165,
+  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
+  "summary": "全体の経路要約",
+  "route_title": "推定ルート名",
+  "steps": [
+    {
+      "from": "出発地または駅",
+      "to": "到着地または駅",
+      "mode": "walk|train|bus|taxi|car|air|ship|unknown",
+      "line": "路線名・便名。なければ空文字",
+      "duration_minutes": 10,
+      "note": "乗換・徒歩などの補足"
+    }
+  ],
+  "transfer_count": 1,
+  "evidence_note": "Google Maps等で最終確認が必要。API実測ではなくGemini推定。"
+}
+""".strip()
+        instruction = """
+経路詳細も返してください。
+ただし、不明な駅名・路線名・乗換駅を断定しないでください。
+不確実な場合は confidence を low にし、line や note に「要確認」と明示してください。
+duration_minutes は steps の合計と大きく矛盾しないようにしてください。
+例: 福井駅→京都駅が20分のような明らかに不自然な値は禁止です。
+""".strip()
+
+    return f"""
+あなたは旅行AIエージェント VoyageFlow の transport resolver です。
+目的は、旅程内の transport 行に使う移動時間と移動手段を、破綻しない範囲で推定することです。
+
+重要:
+- あなたの出力はAPI実測ではなく推定です。
+- 不確かな情報は断定しないでください。
+- 既存コード側で制御するため、出力は必ずJSONのみ。
+- Markdown、説明文、コードフェンスは禁止。
+- 日本国内の公共交通は、常識的な所要時間にしてください。
+- 明らかに短すぎる移動時間を出さないでください。
+- 指定時刻に運行がありそうか不明な場合は、その旨を evidence_note に書いてください。
+
+入力:
+- 出発地: {origin_text}
+- 到着地: {destination_text}
+- 出発日時: {departure_text}
+- 手段ヒント: {mode_text}
+- 詳細レベル: {detail_text}
+
+追加指示:
+{instruction}
+
+出力JSON形式:
+{output_schema}
+""".strip()
+
+
+def _normalize_gemini_transport_result(data: Dict[str, object], detail_level: str) -> Dict[str, object]:
+    if not isinstance(data, dict):
+        data = {}
+
+    def _safe_int(value, default: Optional[int] = None) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return default
+            return int(float(value))
+        except Exception:
+            return default
+
+    allowed_modes = {"train", "bus", "walk", "taxi", "car", "air", "ship", "unknown"}
+    allowed_confidence = {"high", "medium", "low"}
+
+    mode = safe_text(data.get("mode"), "unknown").lower()
+    if mode not in allowed_modes:
+        mode = _infer_mode_from_service_hint(mode, "unknown")
+        if mode not in allowed_modes:
+            mode = "unknown"
+
+    confidence = safe_text(data.get("confidence"), "low").lower()
+    if confidence not in allowed_confidence:
+        confidence = "low"
+
+    duration_minutes = _safe_int(data.get("duration_minutes"), None)
+    if duration_minutes is not None:
+        duration_minutes = max(1, min(duration_minutes, 24 * 60))
+
+    normalized: Dict[str, object] = {
+        "ok": bool(data.get("ok", True)) if data else False,
+        "resolver": "gemini_transport_resolver",
+        "detail_level": detail_level,
+        "confidence": confidence,
+        "duration_minutes": duration_minutes,
+        "mode": mode,
+        "summary": safe_text(data.get("summary"), ""),
+        "evidence_note": safe_text(data.get("evidence_note"), "Gemini推定のため、Google Maps等で最終確認してください。"),
+    }
+
+    if detail_level == "detailed":
+        raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        steps = []
+        total_from_steps = 0
+        for step in raw_steps[:12]:
+            if not isinstance(step, dict):
+                continue
+            step_minutes = _safe_int(step.get("duration_minutes"), None)
+            if step_minutes is not None:
+                step_minutes = max(1, min(step_minutes, 24 * 60))
+                total_from_steps += step_minutes
+            step_mode = safe_text(step.get("mode"), "unknown").lower()
+            if step_mode not in allowed_modes:
+                step_mode = _infer_mode_from_service_hint(step_mode, "unknown")
+                if step_mode not in allowed_modes:
+                    step_mode = "unknown"
+            steps.append({
+                "from": safe_text(step.get("from"), ""),
+                "to": safe_text(step.get("to"), ""),
+                "mode": step_mode,
+                "line": safe_text(step.get("line"), ""),
+                "duration_minutes": step_minutes,
+                "note": safe_text(step.get("note"), ""),
+            })
+        normalized["route_title"] = safe_text(data.get("route_title"), "")
+        normalized["steps"] = steps
+        normalized["transfer_count"] = _safe_int(data.get("transfer_count"), None)
+        normalized["steps_duration_total"] = total_from_steps or None
+
+    return normalized
+
+
+def resolve_transport_with_gemini_for_test(
+    origin: str,
+    destination: str,
+    departure_datetime: str,
+    mode_hint: str = "自動",
+    detail_level: str = "minimal",
+) -> Dict[str, object]:
+    prompt = _build_gemini_transport_resolver_prompt(
+        origin=origin,
+        destination=destination,
+        departure_datetime=departure_datetime,
+        mode_hint=mode_hint,
+        detail_level=detail_level,
+    )
+    started_at = datetime.now()
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        parsed = _safe_json_extract(raw) or {}
+        normalized = _normalize_gemini_transport_result(parsed, detail_level=detail_level)
+        normalized["raw"] = raw
+        normalized["elapsed_seconds"] = round((datetime.now() - started_at).total_seconds(), 2)
+        normalized["fallback_used"] = False
+        return normalized
+    except Exception as e:
+        log_event("GeminiTransport診断", f"{detail_level} resolver失敗: {e}", level="warning")
+        return {
+            "ok": False,
+            "resolver": "gemini_transport_resolver",
+            "detail_level": detail_level,
+            "confidence": "low",
+            "duration_minutes": None,
+            "mode": "unknown",
+            "summary": "",
+            "evidence_note": "Gemini resolver の実行に失敗しました。本番実装時は既存Routes/Directions/距離推定へfallbackします。",
+            "error": str(e),
+            "elapsed_seconds": round((datetime.now() - started_at).total_seconds(), 2),
+            "fallback_used": True,
+        }
+
+
+def _render_gemini_transport_result_card(title: str, result: Dict[str, object]) -> None:
+    st.markdown(f"**{title}**")
+    if not result:
+        st.caption("まだ実行結果がありません。")
+        return
+
+    summary_payload = {
+        "ok": result.get("ok"),
+        "detail_level": result.get("detail_level"),
+        "confidence": result.get("confidence"),
+        "duration_minutes": result.get("duration_minutes"),
+        "mode": result.get("mode"),
+        "summary": result.get("summary"),
+        "evidence_note": result.get("evidence_note"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "fallback_used": result.get("fallback_used"),
+    }
+    if result.get("error"):
+        summary_payload["error"] = result.get("error")
+    if result.get("route_title"):
+        summary_payload["route_title"] = result.get("route_title")
+    if result.get("transfer_count") is not None:
+        summary_payload["transfer_count"] = result.get("transfer_count")
+    if result.get("steps_duration_total") is not None:
+        summary_payload["steps_duration_total"] = result.get("steps_duration_total")
+
+    st.json(summary_payload)
+
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    if steps:
+        st.markdown("**推定ステップ**")
+        for idx, step in enumerate(steps, start=1):
+            st.write(
+                f"{idx}. {safe_text(step.get('from'), '')} → {safe_text(step.get('to'), '')} / "
+                f"{safe_text(step.get('mode'), 'unknown')} / {safe_text(step.get('line'), '')} / "
+                f"{safe_text(step.get('duration_minutes'), '-')}分"
+            )
+            note = safe_text(step.get("note"), "")
+            if note and note != "-":
+                st.caption(note)
+
+    with st.expander("Gemini raw output", expanded=False):
+        st.code(safe_text(result.get("raw"), ""), language="json")
+
+
+def render_gemini_transport_ab_test_panel() -> None:
+    # --- 修正箇所: 左側固定スペースでA/B両方を検証するだけ。本番transportには未接続。 ---
+    with st.expander("🧪 Gemini Transport A/Bテスト", expanded=False):
+        st.caption("診断専用です。ここでの結果は完成旅程・実行シミュレーションへ自動反映しません。")
+        ab_origin = st.text_input("Gemini 出発地", value="福井駅", key="gemini_transport_ab_origin")
+        ab_destination = st.text_input("Gemini 到着地", value="京都駅", key="gemini_transport_ab_destination")
+        ab_departure = st.text_input(
+            "Gemini 出発日時 (YYYY-MM-DD HH:MM)",
+            value="2026-04-30 13:00",
+            key="gemini_transport_ab_departure",
+        )
+        ab_mode_hint = st.selectbox(
+            "Gemini 手段ヒント",
+            options=["自動", "train", "bus", "walk", "taxi", "car", "air", "ship"],
+            index=0,
+            key="gemini_transport_ab_mode_hint",
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            run_minimal = st.button("A案: 時間+手段だけ", use_container_width=True, key="run_gemini_transport_minimal")
+        with col_b:
+            run_detailed = st.button("B案: 経路詳細も取得", use_container_width=True, key="run_gemini_transport_detailed")
+
+        if st.button("A/B両方を実行", use_container_width=True, key="run_gemini_transport_both"):
+            run_minimal = True
+            run_detailed = True
+
+        if run_minimal:
+            st.session_state["gemini_transport_minimal_result"] = resolve_transport_with_gemini_for_test(
+                origin=ab_origin,
+                destination=ab_destination,
+                departure_datetime=ab_departure,
+                mode_hint=ab_mode_hint,
+                detail_level="minimal",
+            )
+
+        if run_detailed:
+            st.session_state["gemini_transport_detailed_result"] = resolve_transport_with_gemini_for_test(
+                origin=ab_origin,
+                destination=ab_destination,
+                departure_datetime=ab_departure,
+                mode_hint=ab_mode_hint,
+                detail_level="detailed",
+            )
+
+        st.divider()
+        _render_gemini_transport_result_card(
+            "A案: 移動時間 + 手段だけ",
+            st.session_state.get("gemini_transport_minimal_result", {}),
+        )
+        st.divider()
+        _render_gemini_transport_result_card(
+            "B案: 経路詳細も取得",
+            st.session_state.get("gemini_transport_detailed_result", {}),
+        )
+
+
 # =========================================================
 # サイドバー
 # =========================================================
@@ -5631,17 +4824,14 @@ with st.sidebar:
     st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
 
     st.divider()
-    render_phase2_phase3_fixed_debug_sidebar()
-
-    st.divider()
     render_internal_logs_sidebar()
-
-    st.divider()
-    render_transport_debug_sidebar()
 
     st.divider()
     st.markdown("### VoyageFlow")
     st.caption("モデル: models/gemini-3.1-flash-lite-preview")
+
+    # --- 修正箇所: Gemini transport resolver A/Bテストをサイドバー固定スペースへ追加 ---
+    render_gemini_transport_ab_test_panel()
 
     # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
     with st.expander("🛠 Routes診断", expanded=False):
