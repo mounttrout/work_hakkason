@@ -35,7 +35,7 @@ from maps.routes_api import RoutesAPI
 # - UI、カード表示、フェーズ構成、既存ホテル・天候・カレンダー・実行シミュレーションは変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.45-phase2-llm-validation-guard"
+APP_VERSION_NAME = "v6.2.46-correction-visibility-hotel-complement"
 APP_UPDATED_DATE = "2026-04-24"
 
 
@@ -548,6 +548,8 @@ def init_session_state() -> None:
         "phase2_validation_error": "",
         "phase2_validator_model": "models/gemini-1.5-flash",
         "phase2_validator_invalid_rows": [],
+        "phase2_quality_corrections": [],
+        "phase2_hotel_candidate_rows": [],
     }
 
     for key, value in defaults.items():
@@ -3205,6 +3207,33 @@ def render_phase2_phase3_fixed_debug_sidebar() -> None:
     }
     st.json(summary_payload)
 
+    with st.expander("データ品質・補正メモ", expanded=True):
+        corrections = st.session_state.get("phase2_quality_corrections") or []
+        hotel_rows = st.session_state.get("phase2_hotel_candidate_rows") or []
+        if not corrections and not hotel_rows:
+            st.success("自動補正・注意対象はありません。")
+        else:
+            st.caption("Phase2生成後に検出・補正した内容です。旅程の透明性確認用です。")
+            for idx, item in enumerate(corrections, start=1):
+                severity = safe_text(item.get("severity"), "info")
+                msg = safe_text(item.get("message"), "")
+                kind = safe_text(item.get("kind"), "correction")
+                if severity == "error":
+                    st.error(f"{idx}. [{kind}] {msg}")
+                elif severity == "warning":
+                    st.warning(f"{idx}. [{kind}] {msg}")
+                else:
+                    st.info(f"{idx}. [{kind}] {msg}")
+            if hotel_rows:
+                st.markdown("**ホテル候補リンク**")
+                for idx, row in enumerate(hotel_rows, start=1):
+                    label = f"Day{safe_text(row.get('day'), '')}: {safe_text(row.get('suggested_destination'), '')}"
+                    url = safe_text(row.get("search_url"), "")
+                    if url and url != "-":
+                        st.link_button(label, url, use_container_width=True)
+                    else:
+                        st.write(f"- {label}")
+
     with st.expander("Phase2 raw JSON / LLM出力", expanded=True):
         if raw and raw != "-":
             st.code(raw, language="json")
@@ -4376,6 +4405,96 @@ def _extract_json_array(text: str) -> List[Dict[str, object]]:
         return []
 
 
+
+# =========================================================
+# 修正箇所 v6.2.46: Phase2補正の可視化 + generic hotel補完
+# - LLM検証やコードガードで補正/除外した内容をサイドバーで見える化
+# - 「銀座エリアのホテル」など具体ホテル名でない宿泊先を、仮ホテルとして明示
+# =========================================================
+def _phase2_reset_quality_corrections() -> None:
+    st.session_state.phase2_quality_corrections = []
+    st.session_state.phase2_hotel_candidate_rows = []
+
+
+def _phase2_add_quality_correction(kind: str, message: str, row: Optional[Dict[str, object]] = None, severity: str = "info") -> None:
+    items = st.session_state.setdefault("phase2_quality_corrections", [])
+    payload = {
+        "kind": safe_text(kind, "correction"),
+        "severity": safe_text(severity, "info"),
+        "message": safe_text(message, ""),
+    }
+    if row is not None:
+        payload["row"] = {k: safe_text(v, "") for k, v in dict(row).items() if k in {"day", "sequence", "destination", "purpose", "genre", "start_time", "end_time"}}
+    items.append(payload)
+
+
+def _extract_hotel_area_hint(destination: str, planning_state: Dict[str, object]) -> str:
+    text = safe_text(destination, "")
+    for token in ["エリアのホテル", "周辺ホテル", "エリア周辺ホテル", "ホテル"]:
+        if token in text:
+            left = text.split(token)[0].strip(" ・、,（）()【】[]")
+            if left:
+                return left
+    area = _extract_area_hint(text)
+    if area:
+        return area
+    primary = safe_text(planning_state.get("primary_destination"), "")
+    if primary:
+        return primary
+    return safe_text(planning_state.get("return_place"), "") or safe_text(planning_state.get("departure_place"), "")
+
+
+def _is_generic_or_area_hotel_label(destination: str, purpose: str = "", genre: str = "") -> bool:
+    text = safe_text(destination, "")
+    low_purpose = safe_text(purpose, "").lower()
+    low_genre = safe_text(genre, "").lower()
+    if low_purpose not in {"accommodation", "hotel", "stay", "lodging", "departure"} and low_genre != "hotel" and "ホテル" not in text.lower():
+        return False
+    if _is_generic_hotel_label(text):
+        return True
+    generic_patterns = [
+        r".+エリアのホテル$",
+        r".+エリア周辺ホテル$",
+        r".+周辺ホテル$",
+        r".+近くのホテル$",
+        r".+ホテル\s*\(?推奨\)?$",
+        r"ホテルチェックイン.*",
+        r"宿泊先.*",
+    ]
+    return any(re.fullmatch(pattern, text) for pattern in generic_patterns)
+
+
+def _build_hotel_search_url(area_hint: str) -> str:
+    query = urllib.parse.quote(f"{safe_text(area_hint, '')} ホテル")
+    return f"https://www.google.com/maps/search/?api=1&query={query}"
+
+
+def _complement_generic_hotel_label(destination: str, purpose: str, genre: str, planning_state: Dict[str, object], day: int) -> tuple[str, str]:
+    """具体ホテル名ではない宿泊先を、仮候補であることが分かる表記にする。"""
+    text = safe_text(destination, "")
+    if not _is_generic_or_area_hotel_label(text, purpose, genre):
+        return text, ""
+    area_hint = _extract_hotel_area_hint(text, planning_state)
+    if not area_hint or area_hint == "-":
+        area_hint = "目的地周辺"
+    label = f"{area_hint}周辺ホテル（候補未確定）"
+    note = f"宿泊先は仮候補です。{area_hint}周辺で具体ホテルを選択してください。"
+    st.session_state.setdefault("phase2_hotel_candidate_rows", []).append({
+        "day": int(day) if str(day).isdigit() else day,
+        "original_destination": text,
+        "suggested_destination": label,
+        "area_hint": area_hint,
+        "search_url": _build_hotel_search_url(area_hint),
+    })
+    _phase2_add_quality_correction(
+        "hotel_complement",
+        f"具体ホテル名ではない宿泊先を仮候補として明示: {text} -> {label}",
+        {"day": day, "destination": text, "purpose": purpose, "genre": genre},
+        severity="warning",
+    )
+    return label, note
+
+
 def _is_bad_phase2_destination(destination: str) -> bool:
     # --- 修正箇所 v6.2.44: destinationへの説明文・ワンポイント混入を防ぐ ---
     text = safe_text(destination, "")
@@ -4421,6 +4540,7 @@ def _repair_or_drop_phase2_rows(df: pd.DataFrame, planning_state: Dict[str, obje
         if cleaned:
             if cleaned != original:
                 log_event("Phase2防御", f"destinationを補正: {original} -> {cleaned}", level="warning")
+                _phase2_add_quality_correction("destination_clean", f"destinationを補正: {original} -> {cleaned}", row.to_dict(), severity="warning")
                 repaired.at[idx, "destination"] = cleaned
             keep_indexes.append(idx)
             continue
@@ -4432,6 +4552,7 @@ def _repair_or_drop_phase2_rows(df: pd.DataFrame, planning_state: Dict[str, obje
             "purpose": purpose,
             "reason": "destinationに説明文/ワンポイント混入の疑い"
         })
+        _phase2_add_quality_correction("guard_drop", f"destination不正のため行を除外: {original}", row.to_dict(), severity="error")
     if dropped_notes:
         for note in dropped_notes[:5]:
             log_event("Phase2防御", f"崩壊疑い行を除外: {note}", level="warning")
@@ -4510,7 +4631,12 @@ def _coerce_phase2_records_to_df(records: List[Dict[str, object]], planning_stat
         destination = _clean_phase2_destination(safe_text(rec.get("destination"), ""), purpose, genre)
         if not destination or destination == "-":
             log_event("Phase2防御", f"destination不正のため行をスキップ: {rec}", level="warning")
+            _phase2_add_quality_correction("guard_drop", f"destination不正のため行をスキップ: {safe_text(rec.get('destination'), '')}", rec, severity="error")
             continue
+
+        # v6.2.46: 具体ホテル名ではない宿泊先は、仮候補であることをデータに明示する。
+        destination, hotel_note = _complement_generic_hotel_label(destination, purpose, genre, planning_state, day)
+
         start_time = safe_text(rec.get("start_time"), "")
         try:
             duration = int(float(safe_text(rec.get("duration_minutes"), "30")))
@@ -4537,7 +4663,7 @@ def _coerce_phase2_records_to_df(records: List[Dict[str, object]], planning_stat
             "duration_minutes": duration,
             "is_transport": False,
             "transport_mode": "-",
-            "one_point": safe_text(rec.get("one_point"), ""),
+            "one_point": (safe_text(rec.get("one_point"), "") + (f" / {hotel_note}" if hotel_note else "")).strip(" /"),
             "address": "",
             "route_from": "",
             "route_to": "",
@@ -4728,13 +4854,20 @@ def _drop_phase2_records_by_validator(records: List[Dict[str, object]], validati
     for idx, rec in enumerate(records):
         if idx in invalid_indexes:
             log_event("Phase2検証LLM", f"検証LLM判定により行を除外: index={idx} / destination={safe_text(rec.get('destination'), '')}", level="warning")
+            _phase2_add_quality_correction(
+                "validator_drop",
+                f"検証LLM判定により不正疑い行を除外: index={idx} / destination={safe_text(rec.get('destination'), '')}",
+                rec,
+                severity="warning",
+            )
             continue
         kept.append(rec)
     return kept
 
 
 def structure_trip_plan_spot_only_with_gemini(trip_plan_text: str, planning_state: Dict[str, object]) -> pd.DataFrame:
-    # --- 修正箇所 v6.2.45: JSON構造化 + 検証LLM + コード防御ガード ---
+    # --- 修正箇所 v6.2.46: JSON構造化 + 検証LLM + コード防御 + 補正可視化 ---
+    _phase2_reset_quality_corrections()
     prompt = _build_phase2_spot_only_json_prompt(trip_plan_text, planning_state)
     log_event("Phase2構造化", "スポット専用JSONプロンプトで構造化を開始", level="info")
     generator = Phase1Generator(logger=log_event)
