@@ -26,115 +26,24 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.45-simple-mobile-compact-actions
-# 【制作日】2026-04-24
+# 【バージョン名】VoyageFlow v6.2.46-final-simple-list-walk-ready
+# 【制作日】2026-04-26
 # 【前バージョンからの修正内容】
-# - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
-# - A案: 移動時間 + 手段だけをGeminiで推定
-# - B案: 経路詳細もGeminiで推定# =========================================================
-# VoyageFlow v6.2.46-final-simple-list-walk-ready
+# - v6.2.39を正本として、既存の旅程生成・完成旅程・実行シミュレーションを維持
+# - 完成旅程に簡易一覧ページ（疑似画面遷移）を追加
+# - 簡易一覧の移動表示ルールを確定
+#   ・スポット: 名称のみ
+#   ・電車: 「電車：駅→駅」
+#   ・タクシー/徒歩/バス/その他: 手段のみ
+# - 簡易一覧をスマホ向けにコンパクト化
+#   ・目的列/最新情報列を削除
+#   ・操作列をアイコン表示（🗺️/🚕/🏨）へ短縮
+# - 簡易一覧だけに徒歩候補表示を追加（旅程本体・Phase2/Phase3は変更しない）
+# - Google Maps / Uber / ホテル予約検索の外部導線は維持
+# - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
 # =========================================================
-
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
 APP_VERSION_NAME = "v6.2.46-final-simple-list-walk-ready"
-APP_UPDATED_DATE = "2026-04-26"
-
-
-def is_walk_candidate(prev_row, next_row):
-    if prev_row is None or next_row is None:
-        return False
-
-    prev_dest = str(prev_row.get("destination", "")).strip()
-    next_dest = str(next_row.get("destination", "")).strip()
-
-    if not prev_dest or not next_dest:
-        return False
-
-    short_prev = prev_dest[:3]
-    short_next = next_dest[:3]
-
-    if short_prev == short_next:
-        return True
-
-    walk_keywords = ["銀座", "浅草", "渋谷", "新宿", "上野", "原宿"]
-    if any(k in prev_dest and k in next_dest for k in walk_keywords):
-        return True
-
-    return False
-
-
-def build_simple_itinerary_rows(df):
-    rows = []
-    prev_spot = None
-
-    for _, row in df.iterrows():
-        is_transport = row.get("type") == "transport"
-        is_hotel = row.get("type") == "hotel"
-
-        start = row.get("start_time", "")
-        end = row.get("end_time", "")
-
-        if is_transport:
-            mode = str(row.get("transport_mode", "")).strip()
-
-            if is_walk_candidate(prev_spot, row):
-                content = "徒歩候補"
-            else:
-                if "電車" in mode:
-                    from_station = str(row.get("route_from", "")).strip()
-                    to_station = str(row.get("route_to", "")).strip()
-                    if from_station and to_station:
-                        content = f"電車：{from_station}→{to_station}"
-                    else:
-                        content = "電車"
-                else:
-                    if "タクシー" in mode:
-                        content = "タクシー"
-                    elif "徒歩" in mode:
-                        content = "徒歩"
-                    elif "バス" in mode:
-                        content = "バス"
-                    else:
-                        content = mode if mode else "移動"
-
-            rows.append({
-                "開始": start,
-                "終了": end,
-                "種別": "移動",
-                "内容": content
-            })
-            continue
-
-        if is_hotel:
-            name = row.get("destination", "")
-            rows.append({
-                "開始": start,
-                "終了": end,
-                "種別": "ホテル",
-                "内容": name
-            })
-            continue
-
-        destination = row.get("destination", "")
-        rows.append({
-            "開始": start,
-            "終了": end,
-            "種別": "スポット",
-            "内容": destination
-        })
-
-        prev_spot = row
-
-    return rows
-
-# - 既存の旅程生成・完成旅程・実行シミュレーションには未接続の診断専用実装
-# - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
-# - 完成旅程に簡易一覧表示（リンク付き・スポット/移動色分け）を追加
-# - 簡易一覧をタブ内追加表示ではなく疑似画面遷移ページとして表示
-# - v6.2.40: スポットカード下部に「🔎 最新情報」公式確認リンクを安全に追加
-# =========================================================
-APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.40-spot-latest-info-links"
 APP_UPDATED_DATE = "2026-04-26"
 
 
