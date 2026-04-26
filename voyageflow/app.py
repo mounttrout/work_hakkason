@@ -26,7 +26,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.43-simple-itinerary-clean-links
+# 【バージョン名】VoyageFlow v6.2.44-simple-transport-display-rule
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
 # - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
@@ -4382,6 +4382,7 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
 # 修正箇所: 完成旅程の簡易一覧表示
 # - 既存カード表示は残し、表示モードとして追加するだけ
 # - スポット/移動/ホテルを色分けし、Google Maps / Uber / ホテル予約リンクだけを残す\n# - v6.2.43: 内容列の重複表示を解消し、スポット名リンクはMapsではなく公式情報リンクを優先
+# - v6.2.44: 簡易一覧の移動表示ルールを確定反映（電車のみ駅間表示、その他は手段のみ）
 # =========================================================
 def _simple_row_html_class(row_dict: Dict[str, object], is_transport: bool) -> str:
     status = safe_text(row_dict.get("execution_status"), "").lower()
@@ -4414,10 +4415,28 @@ def _simple_transport_origin_destination(row_dict: Dict[str, object]) -> tuple[s
 
 
 def _simple_transport_mode_label(row_dict: Dict[str, object]) -> str:
-    display = build_transport_display_safe(row_dict)
-    if display and display != "-":
-        return display
+    # --- 修正箇所(v6.2.44): 簡易一覧では route_from→route_to を混ぜず、手段名だけ返す ---
     mode = safe_text(row_dict.get("transport_mode"), "")
+    destination_text = safe_text(row_dict.get("destination"), "")
+    one_point = safe_text(row_dict.get("one_point"), "")
+    display = safe_text(build_transport_display_safe(row_dict), "")
+    combined = " ".join([mode, destination_text, one_point, display]).lower()
+
+    if any(token in combined for token in ["taxi", "タクシー"]):
+        return "タクシー"
+    if any(token in combined for token in ["walk", "walking", "徒歩"]):
+        return "徒歩"
+    if any(token in combined for token in ["bus", "バス"]):
+        return "バス"
+    if any(token in combined for token in ["train", "transit", "rail", "電車", "列車", "新幹線"]):
+        return "電車"
+    if any(token in combined for token in ["air", "flight", "飛行機", "航空", "フライト"]):
+        return "飛行機"
+    if any(token in combined for token in ["ship", "ferry", "船", "フェリー"]):
+        return "船"
+    if any(token in combined for token in ["car", "車", "レンタカー", "自家用車"]):
+        return "車"
+
     mode_map = {
         "walk": "徒歩",
         "walking": "徒歩",
@@ -4432,6 +4451,37 @@ def _simple_transport_mode_label(row_dict: Dict[str, object]) -> str:
         "ship": "船",
     }
     return mode_map.get(mode.lower(), mode or "移動")
+
+
+def _simple_extract_station_name(value: str) -> str:
+    # --- 修正箇所(v6.2.44): 電車表示用に文字列から「〇〇駅」だけを抽出する ---
+    text = safe_text(value, "")
+    if not text or text == "-":
+        return ""
+    text = re.sub(r"[（(].*?[）)]", "", text).strip()
+    candidates = re.findall(r"[一-龥ぁ-んァ-ヶA-Za-z0-9ー・･\s]+?駅", text)
+    if candidates:
+        cleaned = [re.sub(r"\s+", "", c).strip(" ・･、,/") for c in candidates if c.strip()]
+        if cleaned:
+            return cleaned[-1]
+    return text if text.endswith("駅") else ""
+
+
+def _simple_transport_content_label(row_dict: Dict[str, object], origin: str, destination: str, mode_label: str) -> str:
+    # --- 修正箇所(v6.2.44): 簡易一覧の移動表示ルールを確定 ---
+    # ルール:
+    # - 電車のみ「電車：最寄り駅→最寄り駅」
+    # - タクシー/徒歩/バス/その他は手段のみ
+    # - 前後スポット名は内容列に出さない
+    if mode_label == "電車":
+        from_station = _simple_extract_station_name(origin)
+        to_station = _simple_extract_station_name(destination)
+        if from_station and to_station:
+            return f"電車：{from_station}→{to_station}"
+        if from_station or to_station:
+            return f"電車：{from_station or '最寄り駅'}→{to_station or '最寄り駅'}"
+        return "電車：最寄り駅→最寄り駅"
+    return mode_label or "移動"
 
 
 def _build_hotel_booking_search_url(hotel_name: str, visit_date: str = "") -> str:
@@ -4527,10 +4577,11 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             if transport_mode == "taxi" or "タクシー" in mode_label:
                 actions.append(_simple_action_link("🚕 Uber", build_uber_ride_url(origin, destination)))
 
-            # 内容列は「移動手段：出発地→到着地」の1行だけにして、重複表示を避ける。
-            content_html = (
-                f"<div class='vf-simple-main'>{html.escape(mode_label)}：{html.escape(origin)} → {html.escape(destination)}</div>"
-            )
+            # 内容列は確定ルールで表示する。
+            # - 電車のみ「電車：最寄り駅→最寄り駅」
+            # - タクシー/徒歩/バス/その他は手段のみ
+            content_label = _simple_transport_content_label(row_dict, origin, destination, mode_label)
+            content_html = f"<div class='vf-simple-main'>{html.escape(content_label)}</div>"
             purpose_html = "移動"
             latest_html = ""
             type_html = "<span class='vf-simple-chip'>移動</span>"
