@@ -26,7 +26,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.44-simple-transport-display-rule
+# 【バージョン名】VoyageFlow v6.2.45-simple-mobile-compact-actions
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
 # - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
@@ -109,11 +109,12 @@ st.markdown(
     .vf-simple-main { font-weight: 800; }
     .vf-simple-sub { font-size: 12px; opacity: 0.82; margin-top: 2px; }
     .vf-simple-chip { display: inline-block; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.72); border: 1px solid rgba(0,0,0,0.08); font-size: 12px; font-weight: 700; white-space: nowrap; }
-    .vf-simple-action { display: flex; flex-wrap: wrap; gap: 6px; }
+    .vf-simple-action { display: flex; flex-wrap: nowrap; gap: 5px; align-items: center; }
     .vf-simple-btn {
-        display: inline-block; padding: 6px 9px; border-radius: 8px; text-decoration: none !important;
-        background: rgba(255,255,255,0.85); border: 1px solid rgba(0,0,0,0.16); color: inherit !important;
-        font-size: 12px; font-weight: 700; white-space: nowrap;
+        display: inline-flex; align-items: center; justify-content: center; min-width: 30px; height: 30px;
+        padding: 0 7px; border-radius: 9px; text-decoration: none !important;
+        background: rgba(255,255,255,0.88); border: 1px solid rgba(0,0,0,0.16); color: inherit !important;
+        font-size: 14px; font-weight: 800; white-space: nowrap;
     }
     .vf-simple-btn:hover { background: #ffffff; border-color: rgba(0,0,0,0.28); }
 
@@ -124,6 +125,12 @@ st.markdown(
         h1 { font-size: 2.1rem !important; }
         h2 { font-size: 1.8rem !important; }
         h3 { font-size: 1.4rem !important; }
+        .vf-simple-table { font-size: 12px; min-width: 620px; }
+        .vf-simple-table th { padding: 6px 7px; }
+        .vf-simple-table td { padding: 8px 7px; }
+        .vf-simple-chip { font-size: 11px; padding: 2px 7px; }
+        .vf-simple-main { font-size: 12px; }
+        .vf-simple-btn { min-width: 28px; height: 28px; padding: 0 6px; font-size: 13px; }
     }
 </style>
 """,
@@ -4383,6 +4390,8 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
 # - 既存カード表示は残し、表示モードとして追加するだけ
 # - スポット/移動/ホテルを色分けし、Google Maps / Uber / ホテル予約リンクだけを残す\n# - v6.2.43: 内容列の重複表示を解消し、スポット名リンクはMapsではなく公式情報リンクを優先
 # - v6.2.44: 簡易一覧の移動表示ルールを確定反映（電車のみ駅間表示、その他は手段のみ）
+# - v6.2.45: 簡易一覧をスマホ向けに圧縮（目的/最新情報列削除、操作アイコン短縮）
+# - v6.2.46: 徒歩自動判定（表示のみ）を追加。近接スポットは「徒歩候補」として表示し、旅程本体は変更しない
 # =========================================================
 def _simple_row_html_class(row_dict: Dict[str, object], is_transport: bool) -> str:
     status = safe_text(row_dict.get("execution_status"), "").lower()
@@ -4467,12 +4476,93 @@ def _simple_extract_station_name(value: str) -> str:
     return text if text.endswith("駅") else ""
 
 
+def _simple_infer_walk_area_tokens(value: str) -> set[str]:
+    # --- 修正箇所(v6.2.46): 簡易一覧だけで使う徒歩候補判定用のエリア推定 ---
+    # 旅程データは変更しない。あくまで表示の「徒歩候補」判定に限定する。
+    text = safe_text(value, "")
+    if not text or text == "-":
+        return set()
+
+    explicit_tokens = [
+        "銀座", "東銀座", "有楽町", "日比谷", "丸の内", "東京駅", "新橋",
+        "上野", "御徒町", "浅草", "押上", "渋谷", "原宿", "表参道",
+        "新宿", "初台", "六本木", "赤坂", "青山", "豊洲", "お台場",
+        "名古屋", "名駅", "栄", "大須", "熱田", "金山",
+    ]
+    tokens = {token for token in explicit_tokens if token in text}
+
+    alias_map = {
+        "歌舞伎座": {"銀座", "東銀座"},
+        "GINZA SIX": {"銀座"},
+        "ギンザシックス": {"銀座"},
+        "銀座木村家": {"銀座"},
+        "三井ガーデンホテル銀座プレミア": {"銀座", "新橋"},
+        "シアタークリエ": {"日比谷", "有楽町"},
+        "帝国ホテル": {"日比谷", "有楽町"},
+        "東京宝塚劇場": {"日比谷", "有楽町"},
+        "上野アメ横商店街": {"上野", "御徒町"},
+        "アメ横": {"上野", "御徒町"},
+        "浅草寺": {"浅草"},
+        "雷門": {"浅草"},
+        "渋谷スクランブルスクエア": {"渋谷"},
+        "SHIBUYA SKY": {"渋谷"},
+        "新国立劇場": {"初台", "新宿"},
+        "名古屋城": {"名古屋"},
+        "大須商店街": {"大須"},
+        "オアシス21": {"栄"},
+    }
+    for key, values in alias_map.items():
+        if key in text:
+            tokens.update(values)
+    return tokens
+
+
+def _simple_should_show_walk_candidate(row_dict: Dict[str, object], origin: str, destination: str, mode_label: str) -> bool:
+    # --- 修正箇所(v6.2.46): 徒歩自動判定（表示のみ） ---
+    # Google Maps APIなしでの安全な簡易判定。確定移動手段は書き換えず、簡易一覧だけ「徒歩候補」と表示する。
+    if mode_label in {"徒歩", "飛行機", "船", "新幹線"}:
+        return False
+
+    origin_text = safe_text(origin, "")
+    destination_text = safe_text(destination, "")
+    combined = f"{origin_text} {destination_text} {safe_text(row_dict.get('destination'), '')} {safe_text(row_dict.get('one_point'), '')}"
+
+    # 大移動・駅間移動は徒歩候補にしない
+    long_distance_tokens = ["福井", "金沢", "京都", "大阪", "名古屋", "新幹線", "空港", "フライト", "航空"]
+    if any(token in combined for token in long_distance_tokens) and not any(token in combined for token in ["栄", "大須", "名駅"]):
+        return False
+
+    origin_station = _simple_extract_station_name(origin_text)
+    dest_station = _simple_extract_station_name(destination_text)
+    if origin_station and dest_station and origin_station != dest_station:
+        # すでに駅間として成立している電車表示は維持
+        return False
+
+    origin_areas = _simple_infer_walk_area_tokens(origin_text)
+    dest_areas = _simple_infer_walk_area_tokens(destination_text)
+    if origin_areas and dest_areas and (origin_areas & dest_areas):
+        return True
+
+    # 終了・開始の差が短い近接移動は候補扱い。ただし駅名が絡む長距離は上で除外済み。
+    start_min = _time_to_minutes(safe_text(row_dict.get("start_time"), ""))
+    end_min = _time_to_minutes(safe_text(row_dict.get("end_time"), ""))
+    if start_min is not None and end_min is not None:
+        duration = end_min - start_min
+        if 1 <= duration <= 12 and mode_label in {"タクシー", "車", "バス", "移動"}:
+            return True
+
+    return False
+
+
 def _simple_transport_content_label(row_dict: Dict[str, object], origin: str, destination: str, mode_label: str) -> str:
-    # --- 修正箇所(v6.2.44): 簡易一覧の移動表示ルールを確定 ---
+    # --- 修正箇所(v6.2.44/v6.2.46): 簡易一覧の移動表示ルールを確定 ---
     # ルール:
+    # - 徒歩候補に該当する近接移動は「徒歩候補」と表示（旅程本体は変更しない）
     # - 電車のみ「電車：最寄り駅→最寄り駅」
     # - タクシー/徒歩/バス/その他は手段のみ
     # - 前後スポット名は内容列に出さない
+    if _simple_should_show_walk_candidate(row_dict, origin, destination, mode_label):
+        return "徒歩候補"
     if mode_label == "電車":
         from_station = _simple_extract_station_name(origin)
         to_station = _simple_extract_station_name(destination)
@@ -4555,7 +4645,7 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             current_day = day_int
             rows_html.append(
                 "<tr class='vf-simple-day-row'>"
-                f"<td colspan='7' style='background:#f8fafc;color:#344054;border:1px solid #e4e7ec;border-radius:10px;font-weight:800;'>Day {day_int} - {html.escape(date_text)}</td>"
+                f"<td colspan='5' style='background:#f8fafc;color:#344054;border:1px solid #e4e7ec;border-radius:10px;font-weight:800;'>Day {day_int} - {html.escape(date_text)}</td>"
                 "</tr>"
             )
 
@@ -4571,16 +4661,16 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             route_url = safe_text(row_dict.get("route_url"), "")
             if not route_url or route_url == "-":
                 route_url = build_google_maps_dir_url(origin, destination, transport_mode or "transit")
-            actions = [
-                _simple_action_link("🗺️ Maps", route_url),
-            ]
-            if transport_mode == "taxi" or "タクシー" in mode_label:
-                actions.append(_simple_action_link("🚕 Uber", build_uber_ride_url(origin, destination)))
-
             # 内容列は確定ルールで表示する。
+            # - 徒歩候補に該当する近接移動は「徒歩候補」
             # - 電車のみ「電車：最寄り駅→最寄り駅」
             # - タクシー/徒歩/バス/その他は手段のみ
             content_label = _simple_transport_content_label(row_dict, origin, destination, mode_label)
+            actions = [
+                _simple_action_link("🗺️", route_url),
+            ]
+            if content_label != "徒歩候補" and (transport_mode == "taxi" or "タクシー" in mode_label):
+                actions.append(_simple_action_link("🚕", build_uber_ride_url(origin, destination)))
             content_html = f"<div class='vf-simple-main'>{html.escape(content_label)}</div>"
             purpose_html = "移動"
             latest_html = ""
@@ -4592,9 +4682,9 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             is_hotel = _is_hotel_like_name(destination_name) or _is_valid_hotel_row(row_dict)
             purpose = format_purpose(row_dict.get("purpose"))
             latest = "ホテル予約確認" if is_hotel else _simple_latest_info_headline(destination_name, date_text)
-            actions = [_simple_action_link("🗺️ Maps", place_url)]
+            actions = [_simple_action_link("🗺️", place_url)]
             if is_hotel:
-                actions.append(_simple_action_link("🏨 予約", _build_hotel_booking_search_url(destination_name, date_text)))
+                actions.append(_simple_action_link("🏨", _build_hotel_booking_search_url(destination_name, date_text)))
 
             # スポット名リンクはMapsではなく公式情報/公式検索を優先。Mapsはアクション列だけに残す。
             spot_info_url = "" if is_hotel else _simple_spot_info_url(destination_name, date_text)
@@ -4615,8 +4705,6 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             f"<td>{end_time}</td>"
             f"<td>{type_html}</td>"
             f"<td>{content_html}</td>"
-            f"<td>{purpose_html}</td>"
-            f"<td>{latest_html}</td>"
             f"<td>{action_html}</td>"
             "</tr>"
         )
@@ -4630,9 +4718,7 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
       <th>終了</th>
       <th>種別</th>
       <th>内容</th>
-      <th>目的</th>
-      <th>最新情報 / 移動</th>
-      <th>アクション</th>
+      <th>操作</th>
     </tr>
   </thead>
   <tbody>
@@ -4648,7 +4734,7 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
 def render_simple_itinerary_page() -> None:
     # --- 修正箇所: 簡易一覧を完成旅程タブ内の追加表示ではなく、疑似画面遷移ページとして表示 ---
     st.title("📋 簡易旅程一覧")
-    st.caption("カード表示より情報量と操作ボタンを減らし、旅程全体を一括で確認する画面です。スポットは青、移動は黄、ホテルは緑で表示します。")
+    st.caption("スマホでも見やすいよう、目的・最新情報列を省いた簡易ビューです。近接移動は表示上だけ『徒歩候補』として出します。")
 
     top_left, top_right = st.columns([1, 2])
     with top_left:
