@@ -26,17 +26,17 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.50-condition-trace-logger
+# 【バージョン名】VoyageFlow v6.2.51-phase2-transport-misclassification-logger
 # 【制作日】2026-04-26
 # 【前バージョンからの修正内容】
-# - Phase1→Phase2で destination / trip_days がどこで消えるか追跡する条件トレースログを追加
-# - ユーザー入力直後、条件抽出後、Phase1生成直前、Phase2構造化直前の planning_state をログ化
-# - 英語地名らしき入力（例: tokyo / osaka 等）を検知してログに残す
-# - 今回は自動補正しない。変数追跡と原因特定のみ
-# - 既存の旅程生成・完成旅程・実行シミュレーション本体は変更しない
+# - v6.2.50 の条件トレースログを維持
+# - Phase2構造化後に「駅発＋長時間移動」がスポット扱いになっていないか検査ログを追加
+# - 福井駅→東京駅などの大移動が Phase2 で station/activity 行に誤分類される原因を追跡
+# - 今回は自動補正しない。Phase2 / Phase3 / 完成旅程本体は非破壊
+# - 既存UI・実行シミュレーション・簡易一覧の挙動は変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.50-condition-trace-logger"
+APP_VERSION_NAME = "v6.2.51-phase2-transport-misclassification-logger"
 APP_UPDATED_DATE = "2026-04-26"
 
 
@@ -4080,6 +4080,9 @@ def approve_and_build_phase2_phase3() -> None:
 
     df2 = normalize_phase2_dataframe(df2, s)
 
+    # --- 修正箇所: v6.2.51 Phase2移動誤分類検査ログ（非破壊） ---
+    log_phase2_transport_misclassification(df2)
+
     # --- 修正箇所: Phase3 は destination の意味を増やさず、構造化データの順番だけで移動カードを生成 ---
     log_event("Phase3", f"順番ベースの移動カード生成を開始。transport_style={s['transport_style']}")
     df3 = build_phase3_from_sequential_destinations(df2, s)
@@ -4191,6 +4194,65 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
         df = df.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
         df["sequence"] = df.groupby("day").cumcount() + 1
     return df.reset_index(drop=True)
+
+def log_phase2_transport_misclassification(df2: pd.DataFrame) -> None:
+    """
+    Phase2で「駅発＋長距離移動」がスポット扱いになっていないか検査する。
+    非破壊（ログのみ）。Phase2/Phase3のデータは一切書き換えない。
+    """
+    if df2 is None or df2.empty:
+        log_event("Phase2移動誤分類検査", "検査対象のPhase2データが空です。", level="warning")
+        return
+
+    detected_count = 0
+    transport_words = [
+        "移動", "新幹線", "電車", "列車", "特急", "かがやき", "はくたか",
+        "サンダーバード", "向かう", "向かいます", "到着", "発", "着"
+    ]
+
+    log_event("Phase2移動誤分類検査", f"START rows={len(df2)}", level="info")
+
+    for _, row in df2.reset_index(drop=True).iterrows():
+        day = safe_text(row.get("day"), "")
+        seq = safe_text(row.get("sequence"), "")
+        dest = safe_text(row.get("destination"), "")
+        purpose = safe_text(row.get("purpose"), "")
+        genre = safe_text(row.get("genre"), "")
+        start = safe_text(row.get("start_time"), "")
+        end = safe_text(row.get("end_time"), "")
+        one_point = safe_text(row.get("one_point"), "")
+
+        start_min = _time_to_minutes(start)
+        end_min = _time_to_minutes(end)
+        duration = None
+        if start_min is not None and end_min is not None:
+            duration = end_min - start_min
+            if duration < 0:
+                duration += 24 * 60
+
+        context = f"{dest} {purpose} {genre} {one_point}"
+        is_station_like = ("駅" in dest) or ("station" in genre.lower())
+        has_transport_word = any(word in context for word in transport_words)
+        long_duration = duration is not None and duration >= 90
+        already_transport = bool(row.get("is_transport", False)) or safe_text(row.get("purpose"), "").lower() == "transport"
+
+        if is_station_like and has_transport_word and long_duration and not already_transport:
+            detected_count += 1
+            log_event(
+                "Phase2移動誤分類検査",
+                (
+                    f"検出: Day{day} seq{seq} {dest} {start}-{end} / "
+                    f"duration={duration}分 / purpose={purpose} / genre={genre} / "
+                    f"one_point={one_point}"
+                ),
+                level="warning",
+            )
+
+    if detected_count == 0:
+        log_event("Phase2移動誤分類検査", "誤分類候補は検出されませんでした。", level="info")
+    else:
+        log_event("Phase2移動誤分類検査", f"END detected={detected_count}", level="warning")
+
 
 
 def insert_hotel_row(df: pd.DataFrame) -> None:
