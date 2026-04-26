@@ -26,17 +26,17 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.51-phase2-transport-misclassification-logger
+# 【バージョン名】VoyageFlow v6.2.52-experimental-phase3-double-transport-guard
 # 【制作日】2026-04-26
 # 【前バージョンからの修正内容】
-# - v6.2.50 の条件トレースログを維持
-# - Phase2構造化後に「駅発＋長時間移動」がスポット扱いになっていないか検査ログを追加
-# - 福井駅→東京駅などの大移動が Phase2 で station/activity 行に誤分類される原因を追跡
-# - 今回は自動補正しない。Phase2 / Phase3 / 完成旅程本体は非破壊
-# - 既存UI・実行シミュレーション・簡易一覧の挙動は変更しない
+# - v6.2.51 を退避用完成形として維持し、この版は実験版として作成
+# - Phase2移動誤分類検査ログを維持
+# - Phase3で「Phase2行自体が長距離移動を含んでいる」と判断できる場合、二重移動カード生成をスキップ
+# - 福井駅→東京駅などで、駅発の長時間移動ブロックに対して重複transportを追加しないガードを追加
+# - Phase2データ自体は書き換えない。完成旅程の二重移動防止のみ
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.51-phase2-transport-misclassification-logger"
+APP_VERSION_NAME = "v6.2.52-experimental-phase3-double-transport-guard"
 APP_UPDATED_DATE = "2026-04-26"
 
 
@@ -3919,6 +3919,53 @@ def _fallback_transport_estimate_from_sequence(
     return {"minutes": minutes, "mode": mode, "label": label, "source": source, "note": note}
 
 
+
+def _looks_like_phase2_embedded_transport_row(current: pd.Series | Dict, actual_next: pd.Series | Dict, min_minutes: int = 60) -> bool:
+    """
+    Phase2の1行が「スポット滞在」ではなく、実質的に次地点への移動時間を含んでいるかを判定する。
+    非破壊ガード用。Trueの場合、Phase3では追加transportを生成しない。
+    """
+    if current is None or actual_next is None:
+        return False
+
+    current_dest = safe_text(_row_value(current, "destination", ""), "")
+    next_dest = safe_text(_row_value(actual_next, "destination", ""), "")
+    if not current_dest or not next_dest:
+        return False
+    if _same_effective_place(current_dest, next_dest):
+        return False
+
+    purpose = safe_text(_row_value(current, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(current, "genre", ""), "").lower()
+    one_point = safe_text(_row_value(current, "one_point", ""), "")
+    start_time = safe_text(_row_value(current, "start_time", ""), "")
+    end_time = safe_text(_row_value(current, "end_time", ""), "")
+    next_start = safe_text(_row_value(actual_next, "start_time", ""), "")
+
+    start_min = _time_to_minutes(start_time)
+    end_min = _time_to_minutes(end_time)
+    duration = None
+    if start_min is not None and end_min is not None:
+        duration = end_min - start_min
+        if duration < 0:
+            duration += 24 * 60
+
+    if duration is None or duration < min_minutes:
+        return False
+
+    gap_to_next = _minutes_between_clock(end_time, next_start) if end_time and next_start else None
+    touches_next = gap_to_next is not None and 0 <= gap_to_next <= 10
+
+    context = f"{current_dest} {purpose} {genre} {one_point}"
+    transport_tokens = [
+        "移動", "新幹線", "電車", "列車", "特急", "かがやき", "はくたか",
+        "サンダーバード", "向かう", "向かいます", "出発", "到着", "発", "着"
+    ]
+    has_transport_context = any(token in context for token in transport_tokens)
+    station_like = ("駅" in current_dest) or ("station" in genre)
+
+    return bool(station_like and has_transport_context and touches_next)
+
 def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
     # --- 修正箇所: train / transport 行は独立スポットにせず、前後スポットを橋渡しする移動ヒントとして扱う ---
     if df2 is None or df2.empty:
@@ -3978,6 +4025,23 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
 
         if _same_effective_place(origin_name, destination_name):
             log_event("Phase3", f"同一地点移動をスキップ: {origin_name} → {destination_name}", level="info")
+            continue
+
+        # --- 修正箇所: v6.2.52 Phase3二重移動防止ガード ---
+        # Phase2が「福井駅 09:00-12:00 / 北陸新幹線で東京へ移動」のように、
+        # 1つのスポット行へ長距離移動を含めてしまった場合、ここでさらに
+        # 福井駅→東京駅のtransportを追加すると二重移動になるため、生成を抑止する。
+        if _looks_like_phase2_embedded_transport_row(current, actual_next):
+            log_event(
+                "Phase3二重移動防止",
+                (
+                    f"Phase2行が移動時間を内包している可能性があるためtransport生成をスキップ: "
+                    f"Day{safe_text(current.get('day'), '')} "
+                    f"{origin_name} {safe_text(current.get('start_time'), '')}-{safe_text(current.get('end_time'), '')} "
+                    f"→ {destination_name} {safe_text(actual_next.get('start_time'), '')}"
+                ),
+                level="warning",
+            )
             continue
 
         departure_time = safe_text(current.get("end_time"), safe_text(current.get("start_time"), planning_state.get("departure_time", "09:00")))
