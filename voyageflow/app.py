@@ -26,7 +26,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.39-gemini-transport-ab-test-sidebar
+# 【バージョン名】VoyageFlow v6.2.42-simple-itinerary-page
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
 # - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
@@ -34,6 +34,8 @@ from maps.routes_api import RoutesAPI
 # - B案: 経路詳細もGeminiで推定
 # - 既存の旅程生成・完成旅程・実行シミュレーションには未接続の診断専用実装
 # - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
+# - 完成旅程に簡易一覧表示（リンク付き・スポット/移動色分け）を追加
+# - 簡易一覧をタブ内追加表示ではなく疑似画面遷移ページとして表示
 # - v6.2.40: スポットカード下部に「🔎 最新情報」公式確認リンクを安全に追加
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
@@ -90,6 +92,31 @@ st.markdown(
     [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input {
         color: inherit !important; -webkit-text-fill-color: currentColor !important;
     }
+
+    .vf-simple-table-wrap { margin-top: 10px; margin-bottom: 16px; overflow-x: auto; }
+    .vf-simple-table { width: 100%; border-collapse: separate; border-spacing: 0 7px; font-size: 14px; }
+    .vf-simple-table th {
+        text-align: left; padding: 8px 10px; color: #344054; background: #f2f4f7;
+        border-top: 1px solid #e4e7ec; border-bottom: 1px solid #e4e7ec; white-space: nowrap;
+    }
+    .vf-simple-table td { padding: 10px; vertical-align: top; border-top: 1px solid; border-bottom: 1px solid; }
+    .vf-simple-table td:first-child, .vf-simple-table th:first-child { border-left: 1px solid; border-radius: 10px 0 0 10px; }
+    .vf-simple-table td:last-child, .vf-simple-table th:last-child { border-right: 1px solid; border-radius: 0 10px 10px 0; }
+    .vf-simple-row-spot td { background: #eef6ff; border-color: #c8ddf3; color: #17324d; }
+    .vf-simple-row-transport td { background: #fff7e8; border-color: #f0d39a; color: #4a3310; }
+    .vf-simple-row-hotel td { background: #f1f8ee; border-color: #cde6c5; color: #1f3c1b; }
+    .vf-simple-row-cancelled td { background: #eeeeee; border-color: #d0d5dd; color: #667085; text-decoration: line-through; }
+    .vf-simple-main { font-weight: 800; }
+    .vf-simple-sub { font-size: 12px; opacity: 0.82; margin-top: 2px; }
+    .vf-simple-chip { display: inline-block; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.72); border: 1px solid rgba(0,0,0,0.08); font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .vf-simple-action { display: flex; flex-wrap: wrap; gap: 6px; }
+    .vf-simple-btn {
+        display: inline-block; padding: 6px 9px; border-radius: 8px; text-decoration: none !important;
+        background: rgba(255,255,255,0.85); border: 1px solid rgba(0,0,0,0.16); color: inherit !important;
+        font-size: 12px; font-weight: 700; white-space: nowrap;
+    }
+    .vf-simple-btn:hover { background: #ffffff; border-color: rgba(0,0,0,0.28); }
+
     @media (max-width: 768px) {
         .stTabs [data-baseweb="tab-list"] button { font-size: 13px; padding: 8px 10px; }
         .vf-chat-user, .vf-chat-ai, .vf-card, .vf-log-panel { padding: 12px; }
@@ -542,6 +569,7 @@ def init_session_state() -> None:
         "validation_time_overlap_candidates": [],
         "validation_source_plan_text": "",
         "validation_source_itinerary_text": "",
+        "simple_itinerary_page_mode": False,
     }
 
     for key, value in defaults.items():
@@ -4349,6 +4377,230 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
     st.link_button(label, url, use_container_width=True)
 
 
+
+# =========================================================
+# 修正箇所: 完成旅程の簡易一覧表示
+# - 既存カード表示は残し、表示モードとして追加するだけ
+# - スポット/移動/ホテルを色分けし、Google Maps / Uber / ホテル予約リンクだけを残す
+# =========================================================
+def _simple_row_html_class(row_dict: Dict[str, object], is_transport: bool) -> str:
+    status = safe_text(row_dict.get("execution_status"), "").lower()
+    if status == "cancelled":
+        return "vf-simple-row-cancelled"
+    if is_transport:
+        return "vf-simple-row-transport"
+    if _is_hotel_like_name(safe_text(row_dict.get("destination"), "")) or _is_valid_hotel_row(row_dict):
+        return "vf-simple-row-hotel"
+    return "vf-simple-row-spot"
+
+
+def _simple_transport_origin_destination(row_dict: Dict[str, object]) -> tuple[str, str]:
+    route_from = safe_text(row_dict.get("route_from"), "")
+    route_to = safe_text(row_dict.get("route_to"), "")
+    if route_from and route_to and route_from != "-" and route_to != "-":
+        return route_from, route_to
+
+    destination_text = safe_text(row_dict.get("destination"), "")
+    if "→" in destination_text:
+        left, right = [part.strip() for part in destination_text.split("→", 1)]
+        return safe_text(left, "現在地"), safe_text(right, destination_text)
+
+    one_point = safe_text(row_dict.get("one_point"), "")
+    if "→" in one_point:
+        left, right = [part.strip() for part in one_point.split("→", 1)]
+        return safe_text(left, "現在地"), safe_text(right, destination_text)
+
+    return "現在地", destination_text or "目的地"
+
+
+def _simple_transport_mode_label(row_dict: Dict[str, object]) -> str:
+    display = build_transport_display_safe(row_dict)
+    if display and display != "-":
+        return display
+    mode = safe_text(row_dict.get("transport_mode"), "")
+    mode_map = {
+        "walk": "徒歩",
+        "walking": "徒歩",
+        "train": "電車",
+        "transit": "公共交通",
+        "taxi": "タクシー",
+        "car": "車",
+        "private_car": "自家用車",
+        "rental_car": "レンタカー",
+        "bus": "バス",
+        "air": "飛行機",
+        "ship": "船",
+    }
+    return mode_map.get(mode.lower(), mode or "移動")
+
+
+def _build_hotel_booking_search_url(hotel_name: str, visit_date: str = "") -> str:
+    name = safe_text(hotel_name, "ホテル")
+    date_part = safe_text(visit_date, "")
+    query = f"{name} ホテル 予約"
+    if date_part and date_part != "-":
+        query += f" {date_part}"
+    return "https://www.google.com/search?q=" + urllib.parse.quote(query)
+
+
+def _simple_latest_info_headline(destination: str, visit_date: str = "") -> str:
+    name = safe_text(destination, "")
+    if not name or name == "-" or _is_hotel_like_name(name):
+        return ""
+    for key, info in SPOT_INFO_SOURCES.items():
+        if key in name:
+            return safe_text(info.get("label"), "公式情報あり")
+    category = _guess_spot_category(name)
+    if category == "museum":
+        return "展示・イベント確認"
+    if category == "theater":
+        return "公演・演目確認"
+    if category == "commercial_complex":
+        return "イベント確認"
+    if category == "park":
+        return "開園・見頃確認"
+    if category == "shrine_temple":
+        return "行事・拝観確認"
+    return "公式情報確認"
+
+
+def _simple_action_link(label: str, url: str) -> str:
+    clean_url = html.escape(safe_text(url, ""), quote=True)
+    clean_label = html.escape(safe_text(label, ""))
+    if not clean_url or clean_url == "-" or not clean_label:
+        return ""
+    return f'<a class="vf-simple-btn" href="{clean_url}" target="_blank" rel="noopener noreferrer">{clean_label}</a>'
+
+
+def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None:
+    if df is None or df.empty:
+        st.info("旅程データがありません。")
+        return
+
+    working = df.copy().reset_index(drop=True)
+    if "day" in working.columns and "sequence" in working.columns:
+        working = working.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+
+    rows_html: List[str] = []
+    current_day = None
+    for _, row in working.iterrows():
+        row_dict = row.to_dict()
+        day = row_dict.get("day")
+        day_int = int(day) if pd.notna(day) else 1
+        date_text = safe_text(row_dict.get("date"), "")
+        if current_day != day_int:
+            current_day = day_int
+            rows_html.append(
+                "<tr class='vf-simple-day-row'>"
+                f"<td colspan='7' style='background:#f8fafc;color:#344054;border:1px solid #e4e7ec;border-radius:10px;font-weight:800;'>Day {day_int} - {html.escape(date_text)}</td>"
+                "</tr>"
+            )
+
+        start_time = html.escape(safe_text(row_dict.get("start_time"), "-"))
+        end_time = html.escape(safe_text(row_dict.get("end_time"), "-"))
+        is_transport = bool(row_dict.get("is_transport", False))
+        row_class = _simple_row_html_class(row_dict, is_transport)
+
+        if is_transport:
+            origin, destination = _simple_transport_origin_destination(row_dict)
+            mode_label = _simple_transport_mode_label(row_dict)
+            transport_mode = safe_text(row_dict.get("transport_mode"), "").lower()
+            route_url = safe_text(row_dict.get("route_url"), "")
+            if not route_url or route_url == "-":
+                route_url = build_google_maps_dir_url(origin, destination, transport_mode or "transit")
+            actions = [
+                _simple_action_link("🗺️ Maps", route_url),
+            ]
+            if transport_mode == "taxi" or "タクシー" in mode_label:
+                actions.append(_simple_action_link("🚕 Uber", build_uber_ride_url(origin, destination)))
+
+            content_html = (
+                f"<div class='vf-simple-main'>{html.escape(mode_label)}</div>"
+                f"<div class='vf-simple-sub'>{html.escape(origin)} → {html.escape(destination)}</div>"
+            )
+            purpose_html = "移動"
+            latest_html = f"{html.escape(origin)} → {html.escape(destination)}"
+            type_html = "<span class='vf-simple-chip'>移動</span>"
+            action_html = "<div class='vf-simple-action'>" + "".join(actions) + "</div>"
+        else:
+            destination_name = safe_text(row_dict.get("destination"), "-")
+            place_url = build_google_maps_search_url(destination_name)
+            is_hotel = _is_hotel_like_name(destination_name) or _is_valid_hotel_row(row_dict)
+            purpose = format_purpose(row_dict.get("purpose"))
+            latest = "ホテル予約確認" if is_hotel else _simple_latest_info_headline(destination_name, date_text)
+            actions = [_simple_action_link("🗺️ Maps", place_url)]
+            if is_hotel:
+                actions.append(_simple_action_link("🏨 予約", _build_hotel_booking_search_url(destination_name, date_text)))
+
+            content_html = (
+                f"<div class='vf-simple-main'><a href='{html.escape(place_url, quote=True)}' target='_blank' rel='noopener noreferrer' style='color:inherit;text-decoration:underline;'>{html.escape(destination_name)}</a></div>"
+            )
+            purpose_html = html.escape(purpose)
+            latest_html = html.escape(latest)
+            type_html = "<span class='vf-simple-chip'>ホテル</span>" if is_hotel else "<span class='vf-simple-chip'>スポット</span>"
+            action_html = "<div class='vf-simple-action'>" + "".join(actions) + "</div>"
+
+        rows_html.append(
+            f"<tr class='{row_class}'>"
+            f"<td>{start_time}</td>"
+            f"<td>{end_time}</td>"
+            f"<td>{type_html}</td>"
+            f"<td>{content_html}</td>"
+            f"<td>{purpose_html}</td>"
+            f"<td>{latest_html}</td>"
+            f"<td>{action_html}</td>"
+            "</tr>"
+        )
+
+    table_html = """
+<div class="vf-simple-table-wrap">
+<table class="vf-simple-table">
+  <thead>
+    <tr>
+      <th>開始</th>
+      <th>終了</th>
+      <th>種別</th>
+      <th>内容</th>
+      <th>目的</th>
+      <th>最新情報 / 移動</th>
+      <th>アクション</th>
+    </tr>
+  </thead>
+  <tbody>
+""" + "\n".join(rows_html) + """
+  </tbody>
+</table>
+</div>
+"""
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+
+def render_simple_itinerary_page() -> None:
+    # --- 修正箇所: 簡易一覧を完成旅程タブ内の追加表示ではなく、疑似画面遷移ページとして表示 ---
+    st.title("📋 簡易旅程一覧")
+    st.caption("カード表示より情報量と操作ボタンを減らし、旅程全体を一括で確認する画面です。スポットは青、移動は黄、ホテルは緑で表示します。")
+
+    top_left, top_right = st.columns([1, 2])
+    with top_left:
+        if st.button("⬅ 完成旅程に戻る", use_container_width=True, key="back_to_final_itinerary_from_simple"):
+            st.session_state.simple_itinerary_page_mode = False
+            st.session_state.active_tab = "final_itinerary"
+            st.rerun()
+    with top_right:
+        st.info("表示専用の簡易ビューです。旅程の変更・削除は戻ってカード表示から行ってください。")
+
+    df = st.session_state.get("df_phase3")
+    if df is None or df.empty:
+        st.warning("簡易表示できる完成旅程がありません。")
+        return
+
+    render_simple_itinerary_table(
+        df.copy().reset_index(drop=True),
+        city_hint=safe_text(st.session_state.planning_state.get("primary_destination"), ""),
+    )
+
+
 def render_itinerary_cards(
     df: pd.DataFrame,
     current_step: int | None = None,
@@ -5104,6 +5356,16 @@ with st.sidebar:
         st.rerun()
 
 
+
+# =========================================================
+# 修正箇所: 簡易一覧ページへの疑似画面遷移
+# - Streamlitの別ウインドウではなく、session_stateで安全に全画面相当へ切り替える
+# - 既存タブや完成旅程カード表示は変更しない
+# =========================================================
+if st.session_state.get("simple_itinerary_page_mode", False):
+    render_simple_itinerary_page()
+    st.stop()
+
 # =========================================================
 # タブ
 # =========================================================
@@ -5426,6 +5688,16 @@ with tabs[2]:
         st.markdown("### 完成旅程タイムライン")
         render_google_calendar_sync_panel(df_phase3)
         render_phase35_validation_panel(st.session_state.trip_plan or "", df_phase3)
+
+        col_simple, col_note = st.columns([1, 2])
+        with col_simple:
+            if st.button("📋 簡易一覧で見る", use_container_width=True, key="open_simple_itinerary_page"):
+                st.session_state.simple_itinerary_page_mode = True
+                st.session_state.active_tab = "final_itinerary"
+                st.rerun()
+        with col_note:
+            st.caption("簡易一覧は別画面風に表示します。スポット・移動・ホテルを色分けし、Google Maps / Uber / ホテル予約だけを残します。")
+
         render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
         render_itinerary_cards(
             df_phase3,
