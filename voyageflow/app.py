@@ -26,21 +26,17 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.48-transport-research-agent-trial
-# 【制作日】2026-04-24
+# 【バージョン名】VoyageFlow v6.2.50-condition-trace-logger
+# 【制作日】2026-04-26
 # 【前バージョンからの修正内容】
-# - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
-# - A案: 移動時間 + 手段だけをGeminiで推定
-# - B案: 経路詳細もGeminiで推定
-# - 既存の旅程生成・完成旅程・実行シミュレーションには未接続の診断専用実装
-# - 既存のGoogle Directions診断・Routes診断・Uber導線・天候・ホテル・カレンダー機能は変更しない
-# - 完成旅程に簡易一覧表示（リンク付き・スポット/移動色分け）を追加
-# - 簡易一覧をタブ内追加表示ではなく疑似画面遷移ページとして表示
-# - v6.2.40: スポットカード下部に「🔎 最新情報」公式確認リンクを安全に追加
-# - v6.2.47: 簡易一覧の徒歩判定暴発を抑制し、戻る先を完成旅程へ固定
+# - Phase1→Phase2で destination / trip_days がどこで消えるか追跡する条件トレースログを追加
+# - ユーザー入力直後、条件抽出後、Phase1生成直前、Phase2構造化直前の planning_state をログ化
+# - 英語地名らしき入力（例: tokyo / osaka 等）を検知してログに残す
+# - 今回は自動補正しない。変数追跡と原因特定のみ
+# - 既存の旅程生成・完成旅程・実行シミュレーション本体は変更しない
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.48-transport-research-agent-trial"
+APP_VERSION_NAME = "v6.2.50-condition-trace-logger"
 APP_UPDATED_DATE = "2026-04-26"
 
 
@@ -578,7 +574,6 @@ def init_session_state() -> None:
         "validation_source_plan_text": "",
         "validation_source_itinerary_text": "",
         "simple_itinerary_page_mode": False,
-        "force_final_itinerary_page_mode": False,
     }
 
     for key, value in defaults.items():
@@ -1682,6 +1677,83 @@ def log_event(stage: str, message: str, level: str = "info") -> None:
 
 def clear_logs() -> None:
     st.session_state.app_logs = []
+
+
+# =========================================================
+# 修正箇所: v6.2.50 条件トレースログ
+# - tokyo -> 東京 のような補正はまだ行わない
+# - まず user_input / primary_destination / trip_days / missing_fields の流れだけを見える化する
+# =========================================================
+def _condition_trace_compact(value, max_len: int = 180) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    return text[:max_len] + ("..." if len(text) > max_len else "")
+
+
+def detect_english_place_tokens_for_trace(text: str) -> List[str]:
+    raw = str(text or "").lower()
+    aliases = {
+        "tokyo": "東京",
+        "osaka": "大阪",
+        "kyoto": "京都",
+        "nagoya": "名古屋",
+        "fukuoka": "福岡",
+        "sapporo": "札幌",
+        "kanazawa": "金沢",
+        "yokohama": "横浜",
+        "kobe": "神戸",
+        "hiroshima": "広島",
+        "okinawa": "沖縄",
+        "naha": "那覇",
+    }
+    found = []
+    for token, ja in aliases.items():
+        if re.search(rf"\b{re.escape(token)}\b", raw):
+            found.append(f"{token}->{ja}")
+    return found
+
+
+def get_condition_trace_snapshot(user_input: str = "") -> Dict[str, object]:
+    s = dict(st.session_state.get("planning_state", {}))
+    missing_fields = []
+    try:
+        missing_fields = get_missing_hearing_fields(s)
+    except Exception:
+        missing_fields = []
+    return {
+        "user_input": _condition_trace_compact(user_input),
+        "primary_destination": safe_text(s.get("primary_destination"), ""),
+        "trip_days": s.get("trip_days", ""),
+        "departure_place": safe_text(s.get("departure_place"), ""),
+        "return_place": safe_text(s.get("return_place"), ""),
+        "transport_style": safe_text(s.get("transport_style"), ""),
+        "budget_style": safe_text(s.get("budget_style"), ""),
+        "missing_fields": missing_fields,
+        "conversation_notes_count": len(s.get("conversation_notes", []) or []),
+        "latest_note": _condition_trace_compact((s.get("conversation_notes", []) or [""])[-1] if s.get("conversation_notes") else ""),
+        "english_place_tokens": detect_english_place_tokens_for_trace(user_input or ((s.get("conversation_notes", []) or [""])[-1] if s.get("conversation_notes") else "")),
+    }
+
+
+def log_condition_trace(stage: str, user_input: str = "", extra: Optional[Dict[str, object]] = None) -> None:
+    try:
+        snap = get_condition_trace_snapshot(user_input=user_input)
+        parts = [
+            f"user_input={snap['user_input'] or '-'}",
+            f"primary_destination={snap['primary_destination'] or '未確定'}",
+            f"trip_days={snap['trip_days'] or '-'}",
+            f"departure={snap['departure_place'] or '-'}",
+            f"return={snap['return_place'] or '-'}",
+            f"missing={','.join(snap['missing_fields']) if snap['missing_fields'] else 'なし'}",
+        ]
+        if snap["english_place_tokens"]:
+            parts.append(f"english_token={','.join(snap['english_place_tokens'])}（検知のみ・未補正）")
+        if extra:
+            for key, value in extra.items():
+                parts.append(f"{key}={_condition_trace_compact(value)}")
+        log_event(stage, " / ".join(parts), level="info")
+    except Exception as e:
+        log_event(stage, f"条件トレースログ作成に失敗: {e}", level="warning")
+
 
 
 def _safe_json_extract(text: str) -> Optional[Dict[str, object]]:
@@ -3313,7 +3385,12 @@ def append_chat(role: str, content: str) -> None:
 
 
 def update_planning_state_from_user_text(user_text: str) -> None:
+    # --- 修正箇所: v6.2.50 条件トレースログ（入口） ---
+    log_condition_trace("条件トレース/入力直後", user_input=user_text)
+
     s = resolve_planning_state()
+    before_destination = safe_text(s.get("primary_destination"), "")
+    before_trip_days = s.get("trip_days", "")
     text = user_text.strip()
 
     if "徒歩" in text:
@@ -3340,29 +3417,66 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     # --- 修正箇所: 「京都に行く」を優先し、イベント名や人数語を目的地に混ぜにくくする ---
     travel_match = re.search(r"([一-龥ァ-ヶA-Za-zー・]{2,20})\s*(?:に|へ)行く", text)
     primary_destination = ""
+    extraction_source = "none"
     if travel_match:
         primary_destination = str(travel_match.group(1)).strip()
+        extraction_source = "travel_match"
     else:
         primary_destination = extract_primary_destination_from_text(
             text,
             s.get("departure_place", ""),
             s.get("return_place", ""),
         )
+        extraction_source = "extract_primary_destination_from_text" if primary_destination else "not_detected"
+
+    english_tokens = detect_english_place_tokens_for_trace(text)
+    if english_tokens and not primary_destination:
+        log_event(
+            "条件トレース/英語地名",
+            f"英語地名らしき入力を検知: {', '.join(english_tokens)} / 現時点では自動補正せず primary_destination は未確定のまま",
+            level="warning",
+        )
 
     if primary_destination and not re.search(r"\d+人", primary_destination):
         s["primary_destination"] = primary_destination
-        log_event("会話解析", f"会話から主目的地候補を検出: {primary_destination}")
+        log_event("会話解析", f"会話から主目的地候補を検出: {primary_destination}（source={extraction_source}）")
+    else:
+        log_event(
+            "条件トレース/目的地抽出",
+            f"主目的地候補なし。before={before_destination or '未確定'} / source={extraction_source}",
+            level="warning" if english_tokens else "info",
+        )
 
     s["conversation_notes"].append(text)
     inferred_days = extract_trip_days_from_text(text)
     if inferred_days:
         log_event("会話解析", f"会話から旅行日数候補を検出: {inferred_days}日")
         s["trip_days"] = int(inferred_days)
+    else:
+        log_event("条件トレース/日数抽出", f"旅行日数候補なし。before={before_trip_days}", level="info")
 
     if st.session_state.advisor_done and text:
         s["revision_requests"].append(text)
 
     st.session_state.planning_state = s
+
+    # --- 修正箇所: v6.2.50 条件トレースログ（出口） ---
+    try:
+        missing_after = get_missing_hearing_fields(st.session_state.planning_state)
+    except Exception:
+        missing_after = []
+    log_condition_trace(
+        "条件トレース/抽出後",
+        user_input=user_text,
+        extra={
+            "before_destination": before_destination or "未確定",
+            "after_destination": safe_text(s.get("primary_destination"), "") or "未確定",
+            "before_trip_days": before_trip_days,
+            "after_trip_days": s.get("trip_days", ""),
+            "extract_source": extraction_source,
+            "missing_after": ",".join(missing_after) if missing_after else "なし",
+        },
+    )
 
 def build_phase1_request_text() -> str:
     s = resolve_planning_state()
@@ -3420,10 +3534,18 @@ def build_phase1_request_text() -> str:
 
 def generate_phase1_draft() -> None:
     clear_logs()
+    # --- 修正箇所: v6.2.50 条件トレースログ ---
+    log_condition_trace("条件トレース/Phase1生成直前")
+
     resolved = resolve_planning_state()
     prompt_text = build_phase1_request_text()
     st.session_state.phase1_prompt_text = prompt_text
-    log_event("Phase1", f"LLM候補生成を開始。最終採用: {resolved['trip_days']}日 / {resolved['transport_style']} / {resolved['budget_style']}")
+    log_event(
+        "Phase1",
+        f"LLM候補生成を開始。最終採用: {resolved['trip_days']}日 / {resolved['transport_style']} / {resolved['budget_style']} / 主目的地={resolved.get('primary_destination') or '未確定'}"
+    )
+    if not safe_text(resolved.get("primary_destination"), ""):
+        log_event("条件トレース/Phase1警告", "Phase1生成直前に primary_destination が未確定です。LLMが目的地を自由補完する可能性があります。", level="warning")
 
     generator = Phase1Generator(logger=log_event)
     draft = generator.generate_trip_plan(prompt_text, temperature=st.session_state.temperature)
@@ -3939,6 +4061,17 @@ def approve_and_build_phase2_phase3() -> None:
     s = st.session_state.planning_state
     trip_plan = st.session_state.trip_plan_draft
 
+    # --- 修正箇所: v6.2.50 条件トレースログ ---
+    log_condition_trace(
+        "条件トレース/Phase2構造化直前",
+        extra={
+            "trip_plan_head": _condition_trace_compact(trip_plan, 220),
+            "start_date": s.get("start_date", ""),
+        },
+    )
+    if not safe_text(s.get("primary_destination"), ""):
+        log_event("条件トレース/Phase2警告", "Phase2構造化直前に primary_destination が未確定です。Phase1自由文の目的地に依存します。", level="warning")
+
     log_event("Phase2", "構造化を開始")
     structurer = Phase2Structuring(logger=log_event)
     df2 = structurer.structure_trip_plan(trip_plan, s["start_date"])
@@ -4394,7 +4527,6 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
 # - v6.2.44: 簡易一覧の移動表示ルールを確定反映（電車のみ駅間表示、その他は手段のみ）
 # - v6.2.45: 簡易一覧をスマホ向けに圧縮（目的/最新情報列削除、操作アイコン短縮）
 # - v6.2.46: 徒歩自動判定（表示のみ）を追加。近接スポットは「徒歩候補」として表示し、旅程本体は変更しない
-# - v6.2.48: Transport Research Agentを簡易一覧のみ任意実行。結果はsession_stateにキャッシュし、失敗時は既存表示にfallback
 # =========================================================
 def _simple_row_html_class(row_dict: Dict[str, object], is_transport: bool) -> str:
     status = safe_text(row_dict.get("execution_status"), "").lower()
@@ -4427,60 +4559,42 @@ def _simple_transport_origin_destination(row_dict: Dict[str, object]) -> tuple[s
 
 
 def _simple_transport_mode_label(row_dict: Dict[str, object]) -> str:
-    # --- 修正箇所(v6.2.47): 簡易一覧で徒歩判定が暴発しないよう、明示的な移動手段を最優先する ---
+    # --- 修正箇所(v6.2.44): 簡易一覧では route_from→route_to を混ぜず、手段名だけ返す ---
     mode = safe_text(row_dict.get("transport_mode"), "")
     destination_text = safe_text(row_dict.get("destination"), "")
-    route_from = safe_text(row_dict.get("route_from"), "")
-    route_to = safe_text(row_dict.get("route_to"), "")
     one_point = safe_text(row_dict.get("one_point"), "")
+    display = safe_text(build_transport_display_safe(row_dict), "")
+    combined = " ".join([mode, destination_text, one_point, display]).lower()
 
-    primary = " ".join([mode, destination_text, route_from, route_to]).lower()
-
-    # 強い移動手段を優先。徒歩は最後に判定する。
-    if any(token in primary for token in ["taxi", "タクシー"]):
+    if any(token in combined for token in ["taxi", "タクシー"]):
         return "タクシー"
-    if any(token in primary for token in ["train", "transit", "rail", "電車", "列車", "新幹線"]):
-        return "電車"
-    if any(token in primary for token in ["bus", "バス"]):
-        return "バス"
-    if any(token in primary for token in ["air", "flight", "飛行機", "航空", "フライト"]):
-        return "飛行機"
-    if any(token in primary for token in ["ship", "ferry", "船", "フェリー"]):
-        return "船"
-    if any(token in primary for token in ["car", "車", "レンタカー", "自家用車"]):
-        return "車"
-    if any(token in primary for token in ["walk", "walking", "徒歩"]):
+    if any(token in combined for token in ["walk", "walking", "徒歩"]):
         return "徒歩"
+    if any(token in combined for token in ["bus", "バス"]):
+        return "バス"
+    if any(token in combined for token in ["train", "transit", "rail", "電車", "列車", "新幹線"]):
+        return "電車"
+    if any(token in combined for token in ["air", "flight", "飛行機", "航空", "フライト"]):
+        return "飛行機"
+    if any(token in combined for token in ["ship", "ferry", "船", "フェリー"]):
+        return "船"
+    if any(token in combined for token in ["car", "車", "レンタカー", "自家用車"]):
+        return "車"
 
     mode_map = {
         "walk": "徒歩",
         "walking": "徒歩",
         "train": "電車",
-        "transit": "電車",
-        "rail": "電車",
+        "transit": "公共交通",
         "taxi": "タクシー",
         "car": "車",
         "private_car": "自家用車",
         "rental_car": "レンタカー",
         "bus": "バス",
         "air": "飛行機",
-        "flight": "飛行機",
         "ship": "船",
-        "ferry": "船",
     }
-    if mode.lower() in mode_map:
-        return mode_map[mode.lower()]
-
-    # 補足文は最後のfallback。徒歩は採用しない。
-    secondary = one_point.lower()
-    if any(token in secondary for token in ["taxi", "タクシー"]):
-        return "タクシー"
-    if any(token in secondary for token in ["train", "transit", "rail", "電車", "列車", "新幹線"]):
-        return "電車"
-    if any(token in secondary for token in ["bus", "バス"]):
-        return "バス"
-
-    return mode if mode and mode != "-" else "移動"
+    return mode_map.get(mode.lower(), mode or "移動")
 
 
 def _simple_extract_station_name(value: str) -> str:
@@ -4539,15 +4653,16 @@ def _simple_infer_walk_area_tokens(value: str) -> set[str]:
 
 
 def _simple_should_show_walk_candidate(row_dict: Dict[str, object], origin: str, destination: str, mode_label: str) -> bool:
-    # --- 修正箇所(v6.2.47): 徒歩候補の暴発を抑制 ---
-    # 表示用のみ。旅程データや transport_mode は書き換えない。
-    if mode_label in {"徒歩", "電車", "バス", "飛行機", "船", "新幹線"}:
+    # --- 修正箇所(v6.2.46): 徒歩自動判定（表示のみ） ---
+    # Google Maps APIなしでの安全な簡易判定。確定移動手段は書き換えず、簡易一覧だけ「徒歩候補」と表示する。
+    if mode_label in {"徒歩", "飛行機", "船", "新幹線"}:
         return False
 
     origin_text = safe_text(origin, "")
     destination_text = safe_text(destination, "")
-    combined = f"{origin_text} {destination_text} {safe_text(row_dict.get('destination'), '')} {safe_text(row_dict.get('route_from'), '')} {safe_text(row_dict.get('route_to'), '')}"
+    combined = f"{origin_text} {destination_text} {safe_text(row_dict.get('destination'), '')} {safe_text(row_dict.get('one_point'), '')}"
 
+    # 大移動・駅間移動は徒歩候補にしない
     long_distance_tokens = ["福井", "金沢", "京都", "大阪", "名古屋", "新幹線", "空港", "フライト", "航空"]
     if any(token in combined for token in long_distance_tokens) and not any(token in combined for token in ["栄", "大須", "名駅"]):
         return False
@@ -4555,6 +4670,7 @@ def _simple_should_show_walk_candidate(row_dict: Dict[str, object], origin: str,
     origin_station = _simple_extract_station_name(origin_text)
     dest_station = _simple_extract_station_name(destination_text)
     if origin_station and dest_station and origin_station != dest_station:
+        # すでに駅間として成立している電車表示は維持
         return False
 
     origin_areas = _simple_infer_walk_area_tokens(origin_text)
@@ -4562,11 +4678,12 @@ def _simple_should_show_walk_candidate(row_dict: Dict[str, object], origin: str,
     if origin_areas and dest_areas and (origin_areas & dest_areas):
         return True
 
+    # 終了・開始の差が短い近接移動は候補扱い。ただし駅名が絡む長距離は上で除外済み。
     start_min = _time_to_minutes(safe_text(row_dict.get("start_time"), ""))
     end_min = _time_to_minutes(safe_text(row_dict.get("end_time"), ""))
     if start_min is not None and end_min is not None:
         duration = end_min - start_min
-        if 1 <= duration <= 10 and mode_label in {"タクシー", "車", "移動"}:
+        if 1 <= duration <= 12 and mode_label in {"タクシー", "車", "バス", "移動"}:
             return True
 
     return False
@@ -4590,154 +4707,6 @@ def _simple_transport_content_label(row_dict: Dict[str, object], origin: str, de
             return f"電車：{from_station or '最寄り駅'}→{to_station or '最寄り駅'}"
         return "電車：最寄り駅→最寄り駅"
     return mode_label or "移動"
-
-
-# =========================================================
-# 修正箇所(v6.2.48): Transport Research Agent（簡易一覧のみ・試験導入）
-# - 旅程本体 / df_phase3 は変更しない
-# - 簡易一覧で任意実行された場合だけ、表示用の移動候補を補完する
-# - 結果は session_state["transport_research_cache"] に保存
-# - 失敗時は既存の _simple_transport_content_label にfallback
-# =========================================================
-def _transport_research_cache_key(row_dict: Dict[str, object], origin: str, destination: str) -> str:
-    parts = [
-        safe_text(row_dict.get("day"), ""),
-        safe_text(row_dict.get("sequence"), ""),
-        safe_text(row_dict.get("date"), ""),
-        safe_text(row_dict.get("start_time"), ""),
-        safe_text(origin, ""),
-        safe_text(destination, ""),
-        safe_text(row_dict.get("transport_mode"), ""),
-    ]
-    return "|".join(parts)
-
-
-def _build_transport_research_prompt(row_dict: Dict[str, object], origin: str, destination: str, mode_label: str) -> str:
-    date_text = safe_text(row_dict.get("date"), "")
-    start_time = safe_text(row_dict.get("start_time"), "")
-    end_time = safe_text(row_dict.get("end_time"), "")
-    current_mode = safe_text(mode_label, "移動")
-    current_note = safe_text(row_dict.get("one_point"), "")
-
-    return f"""
-あなたは旅行中の移動手段確認エージェントです。
-次のスポット間移動について、旅行者にとって自然な移動手段を1つだけ提案してください。
-
-重要ルール:
-- 出力は必ずJSONのみ
-- 旅程本体を書き換えない。表示用の候補だけを返す
-- 不明な駅名は無理に作らない
-- 徒歩15分以内と考えられる場合は徒歩を優先
-- 電車が自然で、駅名がある程度わかる場合だけ「電車：A駅→B駅」の形式にする
-- タクシーが自然なら「タクシー」とする
-- 根拠が弱い場合は confidence を low にする
-- 実在確認できない固有名詞や駅名を作らない
-
-入力:
-- 日付: {date_text}
-- 移動開始: {start_time}
-- 移動終了: {end_time}
-- 出発地: {origin}
-- 到着地: {destination}
-- 現在の移動手段: {current_mode}
-- 現在の補足: {current_note}
-
-返却JSON形式:
-{{
-  "mode": "walk|train|taxi|bus|car|other",
-  "display": "徒歩|徒歩候補|タクシー|電車：A駅→B駅|バス|車|移動",
-  "reason": "短い理由",
-  "confidence": "high|medium|low"
-}}
-""".strip()
-
-
-def _normalize_transport_research_result(data: Dict[str, object]) -> Optional[Dict[str, str]]:
-    if not isinstance(data, dict):
-        return None
-
-    mode = safe_text(data.get("mode"), "other").lower()
-    display = safe_text(data.get("display"), "")
-    reason = safe_text(data.get("reason"), "")
-    confidence = safe_text(data.get("confidence"), "low").lower()
-
-    allowed_modes = {"walk", "train", "taxi", "bus", "car", "other"}
-    if mode not in allowed_modes:
-        mode = "other"
-
-    if confidence not in {"high", "medium", "low"}:
-        confidence = "low"
-
-    if not display or display == "-":
-        fallback = {
-            "walk": "徒歩",
-            "train": "電車：最寄り駅→最寄り駅",
-            "taxi": "タクシー",
-            "bus": "バス",
-            "car": "車",
-            "other": "移動",
-        }
-        display = fallback.get(mode, "移動")
-
-    # 表示の安全弁。長すぎる説明文や改行混入は簡易一覧に出さない。
-    display = re.sub(r"\s+", " ", display).strip()
-    if len(display) > 32:
-        if mode == "walk":
-            display = "徒歩"
-        elif mode == "taxi":
-            display = "タクシー"
-        elif mode == "train":
-            display = "電車：最寄り駅→最寄り駅"
-        else:
-            display = "移動"
-
-    return {
-        "mode": mode,
-        "display": display,
-        "reason": reason,
-        "confidence": confidence,
-        "source": "transport_research_agent",
-    }
-
-
-def get_transport_research_result(row_dict: Dict[str, object], origin: str, destination: str, mode_label: str) -> Optional[Dict[str, str]]:
-    # --- 修正箇所(v6.2.48): session_stateキャッシュを使い、同じ移動区間でLLMを再実行しない ---
-    if "transport_research_cache" not in st.session_state or not isinstance(st.session_state.transport_research_cache, dict):
-        st.session_state.transport_research_cache = {}
-
-    cache_key = _transport_research_cache_key(row_dict, origin, destination)
-    cached = st.session_state.transport_research_cache.get(cache_key)
-    if isinstance(cached, dict):
-        return cached if cached.get("ok") else None
-
-    # 長距離・広域移動はAIで徒歩化しない。既存表示にfallback。
-    combined = f"{origin} {destination} {safe_text(row_dict.get('destination'), '')}"
-    if any(token in combined for token in ["新幹線", "空港", "福井", "金沢", "京都", "大阪"]):
-        st.session_state.transport_research_cache[cache_key] = {"ok": False, "reason": "long_distance_guard"}
-        return None
-
-    try:
-        prompt = _build_transport_research_prompt(row_dict, origin, destination, mode_label)
-        generator = Phase1Generator(logger=log_event)
-        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
-        data = _safe_json_extract(raw) or {}
-        normalized = _normalize_transport_research_result(data)
-        if not normalized:
-            st.session_state.transport_research_cache[cache_key] = {"ok": False, "reason": "invalid_result"}
-            return None
-
-        # low信頼度は表示に採用しない。キャッシュだけ残して既存表示へfallback。
-        if normalized.get("confidence") == "low":
-            st.session_state.transport_research_cache[cache_key] = {"ok": False, "reason": "low_confidence", "raw": normalized}
-            return None
-
-        normalized["ok"] = True
-        st.session_state.transport_research_cache[cache_key] = normalized
-        return normalized
-    except Exception as e:
-        log_event("Transport Research Agent", f"移動候補取得に失敗: {e}", level="warning")
-        st.session_state.transport_research_cache[cache_key] = {"ok": False, "reason": str(e)}
-        return None
 
 
 def _build_hotel_booking_search_url(hotel_name: str, visit_date: str = "") -> str:
@@ -4832,17 +4801,10 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             # - 電車のみ「電車：最寄り駅→最寄り駅」
             # - タクシー/徒歩/バス/その他は手段のみ
             content_label = _simple_transport_content_label(row_dict, origin, destination, mode_label)
-            research_result = None
-            if bool(st.session_state.get("simple_transport_research_enabled", False)):
-                research_result = get_transport_research_result(row_dict, origin, destination, mode_label)
-                if research_result and research_result.get("display"):
-                    content_label = safe_text(research_result.get("display"), content_label)
-
             actions = [
                 _simple_action_link("🗺️", route_url),
             ]
-            research_mode = safe_text(research_result.get("mode"), "") if research_result else ""
-            if content_label != "徒歩候補" and research_mode != "walk" and (research_mode == "taxi" or transport_mode == "taxi" or "タクシー" in mode_label or "タクシー" in content_label):
+            if content_label != "徒歩候補" and (transport_mode == "taxi" or "タクシー" in mode_label):
                 actions.append(_simple_action_link("🚕", build_uber_ride_url(origin, destination)))
             content_html = f"<div class='vf-simple-main'>{html.escape(content_label)}</div>"
             purpose_html = "移動"
@@ -4907,25 +4869,16 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
 def render_simple_itinerary_page() -> None:
     # --- 修正箇所: 簡易一覧を完成旅程タブ内の追加表示ではなく、疑似画面遷移ページとして表示 ---
     st.title("📋 簡易旅程一覧")
-    st.caption("スマホでも見やすいよう、目的・最新情報列を省いた簡易ビューです。移動候補AIは表示用だけで、旅程本体は変更しません。")
+    st.caption("スマホでも見やすいよう、目的・最新情報列を省いた簡易ビューです。近接移動は表示上だけ『徒歩候補』として出します。")
 
-    top_left, top_mid, top_right = st.columns([1, 1, 2])
+    top_left, top_right = st.columns([1, 2])
     with top_left:
         if st.button("⬅ 完成旅程に戻る", use_container_width=True, key="back_to_final_itinerary_from_simple"):
             st.session_state.simple_itinerary_page_mode = False
-            st.session_state.force_final_itinerary_page_mode = True
             st.session_state.active_tab = "final_itinerary"
             st.rerun()
-    with top_mid:
-        if st.button("🔎 移動候補AI", use_container_width=True, key="run_transport_research_agent"):
-            st.session_state.simple_transport_research_enabled = True
-            st.rerun()
     with top_right:
-        st.info("表示専用の簡易ビューです。旅程の変更・削除は戻ってカード表示から行ってください。移動候補AIはsession_stateにキャッシュされます。")
-
-    if st.session_state.get("simple_transport_research_enabled", False):
-        cache_count = len(st.session_state.get("transport_research_cache", {}) or {})
-        st.caption(f"移動候補AI: 有効 / キャッシュ件数: {cache_count} / 失敗時は既存表示に戻します。")
+        st.info("表示専用の簡易ビューです。旅程の変更・削除は戻ってカード表示から行ってください。")
 
     df = st.session_state.get("df_phase3")
     if df is None or df.empty:
@@ -5694,64 +5647,6 @@ with st.sidebar:
 
 
 
-
-# =========================================================
-# 修正箇所(v6.2.47): 完成旅程コンテンツを関数化
-# - 簡易一覧から戻った時に st.tabs の初期タブへ戻る問題を避ける
-# - 完成旅程だけを疑似ページとして再表示できるようにする
-# =========================================================
-def render_final_itinerary_content() -> None:
-    st.header("完成旅程")
-
-    if st.session_state.df_phase3 is not None:
-        df_phase3 = st.session_state.df_phase3.copy().reset_index(drop=True)
-
-        summary = infer_trip_summary(df_phase3)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("出発時刻", summary["start_time"])
-        c2.metric("出発地点", summary["start"])
-        c3.metric("宿泊先", summary["hotel"])
-        c4.metric("最終目的地", summary["final"])
-
-        st.divider()
-
-        with st.expander("Phase1 の自然文案", expanded=False):
-            st.markdown(st.session_state.trip_plan or "")
-
-        with st.expander("Phase2 の構造化データ", expanded=False):
-            display_cols = [
-                col for col in [
-                    "day", "sequence", "date", "start_time", "end_time",
-                    "destination", "purpose", "genre", "duration_minutes",
-                    "is_transport", "transport_mode"
-                ] if col in st.session_state.df_phase2.columns
-            ]
-            st.dataframe(st.session_state.df_phase2[display_cols], use_container_width=True, height=320)
-
-        st.markdown("### 完成旅程タイムライン")
-        render_google_calendar_sync_panel(df_phase3)
-        render_phase35_validation_panel(st.session_state.trip_plan or "", df_phase3)
-
-        col_simple, col_note = st.columns([1, 2])
-        with col_simple:
-            if st.button("📋 簡易一覧で見る", use_container_width=True, key="open_simple_itinerary_page"):
-                st.session_state.simple_itinerary_page_mode = True
-                st.session_state.active_tab = "final_itinerary"
-                st.rerun()
-        with col_note:
-            st.caption("簡易一覧は別画面風に表示します。スポット・移動・ホテルを色分けし、Google Maps / Uber / ホテル予約だけを残します。")
-
-        render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
-        render_itinerary_cards(
-            df_phase3,
-            allow_transport_edit=True,
-            transport_edit_scope="plan",
-            hide_completed=st.session_state.hide_completed_plan,
-            hide_cancelled=st.session_state.hide_cancelled_plan,
-        )
-    else:
-        st.info("まず『プラン確認』で旅行案を了承してください。")
-
 # =========================================================
 # 修正箇所: 簡易一覧ページへの疑似画面遷移
 # - Streamlitの別ウインドウではなく、session_stateで安全に全画面相当へ切り替える
@@ -5759,11 +5654,6 @@ def render_final_itinerary_content() -> None:
 # =========================================================
 if st.session_state.get("simple_itinerary_page_mode", False):
     render_simple_itinerary_page()
-    st.stop()
-
-if st.session_state.get("force_final_itinerary_page_mode", False):
-    st.session_state.force_final_itinerary_page_mode = False
-    render_final_itinerary_content()
     st.stop()
 
 # =========================================================
@@ -5910,6 +5800,18 @@ with tabs[0]:
             }
             ambiguities = detect_ambiguities_from_context(user_message, current_state)
             missing_fields = get_missing_hearing_fields(current_state)
+
+            # --- 修正箇所: v6.2.50 条件トレースログ ---
+            log_condition_trace(
+                "条件トレース/ヒアリング判定後",
+                user_input=user_message,
+                extra={
+                    "known_destination": known.get("destination") or "未確定",
+                    "known_trip_days": known.get("trip_days") or "-",
+                    "ambiguities": len(ambiguities),
+                    "missing_fields": ",".join(missing_fields) if missing_fields else "なし",
+                },
+            )
 
             if ambiguities:
                 st.session_state.pending_ambiguity = ambiguities[0]
@@ -6058,7 +5960,56 @@ with tabs[1]:
 # タブ3: 完成旅程
 # =========================================================
 with tabs[2]:
-    render_final_itinerary_content()
+    st.header("完成旅程")
+
+    if st.session_state.df_phase3 is not None:
+        df_phase3 = st.session_state.df_phase3.copy().reset_index(drop=True)
+
+        summary = infer_trip_summary(df_phase3)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("出発時刻", summary["start_time"])
+        c2.metric("出発地点", summary["start"])
+        c3.metric("宿泊先", summary["hotel"])
+        c4.metric("最終目的地", summary["final"])
+
+        st.divider()
+
+        with st.expander("Phase1 の自然文案", expanded=False):
+            st.markdown(st.session_state.trip_plan or "")
+
+        with st.expander("Phase2 の構造化データ", expanded=False):
+            display_cols = [
+                col for col in [
+                    "day", "sequence", "date", "start_time", "end_time",
+                    "destination", "purpose", "genre", "duration_minutes",
+                    "is_transport", "transport_mode"
+                ] if col in st.session_state.df_phase2.columns
+            ]
+            st.dataframe(st.session_state.df_phase2[display_cols], use_container_width=True, height=320)
+
+        st.markdown("### 完成旅程タイムライン")
+        render_google_calendar_sync_panel(df_phase3)
+        render_phase35_validation_panel(st.session_state.trip_plan or "", df_phase3)
+
+        col_simple, col_note = st.columns([1, 2])
+        with col_simple:
+            if st.button("📋 簡易一覧で見る", use_container_width=True, key="open_simple_itinerary_page"):
+                st.session_state.simple_itinerary_page_mode = True
+                st.session_state.active_tab = "final_itinerary"
+                st.rerun()
+        with col_note:
+            st.caption("簡易一覧は別画面風に表示します。スポット・移動・ホテルを色分けし、Google Maps / Uber / ホテル予約だけを残します。")
+
+        render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
+        render_itinerary_cards(
+            df_phase3,
+            allow_transport_edit=True,
+            transport_edit_scope="plan",
+            hide_completed=st.session_state.hide_completed_plan,
+            hide_cancelled=st.session_state.hide_cancelled_plan,
+        )
+    else:
+        st.info("まず『プラン確認』で旅行案を了承してください。")
 
 
 # =========================================================
