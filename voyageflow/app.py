@@ -26,7 +26,7 @@ from maps.routes_api import RoutesAPI
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.42-simple-itinerary-page
+# 【バージョン名】VoyageFlow v6.2.43-simple-itinerary-clean-links
 # 【制作日】2026-04-24
 # 【前バージョンからの修正内容】
 # - サイドバー固定スペースに Gemini transport resolver のA/Bテストパネルを追加
@@ -4381,7 +4381,7 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
 # =========================================================
 # 修正箇所: 完成旅程の簡易一覧表示
 # - 既存カード表示は残し、表示モードとして追加するだけ
-# - スポット/移動/ホテルを色分けし、Google Maps / Uber / ホテル予約リンクだけを残す
+# - スポット/移動/ホテルを色分けし、Google Maps / Uber / ホテル予約リンクだけを残す\n# - v6.2.43: 内容列の重複表示を解消し、スポット名リンクはMapsではなく公式情報リンクを優先
 # =========================================================
 def _simple_row_html_class(row_dict: Dict[str, object], is_transport: bool) -> str:
     status = safe_text(row_dict.get("execution_status"), "").lower()
@@ -4464,6 +4464,19 @@ def _simple_latest_info_headline(destination: str, visit_date: str = "") -> str:
     return "公式情報確認"
 
 
+def _simple_spot_info_url(destination: str, visit_date: str = "") -> str:
+    # --- 修正箇所: 簡易一覧のスポット名リンクはMapsではなく公式情報/公式検索を優先 ---
+    name = safe_text(destination, "")
+    if not name or name == "-" or _is_hotel_like_name(name):
+        return ""
+    for key, info in SPOT_INFO_SOURCES.items():
+        if key in name:
+            return safe_text(info.get("url"), "")
+    category = _guess_spot_category(name)
+    _, url = _spot_latest_info_search_url(name, visit_date, category)
+    return url
+
+
 def _simple_action_link(label: str, url: str) -> str:
     clean_url = html.escape(safe_text(url, ""), quote=True)
     clean_label = html.escape(safe_text(label, ""))
@@ -4514,12 +4527,12 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             if transport_mode == "taxi" or "タクシー" in mode_label:
                 actions.append(_simple_action_link("🚕 Uber", build_uber_ride_url(origin, destination)))
 
+            # 内容列は「移動手段：出発地→到着地」の1行だけにして、重複表示を避ける。
             content_html = (
-                f"<div class='vf-simple-main'>{html.escape(mode_label)}</div>"
-                f"<div class='vf-simple-sub'>{html.escape(origin)} → {html.escape(destination)}</div>"
+                f"<div class='vf-simple-main'>{html.escape(mode_label)}：{html.escape(origin)} → {html.escape(destination)}</div>"
             )
             purpose_html = "移動"
-            latest_html = f"{html.escape(origin)} → {html.escape(destination)}"
+            latest_html = ""
             type_html = "<span class='vf-simple-chip'>移動</span>"
             action_html = "<div class='vf-simple-action'>" + "".join(actions) + "</div>"
         else:
@@ -4532,9 +4545,14 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
             if is_hotel:
                 actions.append(_simple_action_link("🏨 予約", _build_hotel_booking_search_url(destination_name, date_text)))
 
-            content_html = (
-                f"<div class='vf-simple-main'><a href='{html.escape(place_url, quote=True)}' target='_blank' rel='noopener noreferrer' style='color:inherit;text-decoration:underline;'>{html.escape(destination_name)}</a></div>"
-            )
+            # スポット名リンクはMapsではなく公式情報/公式検索を優先。Mapsはアクション列だけに残す。
+            spot_info_url = "" if is_hotel else _simple_spot_info_url(destination_name, date_text)
+            if spot_info_url:
+                content_html = (
+                    f"<div class='vf-simple-main'><a href='{html.escape(spot_info_url, quote=True)}' target='_blank' rel='noopener noreferrer' style='color:inherit;text-decoration:underline;'>{html.escape(destination_name)}</a></div>"
+                )
+            else:
+                content_html = f"<div class='vf-simple-main'>{html.escape(destination_name)}</div>"
             purpose_html = html.escape(purpose)
             latest_html = html.escape(latest)
             type_html = "<span class='vf-simple-chip'>ホテル</span>" if is_hotel else "<span class='vf-simple-chip'>スポット</span>"
