@@ -57,7 +57,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.53-spot-enrichment-minimal"
+APP_VERSION_NAME = "v6.2.54-hearing-state-sync-fix"
 APP_UPDATED_DATE = "2026-04-27"
 
 
@@ -2566,22 +2566,69 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
 
 
 
+def _kanji_number_to_int(value: str) -> Optional[int]:
+    """旅行日数抽出用の簡易漢数字変換。十日程度までを安全に扱う。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    direct = {
+        "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+        "１": 1, "２": 2, "３": 3, "４": 4, "５": 5,
+        "６": 6, "７": 7, "８": 8, "９": 9,
+    }
+    if text in direct:
+        return direct[text]
+    if text.isdigit():
+        return int(text)
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = direct.get(left, 1) if left else 1
+        ones = direct.get(right, 0) if right else 0
+        return int(tens) * 10 + int(ones)
+    return None
+
+
+def _normalize_day_number_token(value: str) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    return _kanji_number_to_int(text)
+
+
 def extract_trip_days_from_text(text: str) -> Optional[int]:
     text = str(text or "")
     if not text.strip():
         return None
-    # --- 修正箇所: 日帰り/◯泊/◯泊◯日 をより自然に拾う ---
+
+    # --- 修正箇所: v6.2.54 会話LLMが認識した「2泊3日」「三日間」等を正式条件へ同期しやすくする ---
+    # ユーザー入力・会話LLM返答・確認文のどれからでも同じ関数で抽出する。
     if "日帰り" in text:
         return 1
-    match = re.search(r"(\d+)\s*泊\s*(\d+)\s*日", text)
+
+    digit_or_kanji = r"(\d+|[一二三四五六七八九十１２３４５６７８９]+)"
+
+    match = re.search(digit_or_kanji + r"\s*泊\s*" + digit_or_kanji + r"\s*日", text)
     if match:
-        return int(match.group(2))
-    match = re.search(r"(\d+)\s*泊", text)
+        days = _normalize_day_number_token(match.group(2))
+        if days:
+            return int(days)
+
+    match = re.search(digit_or_kanji + r"\s*泊", text)
     if match:
-        return int(match.group(1)) + 1
-    match = re.search(r"(\d+)\s*日", text)
+        nights = _normalize_day_number_token(match.group(1))
+        if nights is not None:
+            return int(nights) + 1
+
+    # 「三日間」「3日間」「３日」「三日」など
+    match = re.search(digit_or_kanji + r"\s*日(?:間)?", text)
     if match:
-        return int(match.group(1))
+        days = _normalize_day_number_token(match.group(1))
+        if days:
+            return int(days)
+
     return None
 
 
@@ -2609,6 +2656,12 @@ def extract_primary_destination_from_text(text: str, departure_place: str = "", 
         simple = re.match(r"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]{2,20})\d+\s*泊", compact)
         if simple:
             candidates.append(str(simple.group(1)).strip())
+
+        # --- 修正箇所: v6.2.54 「東京三日間」「京都3日間」のような自然入力から地名を拾う ---
+        day_expr = r"(?:\d+|[一二三四五六七八九十１２３４５６７８９]+)\s*日(?:間)?"
+        simple_days = re.match(rf"([一-龥ぁ-んァ-ヶA-Za-z0-9ー・]{{2,20}}){day_expr}", compact)
+        if simple_days:
+            candidates.append(str(simple_days.group(1)).strip())
 
     exclusions = {
         str(departure_place or "").strip(),
@@ -3402,6 +3455,51 @@ def conversation_advisor_questions() -> List[str]:
 
 def append_chat(role: str, content: str) -> None:
     st.session_state.chat_history.append({"role": role, "content": content})
+
+
+def sync_hearing_state_from_assistant_reply(reply_text: str, user_text: str = "") -> None:
+    """
+    v6.2.54:
+    旅行相談LLMの返答は表示だけで終わらせず、返答内で確認された条件を planning_state に同期する。
+    ただし採用判定はコード側で行い、今回は旅行日数だけを安全対象に限定する。
+    """
+    reply = str(reply_text or "").strip()
+    if not reply:
+        return
+
+    inferred_days = extract_trip_days_from_text(reply)
+    if not inferred_days:
+        return
+
+    # ユーザーが日数を話題にしている/直近会話で日数が出ている場合だけ同期する。
+    recent_history = st.session_state.get("chat_history", [])[-6:]
+    recent_user_text = " / ".join(
+        str(item.get("content", "")) for item in recent_history if item.get("role") == "user"
+    )
+    trigger_text = f"{user_text} / {recent_user_text}"
+    user_side_days = extract_trip_days_from_text(trigger_text)
+
+    day_topic_tokens = ["日", "泊", "日間", "日数", "三日", "二日", "一日", "2泊", "3日", "３日"]
+    if not user_side_days and not any(token in trigger_text for token in day_topic_tokens):
+        log_event("会話状態同期", f"assistant返答に日数候補 {inferred_days}日 がありましたが、ユーザー側根拠が弱いため未採用", level="info")
+        return
+
+    planning_state = dict(st.session_state.get("planning_state", {}))
+    before = planning_state.get("trip_days")
+    if before != int(inferred_days):
+        planning_state["trip_days"] = int(inferred_days)
+        notes = planning_state.get("conversation_notes", [])
+        sync_note = f"会話LLM確認: {inferred_days}日"
+        if sync_note not in notes:
+            notes.append(sync_note)
+        planning_state["conversation_notes"] = notes
+        st.session_state.planning_state = planning_state
+        log_event("会話状態同期", f"assistant返答から旅行日数を同期: {before}日 → {inferred_days}日", level="info")
+
+
+def append_assistant_chat_and_sync(reply_text: str, user_text: str = "") -> None:
+    append_chat("assistant", reply_text)
+    sync_hearing_state_from_assistant_reply(reply_text, user_text=user_text)
 
 
 
@@ -6005,7 +6103,7 @@ with tabs[0]:
             if ambiguities:
                 st.session_state.pending_ambiguity = ambiguities[0]
                 reply = generate_hearing_reply_with_llm(user_message, known, ambiguities, missing_fields)
-                append_chat("assistant", reply)
+                append_assistant_chat_and_sync(reply, user_text)
                 st.rerun()
 
             confirmation_payload = None if st.session_state.get("pending_confirmation") else build_confirmation_payload_from_state()
@@ -6015,7 +6113,7 @@ with tabs[0]:
                 st.rerun()
 
             reply = generate_hearing_reply_with_llm(user_message, known, [], missing_fields)
-            append_chat("assistant", reply)
+            append_assistant_chat_and_sync(reply, user_text)
             st.rerun()
 
         pending_ambiguity = st.session_state.get("pending_ambiguity")
