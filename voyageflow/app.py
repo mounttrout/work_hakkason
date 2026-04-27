@@ -57,7 +57,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.56-station-anchor-normalization"
+APP_VERSION_NAME = "v6.2.57-safe-station-card-insertion"
 APP_UPDATED_DATE = "2026-04-27"
 
 
@@ -3749,88 +3749,6 @@ def _coerce_positive_minutes(value) -> Optional[int]:
         return None
 
 
-def _is_station_anchor_row(row: pd.Series | Dict | None) -> bool:
-    """Phase2の駅行を、移動ではなく出発/到着アンカーとして扱うための判定。"""
-    if row is None:
-        return False
-    destination = safe_text(_row_value(row, "destination", ""), "")
-    genre = safe_text(_row_value(row, "genre", ""), "").lower()
-    return bool(destination and (("駅" in destination) or genre == "station" or "station" in genre))
-
-
-def _normalize_station_anchor_rows(df: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
-    """
-    Phase2には原則「移動行」は入れない前提のため、station + transport を移動扱いにしない。
-    駅行はスポットアンカーとして残し、長い duration は次区間の移動時間候補として退避する。
-    """
-    if df is None or df.empty:
-        return df
-
-    normalized = df.copy().reset_index(drop=True)
-    for col, default in {
-        "embedded_transport_minutes": None,
-        "embedded_transport_original_start_time": "",
-        "embedded_transport_original_end_time": "",
-        "station_anchor_normalized": False,
-    }.items():
-        if col not in normalized.columns:
-            normalized[col] = default
-
-    meal_shopping_activity = {"meal", "lunch", "dinner", "breakfast", "shopping", "activity", "sightseeing", "museum", "theater"}
-
-    for idx in normalized.index:
-        row = normalized.loc[idx]
-        if not _is_station_anchor_row(row):
-            continue
-
-        purpose = safe_text(row.get("purpose"), "").lower()
-        genre = safe_text(row.get("genre"), "").lower()
-        if purpose in meal_shopping_activity:
-            continue
-
-        start_time = safe_text(row.get("start_time"), safe_text(planning_state.get("departure_time"), "09:00"))
-        end_time = safe_text(row.get("end_time"), "")
-        minutes_from_clock = _minutes_between_clock(start_time, end_time) if start_time and end_time else None
-        duration_minutes = _coerce_positive_minutes(row.get("duration_minutes"))
-        original_minutes = minutes_from_clock or duration_minutes
-
-        if original_minutes and original_minutes >= 60:
-            normalized.at[idx, "embedded_transport_minutes"] = int(original_minutes)
-            normalized.at[idx, "embedded_transport_original_start_time"] = start_time
-            normalized.at[idx, "embedded_transport_original_end_time"] = end_time
-
-        # 駅そのものはスポットアンカーとして残す。長時間滞在は避け、30分へ丸める。
-        normalized.at[idx, "is_transport"] = False
-        normalized.at[idx, "genre"] = "station"
-        if purpose in {"transport", "move", "transfer", "", "-"}:
-            if idx == 0:
-                normalized.at[idx, "purpose"] = "departure"
-            else:
-                prev_day = int(normalized.at[idx - 1, "day"]) if idx - 1 in normalized.index and pd.notna(normalized.at[idx - 1, "day"]) else None
-                cur_day = int(row.get("day")) if pd.notna(row.get("day")) else None
-                normalized.at[idx, "purpose"] = "arrival" if prev_day == cur_day else "departure"
-
-        normalized.at[idx, "duration_minutes"] = 30
-        if start_time:
-            normalized.at[idx, "end_time"] = _add_minutes_to_clock(start_time, 30)
-        normalized.at[idx, "station_anchor_normalized"] = True
-        normalized.at[idx, "route_from"] = ""
-        normalized.at[idx, "route_to"] = ""
-        normalized.at[idx, "route_url"] = ""
-        normalized.at[idx, "route_data_source"] = ""
-        normalized.at[idx, "estimated_duration_label"] = ""
-        log_event("Phase2正規化", f"station行を移動ではなく駅アンカーに補正: {safe_text(row.get('destination'), '')} / original_duration={original_minutes or '-'}分", level="info")
-
-    return normalized.reset_index(drop=True)
-
-
-def _embedded_transport_minutes_from_row(row: pd.Series | Dict | None) -> Optional[int]:
-    if row is None:
-        return None
-    value = _row_value(row, "embedded_transport_minutes", None)
-    return _coerce_positive_minutes(value)
-
-
 def rebuild_phase2_time_consistency(df: pd.DataFrame) -> pd.DataFrame:
     # --- 修正箇所: Spot行の end_time は既存値を優先し、欠損・破綻時のみ duration_minutes で補完 ---
     if df is None or df.empty:
@@ -4199,9 +4117,6 @@ def _looks_like_phase2_embedded_transport_row(current: pd.Series | Dict, actual_
         if duration < 0:
             duration += 24 * 60
 
-    if bool(_row_value(current, "station_anchor_normalized", False)):
-        return False
-
     if duration is None or duration < min_minutes:
         return False
 
@@ -4225,9 +4140,6 @@ def _looks_like_embedded_long_return_transport(current: pd.Series | Dict, actual
     # スポット行として持っている場合、Phase3でさらに東京駅→福井駅 30分の
     # 推測transportを追加しないための保険。
     if current is None or actual_next is None:
-        return False
-
-    if bool(_row_value(current, "station_anchor_normalized", False)):
         return False
 
     current_dest = safe_text(_row_value(current, "destination", ""), "")
@@ -4405,20 +4317,9 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             route_source = str(fallback["source"]) if not service_hint else "train_bridge_fallback"
             one_point = str(fallback["note"])
 
-        embedded_minutes = _embedded_transport_minutes_from_row(current)
-        if embedded_minutes and embedded_minutes >= 60:
-            transport_minutes = int(embedded_minutes)
-            duration_label = f"約{transport_minutes}分"
-            route_source = "phase2_station_anchor_embedded_duration"
-            if not one_point or one_point == "-":
-                one_point = "Phase2の駅行に含まれていた長距離移動時間を移動カード側へ退避して利用"
-
         next_start_time = safe_text(actual_next.get("start_time"), "")
         consistent_gap = _minutes_between_clock(departure_time, next_start_time) if departure_time and next_start_time else None
-        if embedded_minutes and embedded_minutes >= 60:
-            # stationアンカーの元durationは「駅滞在」ではなく次区間移動候補として優先する。
-            arrival_time = _add_minutes_to_clock(departure_time, transport_minutes)
-        elif consistent_gap is not None and 1 <= consistent_gap <= 12 * 60:
+        if consistent_gap is not None and 1 <= consistent_gap <= 12 * 60:
             transport_minutes = consistent_gap
             arrival_time = next_start_time
             duration_label = f"約{transport_minutes}分"
@@ -4585,8 +4486,6 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
     df = _protect_meal_rows(df)
     # --- 修正箇所: 自然文見出しが destination に混入した invalid node 名を安全に補正 ---
     df = _normalize_invalid_node_names(df, planning_state)
-    # --- 修正箇所(v6.2.56): Phase2のstation行は移動カード扱いせず、駅アンカーとして保持 ---
-    df = _normalize_station_anchor_rows(df, planning_state)
 
     if planning_state["hotel_required"]:
         has_hotel = df.apply(lambda row: _is_valid_hotel_row(row), axis=1).any()
@@ -4977,8 +4876,12 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
     if not name or name == "-":
         return
 
-    # ホテル・駅行は既存のホテル導線/移動導線と混ざるため、この軽量リンク表示では対象外にする。
-    if _is_hotel_like_name(name) or ("駅" in name):
+    # ホテル行は既存のホテル導線と混ざるため、この軽量リンク表示では対象外にする。
+    if _is_hotel_like_name(name):
+        return
+
+    # --- 修正箇所(v6.2.57): 駅・空港などの移動アンカーにはSpot Enrichmentを出さない ---
+    if _is_station_anchor_name(name):
         return
 
     if enrich_spot_info and format_spot_enrichment_markdown:
@@ -5403,6 +5306,68 @@ def render_simple_itinerary_page() -> None:
     )
 
 
+# =========================================================
+# 修正箇所(v6.2.57): 駅アンカー補助表示
+# - Phase2/Phase3のDataFrame自体は書き換えない
+# - 長距離移動カードに吸収された出発駅/到着駅を、カード表示時だけ補助表示する
+# - 駅カードにはSpot Enrichmentを出さない
+# =========================================================
+def _is_station_anchor_name(name: str) -> bool:
+    text = safe_text(name, "")
+    if not text or text == "-":
+        return False
+    lowered = text.lower()
+    if "hotel" in lowered or "ホテル" in text:
+        return False
+    blocked = ["美術館", "博物館", "歌舞伎", "ディズニー", "公園", "商店街"]
+    if any(token in text for token in blocked):
+        return False
+    return text.endswith("駅") or text.endswith("空港") or text.endswith("港") or text.endswith("バスターミナル")
+
+
+def _has_adjacent_station_spot(day_df: pd.DataFrame, local_pos: int, station_name: str, direction: str) -> bool:
+    """移動カードの前後に同じ駅スポットが既にあるかを確認する。"""
+    if day_df is None or day_df.empty or not station_name:
+        return False
+
+    search_range = range(local_pos - 1, -1, -1) if direction == "before" else range(local_pos + 1, len(day_df))
+    for pos in search_range:
+        try:
+            candidate = day_df.iloc[pos]
+        except Exception:
+            continue
+        if bool(candidate.get("is_transport", False)):
+            continue
+        candidate_destination = safe_text(candidate.get("destination"), "")
+        if _same_effective_place(candidate_destination, station_name):
+            return True
+        # 直近の非transportが別地点なら、そこで探索を止める。
+        return False
+    return False
+
+
+def _render_station_anchor_card(station_name: str, time_text: str, role_label: str, source_row: Dict[str, object]) -> None:
+    """DataFrameには追加せず、UI上だけ駅スポットカードを補助表示する。"""
+    if not _is_station_anchor_name(station_name):
+        return
+    safe_station = html.escape(safe_text(station_name, ""))
+    safe_time = html.escape(safe_text(time_text, ""))
+    safe_role = html.escape(safe_text(role_label, "移動拠点"))
+    status = safe_text(source_row.get("execution_status"), "")
+    status_label = "キャンセル" if status == "cancelled" else "これから"
+    note = "移動カードに含まれる駅を、出発・到着の目印として補助表示しています。"
+    body = f"""
+<div class="vf-card vf-card-future">
+  <div style="font-size:1.05rem;font-weight:800;color:#1d4ed8;margin-bottom:6px;">📍 {safe_time} - {safe_station}</div>
+  <div>状態: {html.escape(status_label)}</div>
+  <div>目的: {safe_role}</div>
+  <div>滞在時間: 目印表示</div>
+  <div style="margin-top:6px;opacity:0.82;">{html.escape(note)}</div>
+</div>
+"""
+    st.markdown(body, unsafe_allow_html=True)
+    st.link_button("📍 Google Mapsで場所を見る", build_google_maps_search_url(station_name), use_container_width=True)
+
 def render_itinerary_cards(
     df: pd.DataFrame,
     current_step: int | None = None,
@@ -5463,6 +5428,10 @@ def render_itinerary_cards(
                     else:
                         origin, destination = "現在地", destination_text
 
+                    # --- 修正箇所(v6.2.57): 移動カードに吸収された出発駅を、表示時だけ駅カードとして補助表示 ---
+                    if _is_station_anchor_name(origin) and not _has_adjacent_station_spot(day_df, local_pos, origin, "before"):
+                        _render_station_anchor_card(origin, safe_text(row_dict.get("start_time"), ""), "出発・乗車", row_dict)
+
                     route_url = safe_text(row_dict.get("route_url"), "")
                     if not route_url or route_url == "-":
                         route_url = build_google_maps_dir_url(
@@ -5496,6 +5465,10 @@ def render_itinerary_cards(
                         uber_url = build_uber_ride_url(origin, destination)
                         st.caption("タクシー移動です。移動開始の数分前に Uber を予約するとスムーズです。")
                         st.link_button("🚕 Uberで配車予約", uber_url, use_container_width=True)
+
+                    # --- 修正箇所(v6.2.57): 移動カードに吸収された到着駅を、表示時だけ駅カードとして補助表示 ---
+                    if _is_station_anchor_name(destination) and not _has_adjacent_station_spot(day_df, local_pos, destination, "after"):
+                        _render_station_anchor_card(destination, safe_text(row_dict.get("end_time"), ""), "到着・降車", row_dict)
 
                     if allow_transport_edit and absolute_idx is not None:
                         with st.expander(f"移動手段を変更 Day{int(day)}-Step{absolute_idx + 1}", expanded=False):
