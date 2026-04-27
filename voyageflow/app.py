@@ -24,6 +24,24 @@ from utils.weather_mock import build_mock_weather_context
 from maps.places_api import PlacesAPI
 from maps.routes_api import RoutesAPI
 
+# =========================================================
+# 修正箇所(v6.2.53): Spot Enrichment Service
+# - 外部サービス化した辞書ベース補完を利用
+# - 失敗時は既存の軽量リンク処理へfallbackするため、既存機能は壊さない
+# =========================================================
+try:
+    from services.spot_enrichment import (
+        enrich_spot_info,
+        format_spot_enrichment_markdown,
+        primary_spot_info_url,
+        spot_enrichment_headline,
+    )
+except Exception:
+    enrich_spot_info = None
+    format_spot_enrichment_markdown = None
+    primary_spot_info_url = None
+    spot_enrichment_headline = None
+
 
 # =========================================================
 # 【バージョン名】VoyageFlow v6.2.52-experimental-phase3-double-transport-guard
@@ -34,10 +52,13 @@ from maps.routes_api import RoutesAPI
 # - Phase3で「Phase2行自体が長距離移動を含んでいる」と判断できる場合、二重移動カード生成をスキップ
 # - 福井駅→東京駅などで、駅発の長時間移動ブロックに対して重複transportを追加しないガードを追加
 # - Phase2データ自体は書き換えない。完成旅程の二重移動防止のみ
+# - v6.2.53: Spot Enrichmentを別ファイル services/spot_enrichment.py + data/spot_event_dictionary.py として最小統合
+# - スポットカード下部・簡易一覧の公式情報リンクを辞書ベース優先に変更
+# - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.52-experimental-phase3-double-transport-guard"
-APP_UPDATED_DATE = "2026-04-26"
+APP_VERSION_NAME = "v6.2.53-spot-enrichment-minimal"
+APP_UPDATED_DATE = "2026-04-27"
 
 
 # =========================================================
@@ -4625,6 +4646,10 @@ def _spot_latest_info_search_url(destination: str, visit_date: str, category: st
 
 
 def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
+    # --- 修正箇所(v6.2.53): Spot Enrichmentを優先利用 ---
+    # - LLMにイベント名を捏造させない
+    # - 辞書登録スポットは公式リンク・登録済みイベントを表示
+    # - 辞書未登録スポットは既存同様に公式情報検索へfallback
     name = safe_text(destination, "")
     if not name or name == "-":
         return
@@ -4633,6 +4658,21 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
     if _is_hotel_like_name(name):
         return
 
+    if enrich_spot_info and format_spot_enrichment_markdown:
+        try:
+            info = enrich_spot_info(
+                spot_name=name,
+                area_hint=safe_text(st.session_state.get("planning_state", {}).get("primary_destination"), ""),
+                travel_date=visit_date,
+            )
+            markdown = format_spot_enrichment_markdown(info)
+            if markdown:
+                st.markdown(markdown)
+                return
+        except Exception as e:
+            log_event("Spot Enrichment", f"辞書補完に失敗したため既存リンクへfallback: {e}", level="warning")
+
+    # fallback: v6.2.52までの安全版リンク表示
     for key, info in SPOT_INFO_SOURCES.items():
         if key in name:
             st.markdown("**🔎 最新情報**")
@@ -4845,9 +4885,20 @@ def _build_hotel_booking_search_url(hotel_name: str, visit_date: str = "") -> st
 
 
 def _simple_latest_info_headline(destination: str, visit_date: str = "") -> str:
+    # --- 修正箇所(v6.2.53): 簡易一覧もSpot Enrichmentの見出しを優先 ---
     name = safe_text(destination, "")
     if not name or name == "-" or _is_hotel_like_name(name):
         return ""
+    if enrich_spot_info and spot_enrichment_headline:
+        try:
+            info = enrich_spot_info(
+                spot_name=name,
+                area_hint=safe_text(st.session_state.get("planning_state", {}).get("primary_destination"), ""),
+                travel_date=visit_date,
+            )
+            return safe_text(spot_enrichment_headline(info), "公式情報確認")
+        except Exception:
+            pass
     for key, info in SPOT_INFO_SOURCES.items():
         if key in name:
             return safe_text(info.get("label"), "公式情報あり")
@@ -4866,10 +4917,22 @@ def _simple_latest_info_headline(destination: str, visit_date: str = "") -> str:
 
 
 def _simple_spot_info_url(destination: str, visit_date: str = "") -> str:
-    # --- 修正箇所: 簡易一覧のスポット名リンクはMapsではなく公式情報/公式検索を優先 ---
+    # --- 修正箇所(v6.2.53): 簡易一覧のスポット名リンクはSpot Enrichment URLを優先 ---
     name = safe_text(destination, "")
     if not name or name == "-" or _is_hotel_like_name(name):
         return ""
+    if enrich_spot_info and primary_spot_info_url:
+        try:
+            info = enrich_spot_info(
+                spot_name=name,
+                area_hint=safe_text(st.session_state.get("planning_state", {}).get("primary_destination"), ""),
+                travel_date=visit_date,
+            )
+            url = safe_text(primary_spot_info_url(info), "")
+            if url and url != "-":
+                return url
+        except Exception:
+            pass
     for key, info in SPOT_INFO_SOURCES.items():
         if key in name:
             return safe_text(info.get("url"), "")

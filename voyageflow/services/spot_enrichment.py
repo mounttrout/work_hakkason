@@ -1,309 +1,164 @@
 # -*- coding: utf-8 -*-
 """
-VoyageFlow spot_enrichment.py
+VoyageFlow Spot Enrichment Service
+version: v0.2.0
+created: 2026-04-27
 
-【役割】
-- data/spot_event_dictionary.py の辞書を検索する。
-- Phase2 / Phase3 の旅程データは変更しない。
-- 完成旅程カード下部に表示する「🔎 最新情報」用の表示データを返す。
-- 取得できない場合は公式検索リンクへフォールバックする。
-
-【app.py からの利用イメージ】
-from services.spot_enrichment import render_spot_latest_info
-
-# スポットカード描画の末尾だけで呼ぶ
-render_spot_latest_info(destination, visit_date=date_text, city_hint=primary_destination)
-
+目的:
+- スポット名から公式情報・イベント情報・予約導線を返す
+- LLMに最新イベントを生成させず、辞書ベースで安全に補完する
+- 未登録スポットは検索/公式確認fallback用データを返す
 """
 
 from __future__ import annotations
 
-import re
-import urllib.parse
-from datetime import datetime, date
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote_plus
 
 try:
-    from data.spot_event_dictionary import (
-        SPOT_EVENT_DICTIONARY,
-        DICTIONARY_UPDATED_AT,
-    )
+    from data.spot_event_dictionary import SPOT_EVENT_DICTIONARY
 except Exception:
-    SPOT_EVENT_DICTIONARY = []
-    DICTIONARY_UPDATED_AT = ""
+    SPOT_EVENT_DICTIONARY = {}
 
 
-def _safe_text(value, default: str = "") -> str:
-    if value is None:
-        return default
-    text = str(value).strip()
-    return text if text else default
-
-
-def _parse_date(value: str) -> Optional[date]:
-    text = _safe_text(value)
-    if not text or text == "-":
-        return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(text, fmt).date()
-        except Exception:
-            continue
-    return None
-
-
-def _normalize_for_match(value: str) -> str:
-    text = _safe_text(value).lower()
-    text = text.replace("　", " ")
-    text = re.sub(r"[（）()\[\]【】「」『』]", " ", text)
-    text = re.sub(r"\s+", "", text)
+def normalize_spot_name(name: Any) -> str:
+    if name is None:
+        return ""
+    text = str(name).strip().replace("　", " ")
     return text
 
 
-def _date_in_range(visit_date: Optional[str], valid_from: str, valid_to: str) -> bool:
-    target = _parse_date(visit_date or "")
-    if target is None:
-        return True
-    start = _parse_date(valid_from)
-    end = _parse_date(valid_to)
-    if start and target < start:
-        return False
-    if end and target > end:
-        return False
-    return True
-
-
-def _is_closed_date(visit_date: Optional[str], closed_dates: List[str]) -> bool:
-    target = _parse_date(visit_date or "")
-    if target is None:
-        return False
-    for closed in closed_dates or []:
-        if _parse_date(closed) == target:
-            return True
-    return False
-
-
-def _guess_category(name: str) -> str:
-    text = _safe_text(name)
-    if any(k in text for k in ["美術館", "博物館", "ミュージアム", "Museum"]):
-        return "museum"
-    if any(k in text for k in ["劇場", "座", "シアター", "能楽堂", "歌舞伎"]):
-        return "theater"
-    if any(k in text for k in ["水族館", "Aquarium"]):
-        return "aquarium"
-    if any(k in text for k in ["動物園", "Zoo"]):
-        return "zoo"
-    if any(k in text for k in ["公園", "庭園", "Park", "Garden"]):
-        return "park"
-    if any(k in text for k in ["寺", "神社", "宮"]):
-        return "shrine_temple"
-    if any(k in text for k in ["城"]):
-        return "castle"
-    if any(k in text for k in ["タワー", "スカイツリー", "Tower"]):
-        return "tower_observation"
-    if any(k in text for k in ["ディズニー", "ランド", "ピューロ", "レゴランド", "遊園地"]):
-        return "theme_park"
-    if any(k in text for k in ["市場", "商店街"]):
-        return "market"
-    if any(k in text for k in ["SIX", "ヒルズ", "ミッドタウン", "スクエア", "モール", "商業施設"]):
-        return "commercial_complex"
-    return "other"
-
-
-def _fallback_query_for_category(name: str, category: str, visit_date: Optional[str]) -> Tuple[str, str]:
-    date_part = ""
-    parsed = _parse_date(visit_date or "")
-    if parsed:
-        date_part = f" {parsed.year}年{parsed.month}月{parsed.day}日"
-
-    if category == "museum":
-        q = f"{name} 展覧会{date_part}"
-        label = "展示情報を調べる"
-    elif category == "theater":
-        q = f"{name} 公演 演目{date_part}"
-        label = "公演情報を調べる"
-    elif category in {"commercial_complex", "market", "area"}:
-        q = f"{name} イベント{date_part}"
-        label = "イベント情報を調べる"
-    elif category in {"theme_park", "amusement"}:
-        q = f"{name} イベント チケット{date_part}"
-        label = "イベント・チケット情報を調べる"
-    elif category in {"park", "garden", "nature"}:
-        q = f"{name} イベント 開園{date_part}"
-        label = "開園・イベント情報を調べる"
-    elif category == "shrine_temple":
-        q = f"{name} 行事 参拝{date_part}"
-        label = "行事・参拝情報を調べる"
-    else:
-        q = f"{name} 公式 最新情報{date_part}"
-        label = "公式情報を調べる"
-
-    url = "https://www.google.com/search?q=" + urllib.parse.quote(q)
-    return label, url
-
-
-def _score_entry(destination: str, entry: Dict[str, object], city_hint: str = "") -> int:
-    dest_norm = _normalize_for_match(destination)
-    if not dest_norm:
-        return 0
-
-    names = [entry.get("spot_name", "")]
-    names.extend(entry.get("aliases", []) or [])
-
-    best = 0
-    for name in names:
-        name_norm = _normalize_for_match(name)
-        if not name_norm:
-            continue
-        if dest_norm == name_norm:
-            best = max(best, 100)
-        elif name_norm in dest_norm:
-            best = max(best, 90)
-        elif dest_norm in name_norm:
-            best = max(best, 75)
-
-    if best and city_hint:
-        city = _safe_text(entry.get("city"))
-        if city and city in _safe_text(city_hint):
-            best += 5
-
-    return best
-
-
-def _find_best_entry(destination: str, visit_date: Optional[str] = None, city_hint: str = "") -> Optional[Dict[str, object]]:
-    candidates: List[Tuple[int, Dict[str, object]]] = []
-    for entry in SPOT_EVENT_DICTIONARY:
-        score = _score_entry(destination, entry, city_hint=city_hint)
-        if score <= 0:
-            continue
-
-        # 期間外でもリンクは使えるが、イベント詳細は出さない。
-        if entry.get("type") == "event" and not _date_in_range(visit_date, entry.get("valid_from", ""), entry.get("valid_to", "")):
-            score -= 20
-
-        candidates.append((score, entry))
-
-    if not candidates:
+def find_spot_key(spot_name: Any) -> Optional[str]:
+    name = normalize_spot_name(spot_name)
+    if not name:
         return None
+    if name in SPOT_EVENT_DICTIONARY:
+        return name
+    for key in SPOT_EVENT_DICTIONARY.keys():
+        if key in name or name in key:
+            return key
+    return None
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    if candidates[0][0] < 60:
-        return None
-    return candidates[0][1]
+
+def build_google_search_url(query: str) -> str:
+    return "https://www.google.com/search?q=" + quote_plus(query)
 
 
-def get_spot_latest_info(destination: str, visit_date: Optional[str] = None, city_hint: str = "") -> Dict[str, object]:
-    """
-    スポット名と旅行日から、カード表示用の最新情報を返す。
-    旅程本体は変更しない。
-    """
-    name = _safe_text(destination)
-    if not name or name == "-":
-        return {"found": False, "should_render": False}
+def enrich_spot_info(
+    spot_name: Any,
+    area_hint: Optional[str] = None,
+    travel_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    name = normalize_spot_name(spot_name)
+    key = find_spot_key(name)
 
-    entry = _find_best_entry(name, visit_date=visit_date, city_hint=city_hint)
-    category = _guess_category(name)
-
-    if entry:
-        closed = _is_closed_date(visit_date, entry.get("closed_dates", []) or [])
-        in_range = _date_in_range(visit_date, entry.get("valid_from", ""), entry.get("valid_to", ""))
-
-        details = list(entry.get("details", []) or [])
-        status_label = "公式情報確認"
-        display_type = "link_only"
-
-        if entry.get("type") == "event" and in_range:
-            status_label = "旅行予定日に開催情報あり"
-            display_type = "event"
-
-        if entry.get("type") == "event" and not in_range:
-            status_label = "旅行予定日は会期外の可能性あり"
-            display_type = "out_of_range"
-
-        if closed:
-            status_label = "旅行予定日は休演・休館の可能性あり"
-            display_type = "closed_warning"
-            details = ["この日は休演・休館日に該当する可能性があります。日程変更または公式確認を推奨。"] + details
-
+    if key:
+        data = SPOT_EVENT_DICTIONARY.get(key, {})
         return {
-            "found": True,
-            "should_render": True,
-            "display_type": display_type,
-            "spot_name": entry.get("spot_name", name),
-            "category": entry.get("category", category),
-            "status_label": status_label,
-            "headline": entry.get("headline", "公式情報確認"),
-            "details": details,
-            "source_label": entry.get("source_label", "公式情報"),
-            "source_url": entry.get("source_url", ""),
-            "confidence": entry.get("confidence", "official_link"),
-            "fetched_at": DICTIONARY_UPDATED_AT,
+            "matched": True,
+            "spot_name": name,
+            "matched_name": key,
+            "area": data.get("area"),
+            "category": data.get("category"),
+            "official_url": data.get("official_url"),
+            "latest_info_url": data.get("latest_info_url") or data.get("official_url"),
+            "reservation_url": data.get("reservation_url"),
+            "display_note": data.get("display_note", "最新情報は公式サイトで確認してください。"),
+            "known_events": data.get("known_events", []),
+            "fallback_search_url": build_google_search_url(f"{key} 公式 最新情報"),
         }
 
-    label, url = _fallback_query_for_category(name, category, visit_date)
+    search_query_parts = [name]
+    if area_hint:
+        search_query_parts.append(str(area_hint))
+    if travel_date:
+        search_query_parts.append(str(travel_date))
+    search_query_parts.append("公式 最新情報")
+    fallback_url = build_google_search_url(" ".join(search_query_parts))
+
     return {
-        "found": False,
-        "should_render": True,
-        "display_type": "fallback_search",
+        "matched": False,
         "spot_name": name,
-        "category": category,
-        "status_label": "公式情報確認",
-        "headline": label,
-        "details": ["辞書未登録スポットのため、公式情報・イベント情報の確認リンクを表示します。"],
-        "source_label": "Google検索",
-        "source_url": url,
-        "confidence": "search_fallback",
-        "fetched_at": DICTIONARY_UPDATED_AT,
+        "matched_name": None,
+        "area": area_hint,
+        "category": None,
+        "official_url": None,
+        "latest_info_url": fallback_url,
+        "reservation_url": None,
+        "display_note": "このスポットは辞書未登録です。最新情報は公式サイトまたは検索結果から確認してください。",
+        "known_events": [],
+        "fallback_search_url": fallback_url,
     }
 
 
-def build_spot_latest_info_markdown(info: Dict[str, object]) -> str:
-    if not info or not info.get("should_render"):
+def spot_enrichment_headline(info: Dict[str, Any]) -> str:
+    if not info:
+        return "公式情報確認"
+    events = info.get("known_events") or []
+    if events:
+        return f"公式情報・登録イベント {len(events)}件"
+    if info.get("matched"):
+        category = str(info.get("category") or "")
+        if category in {"museum"}:
+            return "展示・公式情報確認"
+        if category in {"theater"}:
+            return "公演・公式情報確認"
+        if category in {"theme_park"}:
+            return "イベント・運営情報確認"
+        return "公式情報確認"
+    return "公式情報検索"
+
+
+def primary_spot_info_url(info: Dict[str, Any]) -> str:
+    if not info:
+        return ""
+    return str(info.get("latest_info_url") or info.get("official_url") or info.get("fallback_search_url") or "")
+
+
+def format_spot_enrichment_markdown(info: Dict[str, Any]) -> str:
+    if not info:
         return ""
 
-    status = _safe_text(info.get("status_label"), "公式情報確認")
-    headline = _safe_text(info.get("headline"), "")
-    source_label = _safe_text(info.get("source_label"), "公式情報")
-    fetched_at = _safe_text(info.get("fetched_at"), "")
+    lines: List[str] = []
+    lines.append("**🔎 最新情報**")
 
-    lines = ["**🔎 最新情報**"]
-    if status:
-        lines.append(f"- {status}")
-    if headline:
-        lines.append(f"- {headline}")
+    if info.get("display_note"):
+        lines.append(f"- 注意: {info.get('display_note')}")
 
-    for detail in info.get("details", []) or []:
-        detail_text = _safe_text(detail)
-        if detail_text:
-            lines.append(f"- {detail_text}")
+    events = info.get("known_events") or []
+    if events:
+        lines.append("- 登録済みイベント/展示:")
+        for ev in events:
+            name = ev.get("name", "名称未設定")
+            period = ev.get("period", "期間未設定")
+            source_url = ev.get("source_url")
+            if source_url:
+                lines.append(f"  - [{name}]({source_url})（{period}）")
+            else:
+                lines.append(f"  - {name}（{period}）")
+    elif info.get("matched"):
+        lines.append("- 登録済みイベント/展示: なし（公式ページで最新情報を確認）")
+    else:
+        lines.append("- 登録済みイベント/展示: 未登録")
 
-    if source_label:
-        lines.append(f"- 情報元: {source_label}")
-    if fetched_at:
-        lines.append(f"- 情報取得日: {fetched_at}")
+    official_url = info.get("official_url")
+    latest_info_url = info.get("latest_info_url")
+    reservation_url = info.get("reservation_url")
+
+    if official_url:
+        lines.append(f"- [公式サイト]({official_url})")
+    if latest_info_url:
+        lines.append(f"- [最新情報を確認]({latest_info_url})")
+    if reservation_url:
+        lines.append(f"- [予約・チケット確認]({reservation_url})")
 
     return "\n".join(lines)
 
 
-def render_spot_latest_info(destination: str, visit_date: Optional[str] = None, city_hint: str = "") -> None:
-    """
-    Streamlit UI用。
-    app.py側ではスポットカード末尾でこれを1回呼ぶだけにする。
-    """
-    try:
-        import streamlit as st
-    except Exception:
-        return
-
-    info = get_spot_latest_info(destination, visit_date=visit_date, city_hint=city_hint)
-    if not info.get("should_render"):
-        return
-
-    markdown = build_spot_latest_info_markdown(info)
-    if markdown:
-        st.markdown(markdown)
-
-    url = _safe_text(info.get("source_url"), "")
-    source_label = _safe_text(info.get("source_label"), "公式情報")
-    if url:
-        st.link_button(f"🔗 {source_label}を見る", url, use_container_width=True)
+def enrich_spot_as_markdown(
+    spot_name: Any,
+    area_hint: Optional[str] = None,
+    travel_date: Optional[str] = None,
+) -> str:
+    info = enrich_spot_info(spot_name=spot_name, area_hint=area_hint, travel_date=travel_date)
+    return format_spot_enrichment_markdown(info)
