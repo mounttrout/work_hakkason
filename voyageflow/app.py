@@ -57,7 +57,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.55-hotel-destination-and-long-return-guard"
+APP_VERSION_NAME = "v6.2.56-station-anchor-normalization"
 APP_UPDATED_DATE = "2026-04-27"
 
 
@@ -3749,6 +3749,88 @@ def _coerce_positive_minutes(value) -> Optional[int]:
         return None
 
 
+def _is_station_anchor_row(row: pd.Series | Dict | None) -> bool:
+    """Phase2の駅行を、移動ではなく出発/到着アンカーとして扱うための判定。"""
+    if row is None:
+        return False
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    genre = safe_text(_row_value(row, "genre", ""), "").lower()
+    return bool(destination and (("駅" in destination) or genre == "station" or "station" in genre))
+
+
+def _normalize_station_anchor_rows(df: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    """
+    Phase2には原則「移動行」は入れない前提のため、station + transport を移動扱いにしない。
+    駅行はスポットアンカーとして残し、長い duration は次区間の移動時間候補として退避する。
+    """
+    if df is None or df.empty:
+        return df
+
+    normalized = df.copy().reset_index(drop=True)
+    for col, default in {
+        "embedded_transport_minutes": None,
+        "embedded_transport_original_start_time": "",
+        "embedded_transport_original_end_time": "",
+        "station_anchor_normalized": False,
+    }.items():
+        if col not in normalized.columns:
+            normalized[col] = default
+
+    meal_shopping_activity = {"meal", "lunch", "dinner", "breakfast", "shopping", "activity", "sightseeing", "museum", "theater"}
+
+    for idx in normalized.index:
+        row = normalized.loc[idx]
+        if not _is_station_anchor_row(row):
+            continue
+
+        purpose = safe_text(row.get("purpose"), "").lower()
+        genre = safe_text(row.get("genre"), "").lower()
+        if purpose in meal_shopping_activity:
+            continue
+
+        start_time = safe_text(row.get("start_time"), safe_text(planning_state.get("departure_time"), "09:00"))
+        end_time = safe_text(row.get("end_time"), "")
+        minutes_from_clock = _minutes_between_clock(start_time, end_time) if start_time and end_time else None
+        duration_minutes = _coerce_positive_minutes(row.get("duration_minutes"))
+        original_minutes = minutes_from_clock or duration_minutes
+
+        if original_minutes and original_minutes >= 60:
+            normalized.at[idx, "embedded_transport_minutes"] = int(original_minutes)
+            normalized.at[idx, "embedded_transport_original_start_time"] = start_time
+            normalized.at[idx, "embedded_transport_original_end_time"] = end_time
+
+        # 駅そのものはスポットアンカーとして残す。長時間滞在は避け、30分へ丸める。
+        normalized.at[idx, "is_transport"] = False
+        normalized.at[idx, "genre"] = "station"
+        if purpose in {"transport", "move", "transfer", "", "-"}:
+            if idx == 0:
+                normalized.at[idx, "purpose"] = "departure"
+            else:
+                prev_day = int(normalized.at[idx - 1, "day"]) if idx - 1 in normalized.index and pd.notna(normalized.at[idx - 1, "day"]) else None
+                cur_day = int(row.get("day")) if pd.notna(row.get("day")) else None
+                normalized.at[idx, "purpose"] = "arrival" if prev_day == cur_day else "departure"
+
+        normalized.at[idx, "duration_minutes"] = 30
+        if start_time:
+            normalized.at[idx, "end_time"] = _add_minutes_to_clock(start_time, 30)
+        normalized.at[idx, "station_anchor_normalized"] = True
+        normalized.at[idx, "route_from"] = ""
+        normalized.at[idx, "route_to"] = ""
+        normalized.at[idx, "route_url"] = ""
+        normalized.at[idx, "route_data_source"] = ""
+        normalized.at[idx, "estimated_duration_label"] = ""
+        log_event("Phase2正規化", f"station行を移動ではなく駅アンカーに補正: {safe_text(row.get('destination'), '')} / original_duration={original_minutes or '-'}分", level="info")
+
+    return normalized.reset_index(drop=True)
+
+
+def _embedded_transport_minutes_from_row(row: pd.Series | Dict | None) -> Optional[int]:
+    if row is None:
+        return None
+    value = _row_value(row, "embedded_transport_minutes", None)
+    return _coerce_positive_minutes(value)
+
+
 def rebuild_phase2_time_consistency(df: pd.DataFrame) -> pd.DataFrame:
     # --- 修正箇所: Spot行の end_time は既存値を優先し、欠損・破綻時のみ duration_minutes で補完 ---
     if df is None or df.empty:
@@ -4117,6 +4199,9 @@ def _looks_like_phase2_embedded_transport_row(current: pd.Series | Dict, actual_
         if duration < 0:
             duration += 24 * 60
 
+    if bool(_row_value(current, "station_anchor_normalized", False)):
+        return False
+
     if duration is None or duration < min_minutes:
         return False
 
@@ -4140,6 +4225,9 @@ def _looks_like_embedded_long_return_transport(current: pd.Series | Dict, actual
     # スポット行として持っている場合、Phase3でさらに東京駅→福井駅 30分の
     # 推測transportを追加しないための保険。
     if current is None or actual_next is None:
+        return False
+
+    if bool(_row_value(current, "station_anchor_normalized", False)):
         return False
 
     current_dest = safe_text(_row_value(current, "destination", ""), "")
@@ -4317,9 +4405,20 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             route_source = str(fallback["source"]) if not service_hint else "train_bridge_fallback"
             one_point = str(fallback["note"])
 
+        embedded_minutes = _embedded_transport_minutes_from_row(current)
+        if embedded_minutes and embedded_minutes >= 60:
+            transport_minutes = int(embedded_minutes)
+            duration_label = f"約{transport_minutes}分"
+            route_source = "phase2_station_anchor_embedded_duration"
+            if not one_point or one_point == "-":
+                one_point = "Phase2の駅行に含まれていた長距離移動時間を移動カード側へ退避して利用"
+
         next_start_time = safe_text(actual_next.get("start_time"), "")
         consistent_gap = _minutes_between_clock(departure_time, next_start_time) if departure_time and next_start_time else None
-        if consistent_gap is not None and 1 <= consistent_gap <= 12 * 60:
+        if embedded_minutes and embedded_minutes >= 60:
+            # stationアンカーの元durationは「駅滞在」ではなく次区間移動候補として優先する。
+            arrival_time = _add_minutes_to_clock(departure_time, transport_minutes)
+        elif consistent_gap is not None and 1 <= consistent_gap <= 12 * 60:
             transport_minutes = consistent_gap
             arrival_time = next_start_time
             duration_label = f"約{transport_minutes}分"
@@ -4486,6 +4585,8 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
     df = _protect_meal_rows(df)
     # --- 修正箇所: 自然文見出しが destination に混入した invalid node 名を安全に補正 ---
     df = _normalize_invalid_node_names(df, planning_state)
+    # --- 修正箇所(v6.2.56): Phase2のstation行は移動カード扱いせず、駅アンカーとして保持 ---
+    df = _normalize_station_anchor_rows(df, planning_state)
 
     if planning_state["hotel_required"]:
         has_hotel = df.apply(lambda row: _is_valid_hotel_row(row), axis=1).any()
@@ -4876,8 +4977,8 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
     if not name or name == "-":
         return
 
-    # ホテル行は既存のホテル導線と混ざるため、この軽量リンク表示では対象外にする。
-    if _is_hotel_like_name(name):
+    # ホテル・駅行は既存のホテル導線/移動導線と混ざるため、この軽量リンク表示では対象外にする。
+    if _is_hotel_like_name(name) or ("駅" in name):
         return
 
     if enrich_spot_info and format_spot_enrichment_markdown:
