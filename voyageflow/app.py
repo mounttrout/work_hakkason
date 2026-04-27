@@ -51,13 +51,14 @@ except Exception:
 # - Phase2移動誤分類検査ログを維持
 # - Phase3で「Phase2行自体が長距離移動を含んでいる」と判断できる場合、二重移動カード生成をスキップ
 # - 福井駅→東京駅などで、駅発の長時間移動ブロックに対して重複transportを追加しないガードを追加
+# - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
 # - Phase2データ自体は書き換えない。完成旅程の二重移動防止のみ
 # - v6.2.53: Spot Enrichmentを別ファイル services/spot_enrichment.py + data/spot_event_dictionary.py として最小統合
 # - スポットカード下部・簡易一覧の公式情報リンクを辞書ベース優先に変更
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.57-safe-station-card-insertion"
+APP_VERSION_NAME = "v6.2.58-cross-day-transport-guard"
 APP_UPDATED_DATE = "2026-04-27"
 
 
@@ -4178,6 +4179,44 @@ def _looks_like_embedded_long_return_transport(current: pd.Series | Dict, actual
     return bool(transportish and (station_or_terminal or next_is_return))
 
 
+
+def _is_clock_cross_day(start_time: str, end_time: str) -> bool:
+    # --- 修正箇所: v6.2.58 ---
+    start_min = _time_to_minutes(safe_text(start_time, ""))
+    end_min = _time_to_minutes(safe_text(end_time, ""))
+    if start_min is None or end_min is None:
+        return False
+    return end_min < start_min
+
+
+def _is_hotel_or_lodging_row(row: pd.Series | Dict | None) -> bool:
+    if row is None:
+        return False
+    purpose = safe_text(_row_value(row, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(row, "genre", ""), "").lower()
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    return purpose in {"accommodation", "hotel", "stay", "lodging"} or genre == "hotel" or _is_hotel_like_name(destination)
+
+
+def _should_skip_cross_day_transport(current: pd.Series | Dict, actual_next: pd.Series | Dict, departure_time: str, next_start_time: str, transport_minutes: Optional[int] = None) -> bool:
+    # --- 修正箇所: v6.2.58 ---
+    # 22:00 → 翌朝09:00 のような宿泊時間を、660分の移動として扱わない。
+    if not departure_time or not next_start_time:
+        return False
+
+    cross_day = _is_clock_cross_day(departure_time, next_start_time)
+    next_is_hotel = _is_hotel_or_lodging_row(actual_next)
+    current_is_hotel = _is_hotel_or_lodging_row(current)
+
+    if cross_day and (next_is_hotel or current_is_hotel):
+        return True
+    if cross_day and transport_minutes is not None and int(transport_minutes) >= 300:
+        return True
+    if next_is_hotel and transport_minutes is not None and int(transport_minutes) > 120:
+        return True
+
+    return False
+
 def _promote_last_row_to_embedded_transport(rows: List[Dict[str, object]], current: pd.Series | Dict, actual_next: pd.Series | Dict, planning_state: Dict[str, object], service_hint: str = "") -> None:
     # --- 修正箇所: v6.2.55 ---
     # すでに rows に追加済みの current 行を、スポットカードではなく移動カードへ安全に変換する。
@@ -4329,6 +4368,30 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
         else:
             arrival_time = _add_minutes_to_clock(departure_time, transport_minutes)
 
+
+        # --- 修正箇所: v6.2.58 日跨ぎ宿泊前後の移動時間ガード ---
+        if _should_skip_cross_day_transport(current, actual_next, departure_time, next_start_time, transport_minutes):
+            log_event(
+                "Phase3日跨ぎ移動ガード",
+                (
+                    f"宿泊・日跨ぎ時間を移動として扱わないため追加transportをスキップ: "
+                    f"Day{safe_text(current.get('day'), '')} {origin_name} {departure_time} → {destination_name} {next_start_time} "
+                    f"/ 推定{transport_minutes}分"
+                ),
+                level="warning",
+            )
+            continue
+
+        if _is_clock_cross_day(departure_time, arrival_time):
+            log_event(
+                "Phase3日跨ぎ移動ガード",
+                (
+                    f"end_time < start_time のtransport生成を抑止: "
+                    f"Day{safe_text(current.get('day'), '')} {origin_name} {departure_time} → {destination_name} {arrival_time}"
+                ),
+                level="warning",
+            )
+            continue
         route_url = build_google_maps_dir_url(origin_name, destination_name, transport_mode if transport_mode != "air" else "train")
         transport_row = {
             "day": int(current.get("day", 1) or 1),
