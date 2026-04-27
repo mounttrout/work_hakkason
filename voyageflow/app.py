@@ -52,13 +52,14 @@ except Exception:
 # - Phase3で「Phase2行自体が長距離移動を含んでいる」と判断できる場合、二重移動カード生成をスキップ
 # - 福井駅→東京駅などで、駅発の長時間移動ブロックに対して重複transportを追加しないガードを追加
 # - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
+# - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
 # - Phase2データ自体は書き換えない。完成旅程の二重移動防止のみ
 # - v6.2.53: Spot Enrichmentを別ファイル services/spot_enrichment.py + data/spot_event_dictionary.py として最小統合
 # - スポットカード下部・簡易一覧の公式情報リンクを辞書ベース優先に変更
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.58-cross-day-transport-guard"
+APP_VERSION_NAME = "v6.2.59-reliability-guards"
 APP_UPDATED_DATE = "2026-04-27"
 
 
@@ -596,6 +597,7 @@ def init_session_state() -> None:
         "validation_source_plan_text": "",
         "validation_source_itinerary_text": "",
         "simple_itinerary_page_mode": False,
+        "spot_reliability_logged_keys": set(),
     }
 
     for key, value in defaults.items():
@@ -1106,6 +1108,26 @@ def _contains_hotel_token(name: str) -> bool:
     return any(token in lowered for token in ["hotel", "inn", "resort", "hostel"]) or any(token in text for token in ["ホテル", "旅館"])
 
 
+def _is_bad_hotel_label(name: str) -> bool:
+    # --- 修正箇所(v6.2.59): 箇条書き見出しや時刻付き説明をホテル名として採用しない ---
+    text = safe_text(name, "")
+    if not text:
+        return True
+    stripped = _strip_itinerary_prefix(text) if "_strip_itinerary_prefix" in globals() else text.lstrip("*").strip()
+    if text.startswith("*") or re.match(r"^[-・*\s]*\d{1,2}:\d{2}\s*-", text):
+        return True
+    if re.match(r"^[-・*\s]*(目的|ワンポイント|メモ|補足)\s*[:：]", stripped):
+        return True
+    bad_exact = {"ホテル", "宿", "宿泊先", "ホテルチェックイン", "チェックイン", "ホテルへの荷物預け", "荷物預け"}
+    if stripped in bad_exact:
+        return True
+    if any(token in stripped for token in ["目的:", "目的：", "ワンポイント", "翌日に備えて", "荷物整理", "休息を優先"]):
+        return True
+    if "チェックイン" in stripped and len(stripped) <= 16:
+        return True
+    return False
+
+
 def _is_hotel_like_name(name: str) -> bool:
     text = safe_text(name, "")
     if not text:
@@ -1119,9 +1141,11 @@ def _is_generic_hotel_label(name: str) -> bool:
     text = safe_text(name, "")
     generic_tokens = [
         "宿泊ホテル", "周辺ホテル", "エリア周辺ホテル", "ホテル", "ホテル出発",
-        "宿泊先", "ホテル周辺", "ホテルメイン", "おすすめホテル"
+        "宿泊先", "ホテル周辺", "ホテルメイン", "おすすめホテル", "周辺ホテル"
     ]
     if text in generic_tokens:
+        return True
+    if _is_bad_hotel_label(text):
         return True
     if text.endswith("周辺ホテル") or text.endswith("エリア周辺ホテル"):
         return True
@@ -1228,7 +1252,7 @@ def _extract_concrete_hotel_name_from_plan_text(plan_text: str) -> str:
         candidate = re.sub(r"\s*[（(][^）)]*エリア[^）)]*[）)]\s*$", "", candidate).strip()
         candidate = re.sub(r"\s*[（(][^）)]*周辺[^）)]*[）)]\s*$", "", candidate).strip()
         candidate = re.sub(r"^(宿泊先\s*[:：]\s*)", "", candidate).strip()
-        if candidate and not _is_generic_hotel_label(candidate):
+        if candidate and not _is_generic_hotel_label(candidate) and not _is_bad_hotel_label(candidate) and not _looks_like_invalid_itinerary_node_name(candidate):
             return candidate
     return ""
 
@@ -1239,7 +1263,7 @@ def _extract_concrete_hotel_name_from_day(day_df: pd.DataFrame) -> str:
     concrete_names = []
     for _, row in day_df.iterrows():
         dest = safe_text(row.get("destination"), "")
-        if _is_valid_hotel_row(row) and not _is_generic_hotel_label(dest):
+        if _is_valid_hotel_row(row) and not _is_generic_hotel_label(dest) and not _is_bad_hotel_label(dest) and not _looks_like_invalid_itinerary_node_name(dest):
             concrete_names.append(dest)
     # 同日の終盤にある accommodation を優先
     if concrete_names:
@@ -1453,16 +1477,16 @@ def _extract_hotel_area_from_invalid_text(name: str) -> str:
 
 
 def _derive_safe_hotel_label(name: str) -> str:
-    # --- 修正箇所: v6.2.55 ---
+    # --- 修正箇所: v6.2.55 / v6.2.59 ---
     # destination に混入した説明文をホテル名として採用しない。
     area_from_note = _extract_hotel_area_from_invalid_text(name)
     if area_from_note:
         return f"{area_from_note}周辺ホテル"
 
     place = _derive_place_label_from_invalid_node(name)
-    if not place:
+    if not place or _is_bad_hotel_label(place):
         return "周辺ホテル"
-    if _contains_hotel_token(place) and not _looks_like_invalid_itinerary_node_name(place):
+    if _contains_hotel_token(place) and not _looks_like_invalid_itinerary_node_name(place) and not _is_bad_hotel_label(place):
         return place
     if place.endswith("周辺ホテル"):
         return place
@@ -1609,6 +1633,69 @@ def _propagate_hotel_names(df: pd.DataFrame, planning_state: Dict) -> pd.DataFra
 
     st.session_state["confirmed_hotel_by_day"] = canonical_hotel_by_day
     return normalized
+
+
+def _infer_hotel_area_from_day_rows(day_df: pd.DataFrame) -> str:
+    # --- 修正箇所(v6.2.59): 具体ホテル名が取れない場合に検索しやすいエリア名へ丸める ---
+    if day_df is None or day_df.empty:
+        return ""
+    candidates: List[str] = []
+    for _, row in day_df.iterrows():
+        dest = safe_text(row.get("destination"), "")
+        if not dest or _is_valid_hotel_row(row) or _is_bad_hotel_label(dest):
+            continue
+        candidates.append(dest)
+    joined = " ".join(candidates)
+    area_priority = [
+        ("舞浜", ["ディズニー", "舞浜", "浦安", "東京ベイ"]),
+        ("上野", ["上野", "東京国立博物館", "国立西洋美術館", "アメ横"]),
+        ("両国", ["両国", "国技館", "江戸NOREN"]),
+        ("銀座", ["銀座", "歌舞伎座", "GINZA"]),
+        ("水道橋", ["東京ドーム", "後楽園", "水道橋"]),
+        ("池袋", ["東京芸術劇場", "池袋"]),
+        ("東京駅", ["東京駅", "丸の内", "皇居外苑"]),
+        ("六本木", ["六本木", "森美術館"]),
+        ("表参道", ["表参道", "根津美術館"]),
+    ]
+    for area, tokens in area_priority:
+        if any(token in joined for token in tokens):
+            return area
+    for dest in candidates:
+        area = _extract_area_hint(dest)
+        if area:
+            return area.replace("エリア", "")
+    return "東京" if "東京" in safe_text(st.session_state.get("planning_state", {}).get("primary_destination"), "") else "周辺"
+
+
+def _finalize_hotel_fallback_labels(df: pd.DataFrame, planning_state: Dict) -> pd.DataFrame:
+    # --- 修正箇所(v6.2.59): 壊れたホテル名をルート・カードに出さず、検索用の周辺ホテル表記へ統一 ---
+    if df is None or df.empty or "destination" not in df.columns:
+        return df
+    fixed = df.copy().reset_index(drop=True)
+    if "day" not in fixed.columns:
+        return fixed
+
+    for day, day_df in fixed.groupby("day", sort=True):
+        area = _infer_hotel_area_from_day_rows(day_df)
+        fallback_label = f"{area}周辺ホテル" if area and area != "周辺" else "周辺ホテル"
+        for idx, row in day_df.iterrows():
+            dest = safe_text(row.get("destination"), "")
+            if _is_valid_hotel_row(row) and (_is_bad_hotel_label(dest) or _is_generic_hotel_label(dest) or _looks_like_invalid_itinerary_node_name(dest)):
+                fixed.at[idx, "destination"] = fallback_label
+                fixed.at[idx, "genre"] = "hotel"
+                log_event("ホテル正規化", f"ホテル名が不明なため検索用ラベルへ置換: {dest} -> {fallback_label} (Day{int(day)})", level="warning")
+
+    for col in ["route_from", "route_to"]:
+        if col not in fixed.columns:
+            continue
+        for idx in range(len(fixed)):
+            value = safe_text(fixed.at[idx, col], "")
+            if value and (_is_bad_hotel_label(value) or _looks_like_invalid_itinerary_node_name(value)) and _contains_hotel_token(value):
+                day = int(fixed.at[idx, "day"]) if "day" in fixed.columns and pd.notna(fixed.at[idx, "day"]) else 1
+                day_df = fixed[fixed["day"] == day]
+                area = _infer_hotel_area_from_day_rows(day_df)
+                fixed.at[idx, col] = f"{area}周辺ホテル" if area and area != "周辺" else "周辺ホテル"
+    return fixed
 
 
 def parse_route_diagnostic_departure_iso(departure_text: str) -> str:
@@ -4559,6 +4646,7 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
     df = rebuild_phase2_time_consistency(df)
     df = ensure_daily_hotel_rows(df, planning_state)
     df = _propagate_hotel_names(df, planning_state)
+    df = _finalize_hotel_fallback_labels(df, planning_state)
     df = rebuild_phase2_time_consistency(df)
     if "day" in df.columns and "sequence" in df.columns:
         df = df.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
@@ -4983,6 +5071,190 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
 # - v6.2.45: 簡易一覧をスマホ向けに圧縮（目的/最新情報列削除、操作アイコン短縮）
 # - v6.2.46: 徒歩自動判定（表示のみ）を追加。近接スポットは「徒歩候補」として表示し、旅程本体は変更しない
 # =========================================================
+# =========================================================
+# 修正箇所(v6.2.59): スポット信頼性チェック
+# - LLMに開催日・休館日を作らせず、辞書ルールで危険箇所を検出
+# - ハッカソンで説明できるよう左ログにも記録
+# =========================================================
+SPOT_RELIABILITY_RULES = {
+    "両国国技館": {
+        "type": "event_date",
+        "official_url": "https://kokugikan.sumo.or.jp/Schedule/show/2026-05",
+        "event_keywords": ["相撲", "大相撲", "五月場所", "夏場所"],
+        "valid_ranges": [("2026-05-10", "2026-05-24")],
+        "warning": "2026年5月5日は大相撲五月場所の開催期間外です。五月場所は2026-05-10〜2026-05-24の公式予定です。",
+        "alternative": "代替案: 相撲博物館、両国散策、ちゃんこ料理、または開催期間中への日程変更を検討してください。",
+    },
+    "東京国立博物館": {
+        "type": "opening_hours",
+        "official_url": "https://www.tnm.jp/modules/r_free_page/index.php?id=113",
+        "closed_weekdays": [0],
+        "holiday_monday_open": True,
+        "open_time": "09:30",
+        "close_time": "17:00",
+        "last_entry_time": "16:30",
+        "warning": "東京国立博物館は原則月曜休館、ただし月曜が祝休日の場合は開館し翌平日に休館です。来館前に公式カレンダーを確認してください。",
+    },
+    "国立西洋美術館": {
+        "type": "opening_hours",
+        "official_url": "https://www.nmwa.go.jp/jp/visit/",
+        "closed_weekdays": [0],
+        "holiday_monday_open": True,
+        "open_time": "09:30",
+        "close_time": "17:30",
+        "fri_sat_close_time": "20:00",
+        "last_entry_minutes_before_close": 30,
+        "warning": "国立西洋美術館は原則月曜休館、ただし祝休日の場合は開館し翌平日に休館です。開館時間外や休館日に当たらないか公式情報を確認してください。",
+    },
+    "歌舞伎座": {
+        "type": "official_confirmation",
+        "official_url": "https://www.kabuki-bito.jp/theaters/kabukiza/",
+        "warning": "歌舞伎座の演目・開演時刻は月ごとに変わります。旅程時刻と公演時刻が合うか公式公演情報で確認してください。",
+    },
+    "東京芸術劇場": {
+        "type": "official_confirmation",
+        "official_url": "https://www.geigeki.jp/",
+        "warning": "コンサート・観劇は日時指定イベントです。会場名だけでは開催有無を確定できないため、公式スケジュールとチケット情報を確認してください。",
+    },
+}
+
+JAPANESE_PUBLIC_HOLIDAYS_2026 = {
+    "2026-01-01", "2026-01-12", "2026-02-11", "2026-02-23", "2026-03-20",
+    "2026-04-29", "2026-05-03", "2026-05-04", "2026-05-05", "2026-05-06",
+    "2026-07-20", "2026-08-11", "2026-09-21", "2026-09-22", "2026-09-23",
+    "2026-10-12", "2026-11-03", "2026-11-23",
+}
+
+
+def _parse_date_value(date_text: str):
+    text = safe_text(date_text, "")
+    if not text or text == "-":
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _date_in_range(date_value, start_text: str, end_text: str) -> bool:
+    try:
+        start = datetime.strptime(start_text, "%Y-%m-%d").date()
+        end = datetime.strptime(end_text, "%Y-%m-%d").date()
+        return start <= date_value <= end
+    except Exception:
+        return False
+
+
+def _is_jp_public_holiday(date_value) -> bool:
+    if not date_value:
+        return False
+    return date_value.strftime("%Y-%m-%d") in JAPANESE_PUBLIC_HOLIDAYS_2026
+
+
+def _clock_minutes(value: str) -> Optional[int]:
+    return _time_to_minutes(safe_text(value, ""))
+
+
+def _spot_rule_for_destination(destination: str) -> tuple[str, Dict[str, object]]:
+    name = safe_text(destination, "")
+    for key, rule in SPOT_RELIABILITY_RULES.items():
+        if key in name or name in key:
+            return key, rule
+    return "", {}
+
+
+def build_spot_reliability_warnings(row_dict: Dict[str, object]) -> List[Dict[str, str]]:
+    destination = safe_text(row_dict.get("destination"), "")
+    if not destination or _is_hotel_like_name(destination) or _is_station_anchor_name(destination):
+        return []
+    key, rule = _spot_rule_for_destination(destination)
+    if not rule:
+        return []
+    visit_date = _parse_date_value(safe_text(row_dict.get("date"), ""))
+    start_time = safe_text(row_dict.get("start_time"), "")
+    end_time = safe_text(row_dict.get("end_time"), "")
+    purpose = safe_text(row_dict.get("purpose"), "")
+    one_point = safe_text(row_dict.get("one_point"), "")
+    context = f"{destination} {purpose} {one_point}"
+    warnings: List[Dict[str, str]] = []
+    rule_type = safe_text(rule.get("type"), "")
+    if rule_type == "event_date" and visit_date:
+        keywords = rule.get("event_keywords") or []
+        mentions_event = any(str(token) in context for token in keywords)
+        valid_ranges = rule.get("valid_ranges") or []
+        in_valid_range = any(_date_in_range(visit_date, start, end) for start, end in valid_ranges)
+        if mentions_event and not in_valid_range:
+            warnings.append({"level": "warning", "title": "開催日注意", "message": safe_text(rule.get("warning"), "この日付は対象イベントの開催期間外の可能性があります。"), "action": safe_text(rule.get("alternative"), "公式スケジュールを確認してください。"), "url": safe_text(rule.get("official_url"), "")})
+    elif rule_type == "opening_hours" and visit_date:
+        weekday = visit_date.weekday()
+        closed_weekdays = rule.get("closed_weekdays") or []
+        is_holiday = _is_jp_public_holiday(visit_date)
+        if weekday in closed_weekdays and not (is_holiday and bool(rule.get("holiday_monday_open"))):
+            warnings.append({"level": "warning", "title": "休館日注意", "message": safe_text(rule.get("warning"), "休館日の可能性があります。"), "action": "日程変更または公式カレンダー確認をおすすめします。", "url": safe_text(rule.get("official_url"), "")})
+        start_min = _clock_minutes(start_time)
+        end_min = _clock_minutes(end_time)
+        open_min = _clock_minutes(safe_text(rule.get("open_time"), ""))
+        close_text = safe_text(rule.get("close_time"), "")
+        if visit_date.weekday() in {4, 5} and rule.get("fri_sat_close_time"):
+            close_text = safe_text(rule.get("fri_sat_close_time"), close_text)
+        close_min = _clock_minutes(close_text)
+        last_entry = rule.get("last_entry_time")
+        if last_entry:
+            last_entry_min = _clock_minutes(safe_text(last_entry, ""))
+        elif close_min is not None and rule.get("last_entry_minutes_before_close"):
+            last_entry_min = close_min - int(rule.get("last_entry_minutes_before_close") or 0)
+        else:
+            last_entry_min = None
+        if start_min is not None and open_min is not None and start_min < open_min:
+            warnings.append({"level": "warning", "title": "営業時間注意", "message": f"{key}の開館目安は{rule.get('open_time')}以降です。旅程の開始時刻が早すぎる可能性があります。", "action": "開館後に到着するよう時刻調整してください。", "url": safe_text(rule.get("official_url"), "")})
+        if end_min is not None and close_min is not None and end_min > close_min:
+            warnings.append({"level": "warning", "title": "営業時間注意", "message": f"{key}の閉館目安は{close_text}です。旅程の終了時刻が営業時間外にかかる可能性があります。", "action": "滞在時間短縮または訪問時間の前倒しを検討してください。", "url": safe_text(rule.get("official_url"), "")})
+        if start_min is not None and last_entry_min is not None and start_min > last_entry_min:
+            warnings.append({"level": "warning", "title": "入館締切注意", "message": f"{key}は閉館30分前などに入館締切となる可能性があります。", "action": "公式ページで最終入館時刻を確認してください。", "url": safe_text(rule.get("official_url"), "")})
+    elif rule_type == "official_confirmation":
+        warnings.append({"level": "info", "title": "公式確認推奨", "message": safe_text(rule.get("warning"), "日時指定イベントのため公式確認をおすすめします。"), "action": "公式スケジュール・チケット情報を確認してください。", "url": safe_text(rule.get("official_url"), "")})
+    return warnings
+
+
+def _log_spot_reliability_warning_once(row_dict: Dict[str, object], warning: Dict[str, str]) -> None:
+    key = "|".join([safe_text(row_dict.get("day"), ""), safe_text(row_dict.get("date"), ""), safe_text(row_dict.get("start_time"), ""), safe_text(row_dict.get("destination"), ""), safe_text(warning.get("title"), "")])
+    logged = st.session_state.get("spot_reliability_logged_keys", set())
+    if not isinstance(logged, set):
+        logged = set(logged or [])
+    if key in logged:
+        return
+    logged.add(key)
+    st.session_state.spot_reliability_logged_keys = logged
+    log_event("信頼性チェック", f"{warning.get('title')}: Day{safe_text(row_dict.get('day'), '')} {safe_text(row_dict.get('destination'), '')} / {warning.get('message')}", level="warning" if warning.get("level") == "warning" else "info")
+
+
+def render_spot_reliability_checks(row_dict: Dict[str, object]) -> None:
+    warnings = build_spot_reliability_warnings(row_dict)
+    if not warnings:
+        return
+    for warning in warnings:
+        _log_spot_reliability_warning_once(row_dict, warning)
+        title = html.escape(safe_text(warning.get("title"), "確認"))
+        message = html.escape(safe_text(warning.get("message"), ""))
+        action = html.escape(safe_text(warning.get("action"), ""))
+        st.markdown(f"<div class='vf-card-note' style='background:#fff7e8;color:#5f370e;border-color:#f0c36a;'><b>⚠️ {title}</b><br>{message}<br>{action}</div>", unsafe_allow_html=True)
+        url = safe_text(warning.get("url"), "")
+        if url:
+            st.link_button("公式情報で確認", url, use_container_width=True)
+
+
+def render_hotel_fallback_notice(row_dict: Dict[str, object]) -> None:
+    destination = safe_text(row_dict.get("destination"), "")
+    if not _is_valid_hotel_row(row_dict):
+        return
+    if not (_is_generic_hotel_label(destination) or destination.endswith("周辺ホテル")):
+        return
+    st.markdown("<div class='vf-card-note' style='background:#f8fff2;color:#19340d;border-color:#b8df9c;'><b>🏨 ホテル未確定</b><br>具体ホテル名を無理に生成せず、周辺ホテル検索に切り替えています。ユーザーが予約サイト側で選択してください。</div>", unsafe_allow_html=True)
+    st.link_button("周辺ホテルを検索", _build_hotel_booking_search_url(destination, safe_text(row_dict.get("date"), "")), use_container_width=True)
+
+
 def _simple_row_html_class(row_dict: Dict[str, object], is_transport: bool) -> str:
     status = safe_text(row_dict.get("execution_status"), "").lower()
     if status == "cancelled":
@@ -5621,6 +5893,10 @@ def render_itinerary_cards(
                     st.link_button("📍 Google Mapsで場所を見る", place_url, use_container_width=True)
                     # 修正箇所: スポットカード下部に最新情報の公式確認リンクだけを追加
                     render_spot_latest_info(safe_text(row_dict.get("destination"), ""), safe_text(row_dict.get("date"), ""))
+                    # 修正箇所(v6.2.59): イベント開催日・休館日・営業時間チェックをカード下部へ表示
+                    render_spot_reliability_checks(row_dict)
+                    # 修正箇所(v6.2.59): ホテル未確定時は検索導線へfallback
+                    render_hotel_fallback_notice(row_dict)
 
                     if transport_edit_scope == "plan" and absolute_idx is not None:
                         activity_position = _activity_position_from_phase3(df, absolute_idx)
