@@ -44,8 +44,8 @@ except Exception:
 
 
 # =========================================================
-# 【バージョン名】VoyageFlow v6.2.52-experimental-phase3-double-transport-guard
-# 【制作日】2026-04-26
+# 【バージョン名】VoyageFlow v6.2.55-hotel-destination-and-long-return-guard
+# 【制作日】2026-04-27
 # 【前バージョンからの修正内容】
 # - v6.2.51 を退避用完成形として維持し、この版は実験版として作成
 # - Phase2移動誤分類検査ログを維持
@@ -57,7 +57,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.54a-hearing-state-sync-nameerror-fix"
+APP_VERSION_NAME = "v6.2.55-hotel-destination-and-long-return-guard"
 APP_UPDATED_DATE = "2026-04-27"
 
 
@@ -1372,6 +1372,19 @@ def _looks_like_invalid_itinerary_node_name(name: str) -> bool:
         return True
     if re.match(r"^\*?\s*\d{1,2}:\d{2}\s*-\s*", text):
         return True
+
+    # --- 修正箇所: v6.2.55 ---
+    # Phase2構造化で one_point の文が destination に混入するケースを検知する。
+    note_markers = ["ワンポイント", "one point", "メモ:", "補足:", "注意:"]
+    if any(marker in text for marker in note_markers):
+        return True
+    if text.startswith("- ") and len(text) >= 18 and any(token in text for token in ["ホテル", "宿泊", "アクセス", "おすすめ", "備えて"]):
+        return True
+
+    sentence_like = len(text) >= 24 and any(token in text for token in ["です", "ます", "しましょう", "おすすめ", "備えて"])
+    if sentence_like and any(token in text for token in ["ホテル", "宿泊", "チェックイン", "出発", "到着"]):
+        return True
+
     return ("ホテル" in text and any(token in text for token in ["到着", "出発", "チェックイン", "旅程", "Day"]))
 
 
@@ -1380,8 +1393,10 @@ def _strip_itinerary_prefix(name: str) -> str:
     if not text:
         return ""
     text = text.lstrip("*").strip()
+    text = re.sub(r"^[-・•]+\s*", "", text).strip()
     text = re.sub(r"^\d{1,2}:\d{2}\s*-\s*", "", text).strip()
     text = re.sub(r"^Day\s*\d+\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^(ワンポイント|one point|メモ|補足|注意)\s*[:：]\s*", "", text, flags=re.IGNORECASE).strip()
     return text
 
 
@@ -1409,11 +1424,44 @@ def _derive_place_label_from_invalid_node(name: str) -> str:
     return area_hint or text
 
 
+def _extract_hotel_area_from_invalid_text(name: str) -> str:
+    # --- 修正箇所: v6.2.55 ---
+    # one_point文からホテルのエリアだけを取り出す。
+    text = _strip_itinerary_prefix(name)
+    if not text:
+        return ""
+
+    patterns = [
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+)エリアのホテル",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+)周辺のホテル",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+)エリアに宿泊",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+)周辺に宿泊",
+        r"([一-龥ぁ-んァ-ヶA-Za-z]+)のホテル",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            candidate = safe_text(m.group(1), "")
+            if candidate and len(candidate) <= 12:
+                return candidate
+
+    area_hint = _extract_area_hint(text)
+    if area_hint and len(area_hint) <= 12:
+        return area_hint.replace("エリア", "")
+    return ""
+
+
 def _derive_safe_hotel_label(name: str) -> str:
+    # --- 修正箇所: v6.2.55 ---
+    # destination に混入した説明文をホテル名として採用しない。
+    area_from_note = _extract_hotel_area_from_invalid_text(name)
+    if area_from_note:
+        return f"{area_from_note}周辺ホテル"
+
     place = _derive_place_label_from_invalid_node(name)
     if not place:
         return "周辺ホテル"
-    if _contains_hotel_token(place):
+    if _contains_hotel_token(place) and not _looks_like_invalid_itinerary_node_name(place):
         return place
     if place.endswith("周辺ホテル"):
         return place
@@ -4085,6 +4133,81 @@ def _looks_like_phase2_embedded_transport_row(current: pd.Series | Dict, actual_
 
     return bool(station_like and has_transport_context and touches_next)
 
+
+def _looks_like_embedded_long_return_transport(current: pd.Series | Dict, actual_next: pd.Series | Dict, planning_state: Dict[str, object], min_minutes: int = 90) -> bool:
+    # --- 修正箇所: v6.2.55 ---
+    # Phase2が「東京駅 19:30-22:30 / 福井への帰路」のような大移動を
+    # スポット行として持っている場合、Phase3でさらに東京駅→福井駅 30分の
+    # 推測transportを追加しないための保険。
+    if current is None or actual_next is None:
+        return False
+
+    current_dest = safe_text(_row_value(current, "destination", ""), "")
+    next_dest = safe_text(_row_value(actual_next, "destination", ""), "")
+    if not current_dest or not next_dest or _same_effective_place(current_dest, next_dest):
+        return False
+
+    start_time = safe_text(_row_value(current, "start_time", ""), "")
+    end_time = safe_text(_row_value(current, "end_time", ""), "")
+    next_start = safe_text(_row_value(actual_next, "start_time", ""), "")
+    start_min = _time_to_minutes(start_time)
+    end_min = _time_to_minutes(end_time)
+    if start_min is None or end_min is None:
+        return False
+
+    duration = end_min - start_min
+    if duration < 0:
+        duration += 24 * 60
+    if duration < min_minutes:
+        return False
+
+    gap_to_next = _minutes_between_clock(end_time, next_start) if end_time and next_start else None
+    if gap_to_next is None or not (0 <= gap_to_next <= 10):
+        return False
+
+    purpose = safe_text(_row_value(current, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(current, "genre", ""), "").lower()
+    one_point = safe_text(_row_value(current, "one_point", ""), "")
+    context = f"{current_dest} {next_dest} {purpose} {genre} {one_point}"
+
+    transportish = any(token in context for token in ["移動", "帰路", "帰還", "戻", "向か", "新幹線", "電車", "列車", "出発", "到着"])
+    station_or_terminal = any(token in current_dest for token in ["駅", "空港", "港", "バスターミナル"])
+    return_place = safe_text(planning_state.get("return_place"), "")
+    next_is_return = bool(return_place and _same_effective_place(next_dest, return_place))
+
+    return bool(transportish and (station_or_terminal or next_is_return))
+
+
+def _promote_last_row_to_embedded_transport(rows: List[Dict[str, object]], current: pd.Series | Dict, actual_next: pd.Series | Dict, planning_state: Dict[str, object], service_hint: str = "") -> None:
+    # --- 修正箇所: v6.2.55 ---
+    # すでに rows に追加済みの current 行を、スポットカードではなく移動カードへ安全に変換する。
+    if not rows:
+        return
+    origin_name = safe_text(_row_value(current, "destination", ""), "")
+    destination_name = safe_text(_row_value(actual_next, "destination", ""), "")
+    start_time = safe_text(_row_value(current, "start_time", ""), "")
+    end_time = safe_text(_row_value(current, "end_time", ""), "")
+    minutes = _minutes_between_clock(start_time, end_time) or 0
+    if minutes <= 0:
+        return
+    mode = _infer_mode_from_service_hint(service_hint, _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）")))
+    last = rows[-1]
+    last["destination"] = f"{origin_name} → {destination_name}"
+    last["purpose"] = "transport"
+    last["genre"] = "transport"
+    last["is_transport"] = True
+    last["transport_mode"] = mode
+    last["duration_minutes"] = minutes
+    last["route_from"] = origin_name
+    last["route_to"] = destination_name
+    last["route_url"] = build_google_maps_dir_url(origin_name, destination_name, mode if mode != "air" else "train")
+    last["route_data_source"] = "phase2_embedded_long_transport_guard"
+    last["estimated_duration_label"] = f"約{minutes}分"
+    last["route_departure_at"] = f"{safe_text(_row_value(current, 'date', ''), safe_text(planning_state.get('start_date'), ''))} {start_time}".strip()
+    existing_note = safe_text(last.get("one_point"), "")
+    guard_note = "Phase2の時刻に含まれる長距離移動として扱い、追加の推測移動カードは作成しません。"
+    last["one_point"] = (existing_note + " / " + guard_note).strip(" /")[:180]
+
 def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
     # --- 修正箇所: train / transport 行は独立スポットにせず、前後スポットを橋渡しする移動ヒントとして扱う ---
     if df2 is None or df2.empty:
@@ -4150,11 +4273,12 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
         # Phase2が「福井駅 09:00-12:00 / 北陸新幹線で東京へ移動」のように、
         # 1つのスポット行へ長距離移動を含めてしまった場合、ここでさらに
         # 福井駅→東京駅のtransportを追加すると二重移動になるため、生成を抑止する。
-        if _looks_like_phase2_embedded_transport_row(current, actual_next):
+        if _looks_like_phase2_embedded_transport_row(current, actual_next) or _looks_like_embedded_long_return_transport(current, actual_next, planning_state):
+            _promote_last_row_to_embedded_transport(rows, current, actual_next, planning_state, service_hint=service_hint)
             log_event(
                 "Phase3二重移動防止",
                 (
-                    f"Phase2行が移動時間を内包している可能性があるためtransport生成をスキップ: "
+                    f"Phase2行が移動時間を内包している可能性があるため追加transport生成をスキップ: "
                     f"Day{safe_text(current.get('day'), '')} "
                     f"{origin_name} {safe_text(current.get('start_time'), '')}-{safe_text(current.get('end_time'), '')} "
                     f"→ {destination_name} {safe_text(actual_next.get('start_time'), '')}"
