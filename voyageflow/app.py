@@ -57,7 +57,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.54-hearing-state-sync-fix"
+APP_VERSION_NAME = "v6.2.54a-hearing-state-sync-nameerror-fix"
 APP_UPDATED_DATE = "2026-04-27"
 
 
@@ -6103,7 +6103,7 @@ with tabs[0]:
             if ambiguities:
                 st.session_state.pending_ambiguity = ambiguities[0]
                 reply = generate_hearing_reply_with_llm(user_message, known, ambiguities, missing_fields)
-                append_assistant_chat_and_sync(reply, user_text)
+                append_assistant_chat_and_sync(reply, user_message)
                 st.rerun()
 
             confirmation_payload = None if st.session_state.get("pending_confirmation") else build_confirmation_payload_from_state()
@@ -6113,7 +6113,7 @@ with tabs[0]:
                 st.rerun()
 
             reply = generate_hearing_reply_with_llm(user_message, known, [], missing_fields)
-            append_assistant_chat_and_sync(reply, user_text)
+            append_assistant_chat_and_sync(reply, user_message)
             st.rerun()
 
         pending_ambiguity = st.session_state.get("pending_ambiguity")
