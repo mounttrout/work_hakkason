@@ -6,7 +6,7 @@ import html
 import json
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
@@ -56,13 +56,14 @@ except Exception:
 # - v6.2.60: v6.2.47の正常な簡易旅程・戻るボタン挙動だけを局所復元
 # - v6.2.61: 簡易一覧の移動手段が徒歩に落ちる表示問題を修正
 # - v6.2.62: 左サイドバーのトライ用スペースに Directions transit 駅名抽出診断を追加（完成旅程には未反映）
+# - v6.2.63: Transit駅名抽出トライのdeparture_timeをAsia/Tokyo基準でepoch化。now/epoch直接入力の診断にも対応
 # - Phase2データ自体は書き換えない。完成旅程の二重移動防止のみ
 # - v6.2.53: Spot Enrichmentを別ファイル services/spot_enrichment.py + data/spot_event_dictionary.py として最小統合
 # - スポットカード下部・簡易一覧の公式情報リンクを辞書ベース優先に変更
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.62-directions-transit-station-trial"
+APP_VERSION_NAME = "v6.2.63-transit-trial-jst-epoch-fix"
 APP_UPDATED_DATE = "2026-04-28"
 
 
@@ -2552,15 +2553,86 @@ def _build_station_label_from_station_steps(station_steps: list) -> str:
     return ""
 
 
-def _fetch_google_directions_transit_station_trial(origin_query: str, destination_query: str, departure_date: str, departure_time: str):
+def _parse_station_trial_departure_param(departure_raw: str) -> Dict[str, object]:
+    # --- 修正箇所(v6.2.63): 左サイドバーのTransit駅名抽出トライ専用 ---
+    # 入力された YYYY-MM-DD HH:MM をローカルPCのタイムゾーンではなく、明示的に Asia/Tokyo(JST) として epoch 化する。
+    # 完成旅程・簡易一覧には反映しない診断用。
+    raw = str(departure_raw or "").strip()
+    jst = timezone(timedelta(hours=9), name="Asia/Tokyo")
+    parse_info: Dict[str, object] = {
+        "input_raw": raw,
+        "timezone_assumption": "Asia/Tokyo",
+        "mode": "unparsed",
+        "api_departure_time": None,
+        "jst_datetime": "",
+        "utc_datetime": "",
+        "epoch_seconds": None,
+        "parse_error": "",
+    }
+
+    if not raw:
+        parse_info["parse_error"] = "出発日時が空です。YYYY-MM-DD HH:MM / now / epoch秒 のいずれかで入力してください。"
+        return parse_info
+
+    lowered = raw.lower()
+    if lowered in {"now", "現在", "現在時刻"}:
+        now_jst = datetime.now(jst)
+        parse_info.update({
+            "mode": "now",
+            "api_departure_time": "now",
+            "jst_datetime": now_jst.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "utc_datetime": now_jst.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "epoch_seconds": int(now_jst.timestamp()),
+        })
+        return parse_info
+
+    if re.fullmatch(r"\d{10,}", raw):
+        try:
+            epoch = int(raw)
+            dt_utc = datetime.fromtimestamp(epoch, timezone.utc)
+            dt_jst = dt_utc.astimezone(jst)
+            parse_info.update({
+                "mode": "epoch_direct",
+                "api_departure_time": epoch,
+                "jst_datetime": dt_jst.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "utc_datetime": dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "epoch_seconds": epoch,
+            })
+            return parse_info
+        except Exception as e:
+            parse_info["parse_error"] = f"epoch秒の解釈に失敗: {e}"
+            return parse_info
+
+    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            dt_jst = datetime.strptime(raw, fmt).replace(tzinfo=jst)
+            dt_utc = dt_jst.astimezone(timezone.utc)
+            epoch = int(dt_jst.timestamp())
+            parse_info.update({
+                "mode": "jst_datetime",
+                "api_departure_time": epoch,
+                "jst_datetime": dt_jst.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "utc_datetime": dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "epoch_seconds": epoch,
+            })
+            return parse_info
+        except Exception:
+            continue
+
+    parse_info["parse_error"] = "出発日時を解釈できません。例: 2026-05-06 12:00 / now / 1778036400"
+    return parse_info
+
+
+def _fetch_google_directions_transit_station_trial(origin_query: str, destination_query: str, departure_raw: str):
     """左サイドバー診断専用。取得結果は完成旅程へ反映しない。"""
     api_key = _get_maps_api_key()
+    departure_parse = _parse_station_trial_departure_param(departure_raw)
     debug_info: Dict[str, object] = {
         "origin_query": origin_query,
         "destination_query": destination_query,
         "api_mode": "transit",
-        "departure_date": departure_date,
-        "departure_time": departure_time,
+        "departure_raw": departure_raw,
+        "departure_parse": departure_parse,
         "has_api_key": bool(api_key),
         "status_code": None,
         "api_status": "",
@@ -2580,16 +2652,11 @@ def _fetch_google_directions_transit_station_trial(origin_query: str, destinatio
         "region": "jp",
         "key": api_key,
     }
-    departure_epoch = None
-    raw = f"{safe_text(departure_date, '')} {safe_text(departure_time, '')}".strip()
-    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
-        try:
-            departure_epoch = int(datetime.strptime(raw, fmt).timestamp())
-            break
-        except Exception:
-            continue
-    if departure_epoch:
-        params["departure_time"] = departure_epoch
+    api_departure_time = departure_parse.get("api_departure_time")
+    if api_departure_time:
+        params["departure_time"] = api_departure_time
+    elif departure_parse.get("parse_error"):
+        debug_info["error_message"] = safe_text(departure_parse.get("parse_error"), "出発日時の解釈に失敗しました。")
 
     debug_info["request_params_preview"] = {
         "origin": params.get("origin"),
@@ -2642,6 +2709,8 @@ def _fetch_google_directions_transit_station_trial(origin_query: str, destinatio
         "steps": normalized_steps,
     }
     return result, debug_info
+
+
 def _validate_google_route_minutes(distance_km: float, minutes: int, mode: str, origin_name: str, destination_name: str) -> bool:
     if minutes <= 0:
         return False
@@ -6665,10 +6734,11 @@ with st.sidebar:
     # 完成旅程・簡易一覧には反映しない。Google Directions transit_details から駅名が取れるかだけ検証する。
     with st.expander("🧪 Transit駅名抽出トライ", expanded=False):
         st.caption("Directions API の transit_details から departure_stop / arrival_stop を取れるかだけ確認します。完成旅程には反映しません。")
+        st.caption("v6.2.63: 出発日時は Asia/Tokyo(JST) として epoch 化します。`now` または epoch秒の直接入力も診断できます。")
         trial_origin = st.text_input("駅名抽出 出発地", value="仲見世商店街", key="station_trial_origin")
         trial_destination = st.text_input("駅名抽出 到着地", value="上野", key="station_trial_destination")
         trial_departure = st.text_input(
-            "駅名抽出 出発日時 (YYYY-MM-DD HH:MM)",
+            "駅名抽出 出発日時 (YYYY-MM-DD HH:MM / now / epoch秒)",
             value="2026-05-06 12:00",
             key="station_trial_departure",
         )
@@ -6686,8 +6756,7 @@ with st.sidebar:
                     result, debug_info = _fetch_google_directions_transit_station_trial(
                         origin_query=query_origin,
                         destination_query=query_destination,
-                        departure_date=departure_raw[:10] if len(departure_raw) >= 10 else "",
-                        departure_time=departure_raw[11:16] if len(departure_raw) >= 16 else "09:00",
+                        departure_raw=departure_raw,
                     )
 
                     st.write("入力正規化")
@@ -6699,8 +6768,11 @@ with st.sidebar:
                         "destination_clean": destination_clean,
                         "destination_query": query_destination,
                         "departure": departure_raw,
+                        "timezone_assumption": "Asia/Tokyo",
                         "note": "この結果は完成旅程には反映していません。",
                     })
+                    st.write("時刻変換診断")
+                    st.json((debug_info or {}).get("departure_parse", {}))
                     st.write("Directions API 診断")
                     st.json(debug_info or {})
 
