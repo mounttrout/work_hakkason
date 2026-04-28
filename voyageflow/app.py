@@ -44,6 +44,22 @@ except Exception:
 
 
 # =========================================================
+# 修正箇所(v6.2.64): Spot Info Agent 外付け
+# - app.py本体へ新しいスポット確認ロジックを直書きしない
+# - 失敗時はv6.2.59までの内蔵信頼性チェックへfallback
+# - Phase2 / Phase3 / 移動ロジック / 簡易一覧の戻るボタンは触らない
+# =========================================================
+try:
+    from services.spot_info_agent import (
+        evaluate_spot_reliability as external_evaluate_spot_reliability,
+        get_spot_info as external_get_spot_info,
+    )
+except Exception:
+    external_evaluate_spot_reliability = None
+    external_get_spot_info = None
+
+
+# =========================================================
 # 【バージョン名】VoyageFlow v6.2.55-hotel-destination-and-long-return-guard
 # 【制作日】2026-04-27
 # 【前バージョンからの修正内容】
@@ -53,6 +69,7 @@ except Exception:
 # - 福井駅→東京駅などで、駅発の長時間移動ブロックに対して重複transportを追加しないガードを追加
 # - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
+# - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
 # - v6.2.60: v6.2.47の正常な簡易旅程・戻るボタン挙動だけを局所復元
 # - v6.2.61: 簡易一覧の移動手段が徒歩に落ちる表示問題を修正
 # - v6.2.62: 左サイドバーのトライ用スペースに Directions transit 駅名抽出診断を追加（完成旅程には未反映）
@@ -63,7 +80,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.63-transit-trial-jst-epoch-fix"
+APP_VERSION_NAME = "v6.2.64-spot-info-agent-externalized"
 APP_UPDATED_DATE = "2026-04-28"
 
 
@@ -5288,6 +5305,27 @@ def render_spot_latest_info(destination: str, visit_date: str = "") -> None:
         except Exception as e:
             log_event("Spot Enrichment", f"辞書補完に失敗したため既存リンクへfallback: {e}", level="warning")
 
+    # --- 修正箇所(v6.2.64): 外付けSpot Info Agentを表示リンクfallbackとして利用 ---
+    if external_get_spot_info:
+        try:
+            info = external_get_spot_info(
+                spot_name=name,
+                area_hint=safe_text(st.session_state.get("planning_state", {}).get("primary_destination"), ""),
+                travel_date=visit_date,
+            )
+            if isinstance(info, dict):
+                primary_url = safe_text(info.get("primary_url"), "")
+                primary_label = safe_text(info.get("primary_label"), "公式情報を見る")
+                note = safe_text(info.get("note"), "")
+                if primary_url and primary_url != "-":
+                    st.markdown("**🔎 最新情報**")
+                    if note and note != "-":
+                        st.caption(note)
+                    st.link_button(primary_label, primary_url, use_container_width=True)
+                    return
+        except Exception as e:
+            log_event("Spot Info Agent", f"外付けスポット情報取得に失敗したため既存リンクへfallback: {e}", level="warning")
+
     # fallback: v6.2.52までの安全版リンク表示
     for key, info in SPOT_INFO_SOURCES.items():
         if key in name:
@@ -5408,6 +5446,28 @@ def build_spot_reliability_warnings(row_dict: Dict[str, object]) -> List[Dict[st
     destination = safe_text(row_dict.get("destination"), "")
     if not destination or _is_hotel_like_name(destination) or _is_station_anchor_name(destination):
         return []
+
+    # --- 修正箇所(v6.2.64): 外付けSpot Info Agentを優先し、失敗時のみ内蔵ルールへfallback ---
+    if external_evaluate_spot_reliability:
+        try:
+            result = external_evaluate_spot_reliability(row_dict)
+            external_warnings = result.get("warnings") if isinstance(result, dict) else result
+            if isinstance(external_warnings, list):
+                normalized_warnings: List[Dict[str, str]] = []
+                for warning in external_warnings:
+                    if not isinstance(warning, dict):
+                        continue
+                    normalized_warnings.append({
+                        "level": safe_text(warning.get("level"), "info"),
+                        "title": safe_text(warning.get("title"), "確認"),
+                        "message": safe_text(warning.get("message"), ""),
+                        "action": safe_text(warning.get("action"), ""),
+                        "url": safe_text(warning.get("url"), ""),
+                    })
+                return normalized_warnings
+        except Exception as e:
+            log_event("Spot Info Agent", f"外付け信頼性チェックに失敗したため内蔵ルールへfallback: {e}", level="warning")
+
     key, rule = _spot_rule_for_destination(destination)
     if not rule:
         return []
@@ -5723,6 +5783,19 @@ def _simple_latest_info_headline(destination: str, visit_date: str = "") -> str:
             return safe_text(spot_enrichment_headline(info), "公式情報確認")
         except Exception:
             pass
+    # --- 修正箇所(v6.2.64): 簡易一覧見出しも外付けSpot Info Agentをfallback利用 ---
+    if external_get_spot_info:
+        try:
+            info = external_get_spot_info(
+                spot_name=name,
+                area_hint=safe_text(st.session_state.get("planning_state", {}).get("primary_destination"), ""),
+                travel_date=visit_date,
+            )
+            label = safe_text(info.get("primary_label") if isinstance(info, dict) else "", "")
+            if label and label != "-":
+                return label
+        except Exception:
+            pass
     for key, info in SPOT_INFO_SOURCES.items():
         if key in name:
             return safe_text(info.get("label"), "公式情報あり")
@@ -5753,6 +5826,19 @@ def _simple_spot_info_url(destination: str, visit_date: str = "") -> str:
                 travel_date=visit_date,
             )
             url = safe_text(primary_spot_info_url(info), "")
+            if url and url != "-":
+                return url
+        except Exception:
+            pass
+    # --- 修正箇所(v6.2.64): 簡易一覧URLも外付けSpot Info Agentをfallback利用 ---
+    if external_get_spot_info:
+        try:
+            info = external_get_spot_info(
+                spot_name=name,
+                area_hint=safe_text(st.session_state.get("planning_state", {}).get("primary_destination"), ""),
+                travel_date=visit_date,
+            )
+            url = safe_text(info.get("primary_url") if isinstance(info, dict) else "", "")
             if url and url != "-":
                 return url
         except Exception:
