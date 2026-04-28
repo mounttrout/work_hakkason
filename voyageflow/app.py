@@ -60,7 +60,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.60-reliability-guards-simple-itinerary-restore"
+APP_VERSION_NAME = "v6.2.61-simple-itinerary-transport-display-fix"
 APP_UPDATED_DATE = "2026-04-28"
 
 
@@ -5288,43 +5288,66 @@ def _simple_transport_origin_destination(row_dict: Dict[str, object]) -> tuple[s
 
 
 def _simple_transport_mode_label(row_dict: Dict[str, object]) -> str:
-    # --- 修正箇所(v6.2.44): 簡易一覧では route_from→route_to を混ぜず、手段名だけ返す ---
-    mode = safe_text(row_dict.get("transport_mode"), "")
-    destination_text = safe_text(row_dict.get("destination"), "")
-    one_point = safe_text(row_dict.get("one_point"), "")
-    display = safe_text(build_transport_display_safe(row_dict), "")
-    combined = " ".join([mode, destination_text, one_point, display]).lower()
-
-    if any(token in combined for token in ["taxi", "タクシー"]):
-        return "タクシー"
-    if any(token in combined for token in ["walk", "walking", "徒歩"]):
-        return "徒歩"
-    if any(token in combined for token in ["bus", "バス"]):
-        return "バス"
-    if any(token in combined for token in ["train", "transit", "rail", "電車", "列車", "新幹線"]):
-        return "電車"
-    if any(token in combined for token in ["air", "flight", "飛行機", "航空", "フライト"]):
-        return "飛行機"
-    if any(token in combined for token in ["ship", "ferry", "船", "フェリー"]):
-        return "船"
-    if any(token in combined for token in ["car", "車", "レンタカー", "自家用車"]):
-        return "車"
-
+    # --- 修正箇所(v6.2.61): 簡易一覧の徒歩落ちを防止 ---
+    # 完成旅程カードでは transport_mode / build_transport_display が正しく「電車」になっているのに、
+    # 簡易一覧側で combined 文字列内の「徒歩」を先に拾ってしまい、電車移動が徒歩表示になる問題を修正。
+    # 方針:
+    # - transport_mode が明示されている場合は最優先で採用する
+    # - train / transit / rail / 新幹線 / 電車 は walk / 徒歩 より前に判定する
+    # - 旅程データは変更せず、簡易一覧の表示ラベルだけ補正する
+    mode = safe_text(row_dict.get("transport_mode"), "").strip()
+    mode_lower = mode.lower()
     mode_map = {
         "walk": "徒歩",
         "walking": "徒歩",
         "train": "電車",
-        "transit": "公共交通",
+        "transit": "電車",
+        "rail": "電車",
         "taxi": "タクシー",
         "car": "車",
         "private_car": "自家用車",
         "rental_car": "レンタカー",
         "bus": "バス",
         "air": "飛行機",
+        "flight": "飛行機",
         "ship": "船",
+        "ferry": "船",
     }
-    return mode_map.get(mode.lower(), mode or "移動")
+    if mode_lower in mode_map:
+        return mode_map[mode_lower]
 
+    # 日本語の明示値も先に採用する。
+    if mode in {"電車", "列車", "新幹線", "公共交通"}:
+        return "電車"
+    if mode in {"徒歩", "歩き"}:
+        return "徒歩"
+    if mode in {"タクシー", "バス", "車", "レンタカー", "自家用車", "飛行機", "船"}:
+        return mode
+
+    destination_text = safe_text(row_dict.get("destination"), "")
+    route_from = safe_text(row_dict.get("route_from"), "")
+    route_to = safe_text(row_dict.get("route_to"), "")
+    one_point = safe_text(row_dict.get("one_point"), "")
+    display = safe_text(build_transport_display_safe(row_dict), "")
+    combined = " ".join([mode, destination_text, route_from, route_to, one_point, display]).lower()
+
+    # 優先順位が重要。公共交通語があれば、同じ文字列に「徒歩」が混ざっていても電車を優先する。
+    if any(token in combined for token in ["train", "transit", "rail", "電車", "列車", "新幹線", "かがやき", "はくたか", "のぞみ", "ひかり", "こだま"]):
+        return "電車"
+    if any(token in combined for token in ["air", "flight", "飛行機", "航空", "フライト"]):
+        return "飛行機"
+    if any(token in combined for token in ["ship", "ferry", "船", "フェリー"]):
+        return "船"
+    if any(token in combined for token in ["bus", "バス"]):
+        return "バス"
+    if any(token in combined for token in ["taxi", "タクシー"]):
+        return "タクシー"
+    if any(token in combined for token in ["car", "車", "レンタカー", "自家用車"]):
+        return "車"
+    if any(token in combined for token in ["walk", "walking", "徒歩"]):
+        return "徒歩"
+
+    return mode or "移動"
 
 def _simple_extract_station_name(value: str) -> str:
     # --- 修正箇所(v6.2.44): 電車表示用に文字列から「〇〇駅」だけを抽出する ---
