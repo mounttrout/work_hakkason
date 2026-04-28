@@ -54,13 +54,15 @@ except Exception:
 # - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
 # - v6.2.60: v6.2.47の正常な簡易旅程・戻るボタン挙動だけを局所復元
+# - v6.2.61: 簡易一覧の移動手段が徒歩に落ちる表示問題を修正
+# - v6.2.62: 左サイドバーのトライ用スペースに Directions transit 駅名抽出診断を追加（完成旅程には未反映）
 # - Phase2データ自体は書き換えない。完成旅程の二重移動防止のみ
 # - v6.2.53: Spot Enrichmentを別ファイル services/spot_enrichment.py + data/spot_event_dictionary.py として最小統合
 # - スポットカード下部・簡易一覧の公式情報リンクを辞書ベース優先に変更
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.61-simple-itinerary-transport-display-fix"
+APP_VERSION_NAME = "v6.2.62-directions-transit-station-trial"
 APP_UPDATED_DATE = "2026-04-28"
 
 
@@ -2474,6 +2476,172 @@ def _fetch_google_directions_legacy(origin_query: str, destination_query: str, m
     }
 
 
+
+# =========================================================
+# 修正箇所(v6.2.62): Directions transit 駅名抽出トライ用ヘルパー
+# - 完成旅程/簡易一覧には未反映
+# - 左サイドバーの診断スペースだけで、transit_details の departure_stop / arrival_stop を確認する
+# - 取得できなければ本体実装は見送りやすいよう、失敗理由を debug_info に残す
+# =========================================================
+def _strip_google_html_instruction(value: str) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _google_time_text(value: object) -> str:
+    if isinstance(value, dict):
+        return safe_text(value.get("text"), "")
+    return ""
+
+
+def _extract_directions_transit_station_steps(steps: list) -> tuple[list, list]:
+    """Directions API の steps から診断用の transit stop 情報だけを安全に抽出する。"""
+    normalized_steps: List[Dict[str, object]] = []
+    station_steps: List[Dict[str, object]] = []
+    if not isinstance(steps, list):
+        return normalized_steps, station_steps
+
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        travel_mode = safe_text(step.get("travel_mode"), "")
+        duration_text = safe_text((step.get("duration") or {}).get("text"), "") if isinstance(step.get("duration"), dict) else ""
+        distance_text = safe_text((step.get("distance") or {}).get("text"), "") if isinstance(step.get("distance"), dict) else ""
+        instruction_text = _strip_google_html_instruction(step.get("html_instructions", ""))
+        row: Dict[str, object] = {
+            "travel_mode": travel_mode,
+            "duration_text": duration_text,
+            "distance_text": distance_text,
+            "instruction_text": instruction_text,
+        }
+
+        if travel_mode == "TRANSIT":
+            detail = step.get("transit_details") or {}
+            line = detail.get("line") or {}
+            vehicle = line.get("vehicle") or {}
+            departure_stop = detail.get("departure_stop") or {}
+            arrival_stop = detail.get("arrival_stop") or {}
+            transit_row: Dict[str, object] = {
+                "vehicle_name": safe_text(vehicle.get("name"), "公共交通"),
+                "vehicle_type": safe_text(vehicle.get("type"), ""),
+                "line_name": safe_text(line.get("short_name") or line.get("name"), ""),
+                "line_full_name": safe_text(line.get("name"), ""),
+                "headsign": safe_text(detail.get("headsign"), ""),
+                "departure_stop": safe_text(departure_stop.get("name"), ""),
+                "arrival_stop": safe_text(arrival_stop.get("name"), ""),
+                "departure_time": _google_time_text(detail.get("departure_time")),
+                "arrival_time": _google_time_text(detail.get("arrival_time")),
+                "num_stops": detail.get("num_stops"),
+            }
+            row["transit_details"] = transit_row
+            station_steps.append(transit_row)
+        normalized_steps.append(row)
+
+    return normalized_steps, station_steps
+
+
+def _build_station_label_from_station_steps(station_steps: list) -> str:
+    if not station_steps:
+        return ""
+    first_departure = safe_text((station_steps[0] or {}).get("departure_stop"), "")
+    last_arrival = safe_text((station_steps[-1] or {}).get("arrival_stop"), "")
+    if first_departure and last_arrival and first_departure != "-" and last_arrival != "-":
+        return f"{first_departure}→{last_arrival}"
+    return ""
+
+
+def _fetch_google_directions_transit_station_trial(origin_query: str, destination_query: str, departure_date: str, departure_time: str):
+    """左サイドバー診断専用。取得結果は完成旅程へ反映しない。"""
+    api_key = _get_maps_api_key()
+    debug_info: Dict[str, object] = {
+        "origin_query": origin_query,
+        "destination_query": destination_query,
+        "api_mode": "transit",
+        "departure_date": departure_date,
+        "departure_time": departure_time,
+        "has_api_key": bool(api_key),
+        "status_code": None,
+        "api_status": "",
+        "error_message": "",
+        "response_text_preview": "",
+        "request_params_preview": {},
+    }
+    if not api_key:
+        debug_info["error_message"] = "MAPS_API_KEY が見つかりません"
+        return None, debug_info
+
+    params: Dict[str, object] = {
+        "origin": origin_query,
+        "destination": destination_query,
+        "mode": "transit",
+        "language": "ja",
+        "region": "jp",
+        "key": api_key,
+    }
+    departure_epoch = None
+    raw = f"{safe_text(departure_date, '')} {safe_text(departure_time, '')}".strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            departure_epoch = int(datetime.strptime(raw, fmt).timestamp())
+            break
+        except Exception:
+            continue
+    if departure_epoch:
+        params["departure_time"] = departure_epoch
+
+    debug_info["request_params_preview"] = {
+        "origin": params.get("origin"),
+        "destination": params.get("destination"),
+        "mode": params.get("mode"),
+        "language": params.get("language"),
+        "region": params.get("region"),
+        "departure_time": params.get("departure_time"),
+    }
+
+    try:
+        resp = requests.get("https://maps.googleapis.com/maps/api/directions/json", params=params, timeout=15)
+        debug_info["status_code"] = resp.status_code
+        debug_info["response_text_preview"] = (resp.text or "")[:2500]
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        debug_info["error_message"] = str(e)
+        return None, debug_info
+
+    status = str(data.get("status") or "")
+    debug_info["api_status"] = status
+    debug_info["error_message"] = str(data.get("error_message") or "")
+    if status != "OK":
+        return None, debug_info
+
+    routes = data.get("routes") or []
+    if not routes:
+        debug_info["error_message"] = "routes が空です"
+        return None, debug_info
+    route = routes[0]
+    legs = route.get("legs") or []
+    if not legs:
+        debug_info["error_message"] = "legs が空です"
+        return None, debug_info
+    leg = legs[0]
+
+    normalized_steps, station_steps = _extract_directions_transit_station_steps(leg.get("steps") or [])
+    fare = route.get("fare") or {}
+    result = {
+        "source": "google_directions_transit_station_trial",
+        "minutes": max(1, int(round(int((leg.get("duration") or {}).get("value", 0)) / 60))) if isinstance(leg.get("duration"), dict) and (leg.get("duration") or {}).get("value") else None,
+        "duration_text": safe_text((leg.get("duration") or {}).get("text"), "") if isinstance(leg.get("duration"), dict) else "",
+        "distance_text": safe_text((leg.get("distance") or {}).get("text"), "") if isinstance(leg.get("distance"), dict) else "",
+        "fare_text": safe_text(fare.get("text"), ""),
+        "start_address": safe_text(leg.get("start_address"), origin_query),
+        "end_address": safe_text(leg.get("end_address"), destination_query),
+        "station_label": _build_station_label_from_station_steps(station_steps),
+        "transit_station_steps": station_steps,
+        "steps": normalized_steps,
+    }
+    return result, debug_info
 def _validate_google_route_minutes(distance_km: float, minutes: int, mode: str, origin_name: str, destination_name: str) -> bool:
     if minutes <= 0:
         return False
@@ -6492,6 +6660,85 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Directions診断エラー: {e}")
 
+
+    # --- 修正箇所(v6.2.62): 左サイドバー専用の駅名抽出トライ ---
+    # 完成旅程・簡易一覧には反映しない。Google Directions transit_details から駅名が取れるかだけ検証する。
+    with st.expander("🧪 Transit駅名抽出トライ", expanded=False):
+        st.caption("Directions API の transit_details から departure_stop / arrival_stop を取れるかだけ確認します。完成旅程には反映しません。")
+        trial_origin = st.text_input("駅名抽出 出発地", value="仲見世商店街", key="station_trial_origin")
+        trial_destination = st.text_input("駅名抽出 到着地", value="上野", key="station_trial_destination")
+        trial_departure = st.text_input(
+            "駅名抽出 出発日時 (YYYY-MM-DD HH:MM)",
+            value="2026-05-06 12:00",
+            key="station_trial_departure",
+        )
+        if st.button("🚉 駅名抽出を試す", use_container_width=True, key="run_station_name_trial"):
+            try:
+                api_key = _get_maps_api_key()
+                if not api_key:
+                    st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
+                else:
+                    origin_clean = _normalize_route_query_name(trial_origin)
+                    destination_clean = _normalize_route_query_name(trial_destination)
+                    query_origin = _build_google_directions_location_query(origin_clean, None, None)
+                    query_destination = _build_google_directions_location_query(destination_clean, None, None)
+                    departure_raw = str(trial_departure or "").strip()
+                    result, debug_info = _fetch_google_directions_transit_station_trial(
+                        origin_query=query_origin,
+                        destination_query=query_destination,
+                        departure_date=departure_raw[:10] if len(departure_raw) >= 10 else "",
+                        departure_time=departure_raw[11:16] if len(departure_raw) >= 16 else "09:00",
+                    )
+
+                    st.write("入力正規化")
+                    st.json({
+                        "origin_raw": trial_origin,
+                        "origin_clean": origin_clean,
+                        "origin_query": query_origin,
+                        "destination_raw": trial_destination,
+                        "destination_clean": destination_clean,
+                        "destination_query": query_destination,
+                        "departure": departure_raw,
+                        "note": "この結果は完成旅程には反映していません。",
+                    })
+                    st.write("Directions API 診断")
+                    st.json(debug_info or {})
+
+                    if not result:
+                        st.warning("駅名抽出に使える transit 結果を取得できませんでした。API status / error_message / response preview を確認してください。")
+                    else:
+                        station_label = safe_text(result.get("station_label"), "")
+                        if station_label:
+                            st.success(f"抽出候補: 電車：{station_label}")
+                        else:
+                            st.warning("Directions結果は取得できましたが、departure_stop / arrival_stop が空でした。")
+                        st.write("駅名抽出結果")
+                        st.json({
+                            "station_label": station_label,
+                            "duration_text": result.get("duration_text"),
+                            "distance_text": result.get("distance_text"),
+                            "fare_text": result.get("fare_text"),
+                            "start_address": result.get("start_address"),
+                            "end_address": result.get("end_address"),
+                            "transit_station_steps_count": len(result.get("transit_station_steps") or []),
+                        })
+                        station_steps = result.get("transit_station_steps") or []
+                        if station_steps:
+                            st.markdown("**Transit station steps**")
+                            for idx, step in enumerate(station_steps, start=1):
+                                line = safe_text(step.get("line_name"), "")
+                                vehicle = safe_text(step.get("vehicle_name"), "公共交通")
+                                dep = safe_text(step.get("departure_stop"), "")
+                                arr = safe_text(step.get("arrival_stop"), "")
+                                dep_time = safe_text(step.get("departure_time"), "")
+                                arr_time = safe_text(step.get("arrival_time"), "")
+                                st.write(f"{idx}. {vehicle} {line}: {dep} → {arr} ({dep_time} - {arr_time})")
+                            with st.expander("駅名抽出 step JSON", expanded=False):
+                                st.json(station_steps)
+                        with st.expander("全 step JSON", expanded=False):
+                            st.json(result.get("steps") or [])
+            except Exception as e:
+                st.error(f"駅名抽出トライ エラー: {e}")
     if st.button("🔄 全リセット", use_container_width=True):
         reset_all()
         st.rerun()
