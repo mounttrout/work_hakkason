@@ -94,6 +94,7 @@ except Exception:
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
 # - v6.2.69: 自家用車旅行では原則private_carを維持し、明示例外のみbus/walk/train等を許可
 # - v6.2.70: 自家用車意図をplanning_stateだけでなくPhase1プロンプト/自然文案/session_stateから検出するよう補強
+# - v6.2.71: 自家用車意図をresolve_planning_stateで確定し、内部train文字列による例外誤発火を抑止。Phase2ホテル宿泊行の時刻逆転を補正
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
 # - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
 # - v6.2.66: ホテル出発行を移動カードへ誤昇格しないガード、同一大都市圏ホテル継続判定、チェックリスト重複抑制
@@ -107,7 +108,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.70-private-car-context-detection-fix"
+APP_VERSION_NAME = "v6.2.71-private-car-guard-phase2-hotel-time-fix"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -1411,8 +1412,10 @@ def _private_car_exception_mode_from_context(*texts: str) -> str:
 
     # ユーザー・Phase2側で明確に公共交通が指定されている区間だけ許可する。
     rail_tokens = [
+        # --- 修正箇所(v6.2.71): route_source 等の内部文字列 train_bridge で誤って電車例外にしないため、
+        # 英語の train/rail/transit はここでは見ない。日本語で明示された公共交通だけを例外扱いにする。
         "新幹線", "特急", "列車", "鉄道", "電車で", "電車に乗", "電車移動",
-        "公共交通", "train", "rail", "transit",
+        "公共交通",
     ]
     if any(token in context for token in rail_tokens):
         return "train"
@@ -3746,6 +3749,18 @@ def resolve_planning_state() -> Dict:
     notes = s.get("conversation_notes", []) + s.get("revision_requests", [])
     latest_text = " / ".join(notes)
     resolved = dict(s)
+
+    # --- 修正箇所(v6.2.71): 相談メモに自家用車/ドライブ指定がある場合は、ここで主移動モードを確定する ---
+    # primary_destination が「宿は日替わりで」等に置換されても、移動手段指定を下流へ落とさない。
+    if _has_private_car_trip_intent(s, latest_text):
+        before_transport_style = safe_text(resolved.get("transport_style"), "")
+        if before_transport_style not in {"自家用車", "マイカー"}:
+            resolved["transport_style"] = "自家用車"
+            log_event(
+                "条件解決",
+                f"会話内の自家用車指定を主移動モードへ反映: {before_transport_style or '未設定'} → 自家用車",
+                level="info",
+            )
     conversation_trip_days = extract_trip_days_from_text(latest_text)
     adopted_source = "基本情報"
     if conversation_trip_days and conversation_trip_days != int(s.get("trip_days", 2)):
@@ -4189,7 +4204,10 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     before_trip_days = s.get("trip_days", "")
     text = user_text.strip()
 
-    if "徒歩" in text:
+    # --- 修正箇所(v6.2.71): 自家用車/ドライブ旅行は「自動」や「レンタカー」ではなく主移動モードとして保持 ---
+    if any(token in text for token in ["自家用車", "マイカー", "自分の車", "家の車", "ドライブ旅行", "ドライブで", "ドライビング", "車で"]):
+        s["transport_style"] = "自家用車"
+    elif "徒歩" in text:
         s["transport_style"] = "徒歩メイン"
     elif "電車" in text:
         s["transport_style"] = "電車メイン"
@@ -4376,6 +4394,71 @@ def _coerce_positive_minutes(value) -> Optional[int]:
         return minutes if minutes > 0 else None
     except Exception:
         return None
+
+
+def _clock_from_minutes(total_minutes: int) -> str:
+    total = int(total_minutes) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _repair_phase2_hotel_time_order(df: pd.DataFrame) -> pd.DataFrame:
+    # --- 修正箇所(v6.2.71): Phase2構造化で宿泊行の開始時刻が午前へ崩れるケースを後処理で補正 ---
+    # 例: Day2 13:30-16:30 観光 の後に、宿泊行が 09:30-23:00 と出る。
+    # Phase2本体やLLM出力は触らず、同日内の sequence 順でホテル宿泊行だけを直す。
+    if df is None or df.empty or "day" not in df.columns:
+        return df
+
+    fixed = df.copy().reset_index(drop=True)
+    if "sequence" in fixed.columns:
+        fixed = fixed.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+
+    for day, day_df in fixed.groupby("day", sort=True):
+        latest_prior_end: Optional[int] = None
+        latest_prior_destination = ""
+        for idx, row in day_df.iterrows():
+            start_text = safe_text(row.get("start_time"), "")
+            end_text = safe_text(row.get("end_time"), "")
+            start_min = _time_to_minutes(start_text)
+            end_min = _time_to_minutes(end_text)
+            is_hotel = _is_valid_hotel_row(row)
+            purpose = safe_text(row.get("purpose"), "").lower()
+
+            if is_hotel and purpose in {"accommodation", "hotel", "stay", "lodging"}:
+                # 午後/夕方のスポット後にホテル行が午前開始になっている場合だけ補正する。
+                if (
+                    latest_prior_end is not None
+                    and start_min is not None
+                    and start_min + 10 < latest_prior_end
+                    and start_min <= 12 * 60
+                    and latest_prior_end >= 12 * 60
+                ):
+                    new_start = _clock_from_minutes(latest_prior_end)
+                    # 当日宿泊カードは当日末までの表示に留め、翌朝出発は翌日ホテル行に任せる。
+                    new_end = end_text
+                    if end_min is None or end_min <= latest_prior_end or end_min - latest_prior_end > 8 * 60:
+                        new_end = "23:00" if latest_prior_end < 23 * 60 else _clock_from_minutes(min(latest_prior_end + 60, 23 * 60 + 59))
+                    fixed.at[idx, "start_time"] = new_start
+                    fixed.at[idx, "end_time"] = new_end
+                    if "duration_minutes" in fixed.columns:
+                        fixed.at[idx, "duration_minutes"] = _minutes_between_clock(new_start, new_end) or fixed.at[idx, "duration_minutes"]
+                    log_event(
+                        "Phase2ホテル時刻補正",
+                        f"Day{int(day)} {safe_text(row.get('destination'), '')}: {start_text}-{end_text} → {new_start}-{new_end}（直前予定: {latest_prior_destination}）",
+                        level="warning",
+                    )
+                    start_min = _time_to_minutes(new_start)
+                    end_min = _time_to_minutes(new_end)
+
+            if end_min is not None:
+                # 宿泊行を含む後続判定でも、sequence上の最新終了時刻を保持する。
+                if latest_prior_end is None or end_min > latest_prior_end:
+                    latest_prior_end = end_min
+                    latest_prior_destination = safe_text(row.get("destination"), "")
+
+    if "day" in fixed.columns and "sequence" in fixed.columns:
+        fixed = fixed.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+        fixed["sequence"] = fixed.groupby("day").cumcount() + 1
+    return fixed.reset_index(drop=True)
 
 
 def rebuild_phase2_time_consistency(df: pd.DataFrame) -> pd.DataFrame:
@@ -5278,9 +5361,11 @@ def normalize_phase2_dataframe(df: pd.DataFrame, planning_state: Dict) -> pd.Dat
     # --- 修正箇所: Phase2の既存時刻を尊重しつつ整合を取り、複数日はホテルカードを補完 ---
     df = rebuild_phase2_time_consistency(df)
     df = ensure_daily_hotel_rows(df, planning_state)
+    df = _repair_phase2_hotel_time_order(df)
     df = _propagate_hotel_names(df, planning_state)
     df = _finalize_hotel_fallback_labels(df, planning_state)
     df = rebuild_phase2_time_consistency(df)
+    df = _repair_phase2_hotel_time_order(df)
     if "day" in df.columns and "sequence" in df.columns:
         df = df.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
         df["sequence"] = df.groupby("day").cumcount() + 1
