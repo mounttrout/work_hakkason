@@ -39,6 +39,20 @@ KNOWN_LOCATION_COORDS: Dict[str, Tuple[float, float]] = {
     "渋谷駅": (35.6580, 139.7016),
     "表参道": (35.6652, 139.7123),
     "表参道駅": (35.6652, 139.7123),
+    "郡上八幡城": (35.7486, 136.9605),
+    "郡上八幡": (35.7480, 136.9610),
+    "飛騨の里": (36.1326, 137.2356),
+    "高山市内": (36.1461, 137.2522),
+    "大王わさび農場": (36.3397, 137.9099),
+    "安曇野わさび田湧水群": (36.3397, 137.9099),
+    "安曇野アートヒルズミュージアム": (36.3502, 137.8724),
+    "安曇野 穂高ビューホテル": (36.3368, 137.8192),
+    "お宿なごみ野": (36.3503, 137.8579),
+    "上高地": (36.2474, 137.6375),
+    "河童橋": (36.2485, 137.6371),
+    "松本城": (36.2386, 137.9694),
+    "ホテル ブエナビスタ": (36.2260, 137.9686),
+    "美ヶ原高原美術館": (36.2319, 138.1342),
 }
 
 
@@ -341,3 +355,98 @@ def build_dummy_current_location(itinerary_df: Any, mode: str, current_time: Any
     if mode == "予定外移動サンプル":
         return {"label": "渋谷駅付近（予定外移動サンプル）", "lat": 35.6580, "lng": 139.7016}
     return {"label": "東京駅", "lat": 35.681236, "lng": 139.767125}
+
+
+# =========================================================
+# v6.2.72: ハッカソン説明用デモシナリオ生成
+# - 実GPSがなくても、予定通り/到着/遅延/予定外移動/天候悪化の見せ方を確認できる
+# - 完成旅程は変更しない。Execution Monitorの入力値を作るだけ
+# =========================================================
+def _pick_demo_target(rows: List[Dict[str, Any]], prefer_transport: bool = False) -> Optional[Dict[str, Any]]:
+    if not rows:
+        return None
+    if prefer_transport:
+        for row in rows:
+            if row.get("type") == "transport" and row.get("start_dt"):
+                return row
+    for row in rows:
+        if row.get("type") == "spot" and row.get("start_dt"):
+            return row
+    for row in rows:
+        if row.get("start_dt"):
+            return row
+    return rows[0]
+
+
+def _far_sample_location_for(target: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    label = _safe_text((target or {}).get("label"), "")
+    # 対象地に合わせて、わざと離れた場所を選ぶ
+    if any(token in label for token in ["長野", "安曇野", "松本", "上高地", "河童橋", "美ヶ原", "岐阜", "高山", "郡上"]):
+        return {"label": "福井駅付近（デモ用・予定地から離れています）", "lat": 36.0621, "lng": 136.2236}
+    return {"label": "渋谷駅付近（デモ用・予定地から離れています）", "lat": 35.6580, "lng": 139.7016}
+
+
+def build_execution_demo_context(itinerary_df: Any, scenario: str) -> Dict[str, Any]:
+    rows = _normalize_rows(itinerary_df)
+    target = _pick_demo_target(rows, prefer_transport=(scenario == "予定通りデモ"))
+    if not target:
+        now = datetime.now().replace(second=0, microsecond=0)
+        return {
+            "current_time": now.strftime("%Y-%m-%d %H:%M"),
+            "current_location": {"label": "東京駅", "lat": 35.681236, "lng": 139.767125},
+            "scenario_label": scenario,
+            "note": "完成旅程が不足しているため、固定サンプルで表示します。",
+        }
+
+    start_dt = target.get("start_dt") or datetime.now().replace(second=0, microsecond=0)
+    coords = target.get("coords") or coords_for_name(target.get("label"))
+    near_location = {
+        "label": f"{target.get('label')}付近（デモ）",
+        "lat": coords[0] if coords else 35.681236,
+        "lng": coords[1] if coords else 139.767125,
+    }
+
+    if scenario == "到着済みデモ":
+        demo_time = start_dt + timedelta(minutes=5)
+        return {
+            "current_time": demo_time.strftime("%Y-%m-%d %H:%M"),
+            "current_location": near_location,
+            "scenario_label": scenario,
+            "note": "現在地を予定地付近に置き、到着済み/滞在中の表示を確認します。",
+        }
+
+    if scenario == "遅延リスクデモ":
+        demo_time = start_dt - timedelta(minutes=5)
+        return {
+            "current_time": demo_time.strftime("%Y-%m-%d %H:%M"),
+            "current_location": _far_sample_location_for(target),
+            "scenario_label": scenario,
+            "note": "予定開始直前なのに現在地が離れている状態を作り、遅延リスクを確認します。",
+        }
+
+    if scenario == "予定外移動デモ":
+        demo_time = start_dt + timedelta(minutes=10)
+        return {
+            "current_time": demo_time.strftime("%Y-%m-%d %H:%M"),
+            "current_location": _far_sample_location_for(target),
+            "scenario_label": scenario,
+            "note": "本来は予定地にいる時間なのに現在地が離れている状態を作り、予定外移動を確認します。",
+        }
+
+    if scenario == "天候悪化デモ":
+        demo_time = start_dt + timedelta(minutes=5)
+        return {
+            "current_time": demo_time.strftime("%Y-%m-%d %H:%M"),
+            "current_location": near_location,
+            "scenario_label": scenario,
+            "note": "現在地は予定地付近のまま、屋外予定に天候悪化が起きた想定の説明表示を確認します。",
+        }
+
+    # 予定通りデモ
+    demo_time = start_dt + timedelta(minutes=3)
+    return {
+        "current_time": demo_time.strftime("%Y-%m-%d %H:%M"),
+        "current_location": near_location,
+        "scenario_label": scenario,
+        "note": "現在地を予定地付近に置き、予定通り進行している見せ方を確認します。",
+    }

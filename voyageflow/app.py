@@ -73,11 +73,13 @@ except Exception:
 try:
     from services.execution_monitor_agent import (
         build_dummy_current_location,
+        build_execution_demo_context,
         evaluate_execution_progress,
         coords_for_name,
     )
 except Exception:
     build_dummy_current_location = None
+    build_execution_demo_context = None
     evaluate_execution_progress = None
     coords_for_name = None
 
@@ -95,6 +97,7 @@ except Exception:
 # - v6.2.69: 自家用車旅行では原則private_carを維持し、明示例外のみbus/walk/train等を許可
 # - v6.2.70: 自家用車意図をplanning_stateだけでなくPhase1プロンプト/自然文案/session_stateから検出するよう補強
 # - v6.2.71: 自家用車意図をresolve_planning_stateで確定し、内部train文字列による例外誤発火を抑止。Phase2ホテル宿泊行の時刻逆転を補正
+# - v6.2.72: 実行シミュレーション画面の実行中ナビ実験をハッカソン説明用に見やすく整理。デモシナリオを追加し、再計画は行わず提案表示に限定
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
 # - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
 # - v6.2.66: ホテル出発行を移動カードへ誤昇格しないガード、同一大都市圏ホテル継続判定、チェックリスト重複抑制
@@ -108,7 +111,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.71-private-car-guard-phase2-hotel-time-fix"
+APP_VERSION_NAME = "v6.2.72-execution-monitor-demo-polish"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -6784,9 +6787,20 @@ def _build_monitor_current_location(df: pd.DataFrame, mode: str, current_time_te
     return {"label": "未指定"}
 
 
+def _execution_monitor_relation_label(relation: str) -> str:
+    return {
+        "active": "現在の予定",
+        "next": "次の予定",
+        "past_last": "最終予定後",
+    }.get(safe_text(relation, ""), "対象予定")
+
+
 def render_execution_monitor_trial(df: pd.DataFrame, title: str = "🧭 実行中ナビ実験") -> None:
+    # --- 修正箇所(v6.2.72): 実行シミュレーション画面だけを局所修正 ---
+    # ハッカソン説明用に、現在地チェックを「見せる」ためのデモシナリオを追加。
+    # 完成旅程・Phase2/Phase3・簡易一覧・チェックリストは変更しない。
     st.markdown(f"### {title}")
-    st.caption("ハッカソン用の安全な実験機能です。完成旅程を変更せず、現在地/現在時刻から進行状況だけを判定します。")
+    st.caption("完成旅程を変更せず、現在地/現在時刻から進行状況だけを判定します。ハッカソン用にデモシナリオでも確認できます。")
 
     if evaluate_execution_progress is None:
         st.warning("Execution Monitor Agentを読み込めませんでした。services/execution_monitor_agent.py を確認してください。")
@@ -6795,41 +6809,64 @@ def render_execution_monitor_trial(df: pd.DataFrame, title: str = "🧭 実行�
         st.info("完成旅程がないため、実行中ナビ判定はできません。")
         return
 
-    default_time = st.session_state.get("execution_monitor_current_time") or _first_itinerary_datetime_text(df)
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        current_time_text = st.text_input(
-            "現在時刻（YYYY-MM-DD HH:MM / now）",
-            value=safe_text(default_time, "now"),
-            key="execution_monitor_current_time_input",
-        )
-        st.session_state.execution_monitor_current_time = current_time_text
-    with c2:
-        mode_options = ["予定地点付近", "遅延サンプル", "予定外移動サンプル", "スポット名から推定", "緯度経度を手入力"]
-        current_mode = st.session_state.get("execution_monitor_location_mode", "予定地点付近")
-        location_mode = st.selectbox(
-            "現在地の指定方法",
-            mode_options,
-            index=mode_options.index(current_mode) if current_mode in mode_options else 0,
-            key="execution_monitor_location_mode_select",
-        )
-        st.session_state.execution_monitor_location_mode = location_mode
+    scenario_options = ["手動/通常判定", "予定通りデモ", "到着済みデモ", "遅延リスクデモ", "予定外移動デモ", "天候悪化デモ"]
+    scenario = st.selectbox(
+        "デモシナリオ",
+        scenario_options,
+        index=0,
+        help="GPSや権限に依存せず、旅行中ナビの見え方を確認するためのハッカソン用モードです。",
+        key="execution_monitor_demo_scenario",
+    )
 
-    if location_mode in {"スポット名から推定", "緯度経度を手入力"}:
-        c3, c4, c5 = st.columns([1.2, 0.8, 0.8])
-        with c3:
-            st.session_state.execution_monitor_manual_location = st.text_input(
-                "現在地名",
-                value=safe_text(st.session_state.get("execution_monitor_manual_location"), "東京駅"),
-                key="execution_monitor_location_name_input",
+    demo_context = None
+    current_location = None
+    if scenario != "手動/通常判定" and build_execution_demo_context:
+        demo_context = build_execution_demo_context(df, scenario)
+        current_time_text = safe_text(demo_context.get("current_time"), _first_itinerary_datetime_text(df))
+        current_location = demo_context.get("current_location") or {}
+        st.info(f"🎬 {scenario}: {safe_text(demo_context.get('note'), 'デモ用の現在地・時刻で判定します。')}")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.write(f"**デモ時刻**: {current_time_text}")
+        with c2:
+            st.write(f"**デモ現在地**: {safe_text(current_location.get('label'), '-')}")
+    else:
+        default_time = st.session_state.get("execution_monitor_current_time") or _first_itinerary_datetime_text(df)
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            current_time_text = st.text_input(
+                "現在時刻（YYYY-MM-DD HH:MM / now）",
+                value=safe_text(default_time, "now"),
+                key="execution_monitor_current_time_input",
             )
-        if location_mode == "緯度経度を手入力":
-            with c4:
-                st.session_state.execution_monitor_manual_lat = st.text_input("lat", value=safe_text(st.session_state.get("execution_monitor_manual_lat"), ""), key="execution_monitor_lat_input")
-            with c5:
-                st.session_state.execution_monitor_manual_lng = st.text_input("lng", value=safe_text(st.session_state.get("execution_monitor_manual_lng"), ""), key="execution_monitor_lng_input")
+            st.session_state.execution_monitor_current_time = current_time_text
+        with c2:
+            mode_options = ["予定地点付近", "遅延サンプル", "予定外移動サンプル", "スポット名から推定", "緯度経度を手入力"]
+            current_mode = st.session_state.get("execution_monitor_location_mode", "予定地点付近")
+            location_mode = st.selectbox(
+                "現在地の指定方法",
+                mode_options,
+                index=mode_options.index(current_mode) if current_mode in mode_options else 0,
+                key="execution_monitor_location_mode_select",
+            )
+            st.session_state.execution_monitor_location_mode = location_mode
 
-    current_location = _build_monitor_current_location(df, location_mode, current_time_text)
+        if location_mode in {"スポット名から推定", "緯度経度を手入力"}:
+            c3, c4, c5 = st.columns([1.2, 0.8, 0.8])
+            with c3:
+                st.session_state.execution_monitor_manual_location = st.text_input(
+                    "現在地名",
+                    value=safe_text(st.session_state.get("execution_monitor_manual_location"), "東京駅"),
+                    key="execution_monitor_location_name_input",
+                )
+            if location_mode == "緯度経度を手入力":
+                with c4:
+                    st.session_state.execution_monitor_manual_lat = st.text_input("lat", value=safe_text(st.session_state.get("execution_monitor_manual_lat"), ""), key="execution_monitor_lat_input")
+                with c5:
+                    st.session_state.execution_monitor_manual_lng = st.text_input("lng", value=safe_text(st.session_state.get("execution_monitor_manual_lng"), ""), key="execution_monitor_lng_input")
+
+        current_location = _build_monitor_current_location(df, location_mode, current_time_text)
+
     try:
         result = evaluate_execution_progress(
             itinerary_df=df,
@@ -6842,9 +6879,26 @@ def render_execution_monitor_trial(df: pd.DataFrame, title: str = "🧭 実行�
             st.exception(e)
         return
 
+    if scenario == "天候悪化デモ":
+        # 位置・時刻判定は残しつつ、審査説明用に天候悪化時の提案表示へ置き換える。
+        result["status"] = "weather_risk"
+        result["status_label"] = "天候悪化リスク"
+        result["severity"] = "warning"
+        result["message"] = "屋外予定に雨・強風などの天候悪化が起きた想定です。予定の自動変更はせず、屋内候補や移動手段変更を提案します。"
+        result["actions"] = [
+            "屋外スポットの公式情報・天候を確認する",
+            "近隣の屋内スポットへ切り替える候補を出す",
+            "徒歩移動が多い場合はタクシーや屋内動線を検討する",
+            "変更が必要な場合のみ、ユーザー確認後に局所再計画する",
+        ]
+
     severity = safe_text(result.get("severity"), "info")
     status_label = safe_text(result.get("status_label"), "確認")
     message = safe_text(result.get("message"), "")
+    target = result.get("target_step", {}) or {}
+    relation_label = _execution_monitor_relation_label(safe_text(target.get("relation"), ""))
+
+    st.markdown("#### 📍 現在地・時刻チェック")
     if severity == "success":
         st.success(f"{status_label}: {message}")
     elif severity == "warning":
@@ -6852,23 +6906,35 @@ def render_execution_monitor_trial(df: pd.DataFrame, title: str = "🧭 実行�
     else:
         st.info(f"{status_label}: {message}")
 
-    target = result.get("target_step", {}) or {}
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("判定時刻", safe_text(result.get("current_time"), "-"))
     m2.metric("現在地", safe_text(result.get("current_location_label"), "-"))
-    m3.metric("対象予定", safe_text(target.get("label"), "-"))
+    m3.metric(relation_label, safe_text(target.get("label"), "-"))
     distance = result.get("distance_m")
     m4.metric("対象まで", f"{distance}m" if distance is not None else "位置未確定")
 
-    with st.expander("判定詳細", expanded=False):
-        st.json(result)
+    st.markdown("#### 🧠 判定の読み取り")
+    readable_type = {
+        "transport": "移動中/移動予定",
+        "spot": "スポット滞在",
+        "hotel": "宿泊・滞在",
+    }.get(safe_text(target.get("type"), ""), "予定")
+    st.write(f"- 対象: **{safe_text(target.get('label'), '-')}**")
+    st.write(f"- 種別: {readable_type}")
+    st.write(f"- 予定時刻: {safe_text(target.get('date'), '-')} {safe_text(target.get('start_time'), '-')} - {safe_text(target.get('end_time'), '-')}")
+    if distance is None:
+        st.write("- 距離判定: 位置情報またはスポット座標が不足しているため、時刻中心で判定しています。")
+    else:
+        st.write(f"- 距離判定: 現在地から対象予定まで約 **{distance}m** です。")
 
     actions = result.get("actions") or []
     if actions:
-        st.markdown("**次の確認候補（まだ自動再計画はしません）**")
+        st.markdown("#### ✅ 次の確認候補（自動再計画はまだしません）")
         for action in actions:
             st.write(f"- {safe_text(action, '')}")
 
+    with st.expander("判定詳細JSON（デバッグ用）", expanded=False):
+        st.json(result)
 
 def render_simple_itinerary_page() -> None:
     # --- 修正箇所: 簡易一覧を完成旅程タブ内の追加表示ではなく、疑似画面遷移ページとして表示 ---
