@@ -93,6 +93,7 @@ except Exception:
 # - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
 # - v6.2.69: 自家用車旅行では原則private_carを維持し、明示例外のみbus/walk/train等を許可
+# - v6.2.70: 自家用車意図をplanning_stateだけでなくPhase1プロンプト/自然文案/session_stateから検出するよう補強
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
 # - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
 # - v6.2.66: ホテル出発行を移動カードへ誤昇格しないガード、同一大都市圏ホテル継続判定、チェックリスト重複抑制
@@ -106,7 +107,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.69-private-car-mode-guard"
+APP_VERSION_NAME = "v6.2.70-private-car-context-detection-fix"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -1308,19 +1309,65 @@ def _compose_transport_bridge_hints(bridge_rows: list) -> tuple[str, str]:
 
 
 def _planning_transport_context_text(planning_state: Dict[str, object], *extra_texts: str) -> str:
-    # --- 修正箇所(v6.2.69): 自家用車旅行の意図検出用に、会話条件と区間文脈をまとめる ---
+    # --- 修正箇所(v6.2.70): 自家用車旅行の意図検出を planning_state だけに依存しない ---
+    # v6.2.69 では primary_destination が「宿は日替わりで」等に置き換わった場合、
+    # 相談メモ内の「自家用車で」が planning_state に残らず、ガードが発火しないケースがあった。
+    # ここでは Phase1プロンプト・自然文案・解決条件・チャット履歴も参照し、
+    # ユーザーが明示した主移動手段を完成旅程/簡易一覧の最終表示まで保持する。
     parts: List[str] = []
     if isinstance(planning_state, dict):
-        for key in ("primary_destination", "transport_style", "budget_style", "departure_place", "return_place"):
+        for key in (
+            "primary_destination",
+            "transport_style",
+            "budget_style",
+            "departure_place",
+            "return_place",
+            "purpose",
+            "travel_purpose",
+            "companions",
+            "personal_info",
+        ):
             value = planning_state.get(key)
             if value:
                 parts.append(str(value))
-        for key in ("conversation_notes", "revision_requests"):
+        for key in ("conversation_notes", "revision_requests", "fixed_requirements", "additional_requests"):
             values = planning_state.get(key) or []
             if isinstance(values, list):
                 parts.extend(str(v) for v in values if v)
             elif values:
                 parts.append(str(values))
+
+    # session_state 側にだけ残る相談メモ・Phase1プロンプト・自然文案も参照する。
+    # 失敗しても本体を止めないため try で囲む。
+    try:
+        session_keys = (
+            "phase1_prompt_text",
+            "trip_plan_draft",
+            "trip_plan",
+            "validation_source_plan_text",
+            "user_request",
+            "last_user_input",
+            "original_user_input",
+        )
+        for key in session_keys:
+            value = st.session_state.get(key)
+            if value:
+                parts.append(str(value))
+
+        resolved = st.session_state.get("resolved_conditions")
+        if isinstance(resolved, dict):
+            parts.extend(str(v) for v in resolved.values() if v)
+
+        chat_history = st.session_state.get("chat_history") or []
+        if isinstance(chat_history, list):
+            for item in chat_history[-12:]:
+                if isinstance(item, dict):
+                    parts.extend(str(item.get(k, "")) for k in ("content", "message", "text", "role") if item.get(k))
+                elif item:
+                    parts.append(str(item))
+    except Exception:
+        pass
+
     parts.extend(str(v) for v in extra_texts if v)
     return " ".join(parts)
 
@@ -1333,7 +1380,8 @@ def _has_private_car_trip_intent(planning_state: Dict[str, object], *extra_texts
 
     private_car_tokens = [
         "自家用車", "マイカー", "自分の車", "自分のクルマ", "家の車",
-        "車で", "車移動", "車利用", "車旅行", "自動車", "ドライブ旅行", "ドライブで",
+        "車で", "車移動", "車利用", "車旅行", "自動車",
+        "ドライブ旅行", "ドライブで", "ドライブ", "ドライビング", "driving",
         "private car", "my car",
     ]
     rental_car_tokens = ["レンタカー", "レンタルカー", "借りた車", "借りる車"]
