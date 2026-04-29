@@ -94,6 +94,7 @@ except Exception:
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
 # - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
+# - v6.2.66: ホテル出発行を移動カードへ誤昇格しないガード、同一大都市圏ホテル継続判定、チェックリスト重複抑制
 # - v6.2.60: v6.2.47の正常な簡易旅程・戻るボタン挙動だけを局所復元
 # - v6.2.61: 簡易一覧の移動手段が徒歩に落ちる表示問題を修正
 # - v6.2.62: 左サイドバーのトライ用スペースに Directions transit 駅名抽出診断を追加（完成旅程には未反映）
@@ -104,7 +105,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.65-dynamic-checklist-execution-monitor"
+APP_VERSION_NAME = "v6.2.66-checklist-dedupe-hotel-departure-guard"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -1439,6 +1440,34 @@ def _protect_meal_rows(df: pd.DataFrame) -> pd.DataFrame:
     return repaired
 
 
+def _major_metro_group(area_hint: str) -> str:
+    # --- 修正箇所(v6.2.66): 同一大都市圏内のエリア移動を「ホテル変更が必要な大移動」と誤判定しない ---
+    text = safe_text(area_hint, "")
+    if not text:
+        return ""
+    tokyo_tokens = {
+        "東京", "新宿", "渋谷", "銀座", "上野", "浅草", "丸の内", "両国", "水道橋",
+        "後楽園", "神楽坂", "表参道", "秋葉原", "池袋", "品川", "台東", "墨田", "文京", "千代田", "港", "中央", "江東"
+    }
+    osaka_tokens = {"大阪", "梅田", "難波", "なんば", "心斎橋", "天王寺", "新大阪"}
+    kyoto_tokens = {"京都", "祇園", "嵐山", "河原町"}
+    nagoya_tokens = {"名古屋", "栄", "金山"}
+    fukuoka_tokens = {"福岡", "博多", "天神"}
+    sapporo_tokens = {"札幌", "小樽", "北海道"}
+    groups = [
+        ("tokyo", tokyo_tokens),
+        ("osaka", osaka_tokens),
+        ("kyoto", kyoto_tokens),
+        ("nagoya", nagoya_tokens),
+        ("fukuoka", fukuoka_tokens),
+        ("sapporo", sapporo_tokens),
+    ]
+    for group_name, tokens in groups:
+        if any(token and token in text for token in tokens):
+            return group_name
+    return ""
+
+
 def _detect_large_area_change_between_days(prev_day_df: pd.DataFrame, next_day_df: pd.DataFrame) -> bool:
     prev_candidates = [safe_text(row.get("destination"), "") for _, row in prev_day_df.iterrows() if not bool(row.get("is_transport", False)) and not _is_hotel_like_name(safe_text(row.get("destination"), ""))]
     next_candidates = [safe_text(row.get("destination"), "") for _, row in next_day_df.iterrows() if not bool(row.get("is_transport", False)) and not _is_hotel_like_name(safe_text(row.get("destination"), ""))]
@@ -1446,6 +1475,12 @@ def _detect_large_area_change_between_days(prev_day_df: pd.DataFrame, next_day_d
     next_area = next((hint for hint in (_extract_area_hint(v) for v in next_candidates) if hint), "")
     if not prev_area or not next_area:
         return False
+
+    prev_group = _major_metro_group(prev_area)
+    next_group = _major_metro_group(next_area)
+    if prev_group and next_group and prev_group == next_group:
+        return False
+
     return prev_area != next_area and prev_area not in next_area and next_area not in prev_area
 
 
@@ -4485,6 +4520,8 @@ def _looks_like_phase2_embedded_transport_row(current: pd.Series | Dict, actual_
         return False
     if _same_effective_place(current_dest, next_dest):
         return False
+    if _is_hotel_or_lodging_row(current):
+        return False
 
     purpose = safe_text(_row_value(current, "purpose", ""), "").lower()
     genre = safe_text(_row_value(current, "genre", ""), "").lower()
@@ -4600,6 +4637,28 @@ def _should_skip_cross_day_transport(current: pd.Series | Dict, actual_next: pd.
 
     return False
 
+def _should_keep_hotel_departure_row_without_transport(current: pd.Series | Dict, actual_next: pd.Series | Dict) -> bool:
+    # --- 修正箇所(v6.2.66): ホテル出発行を「移動カード」に誤昇格させない ---
+    # 例: Day2 09:00-10:00 アパホテル（departure）→ 10:00 仲見世商店街。
+    # この行はPhase2上の最初の予定として保持し、追加transport生成も行わない。
+    if current is None or actual_next is None:
+        return False
+    if not _is_hotel_or_lodging_row(current):
+        return False
+
+    purpose = safe_text(_row_value(current, "purpose", ""), "").lower()
+    one_point = safe_text(_row_value(current, "one_point", ""), "")
+    if purpose not in {"departure", "hotel", "accommodation", "stay", "lodging"} and "出発" not in one_point:
+        return False
+
+    current_end = safe_text(_row_value(current, "end_time", ""), "")
+    next_start = safe_text(_row_value(actual_next, "start_time", ""), "")
+    gap = _minutes_between_clock(current_end, next_start) if current_end and next_start else None
+    if gap is None:
+        return False
+    return 0 <= gap <= 5
+
+
 def _promote_last_row_to_embedded_transport(rows: List[Dict[str, object]], current: pd.Series | Dict, actual_next: pd.Series | Dict, planning_state: Dict[str, object], service_hint: str = "") -> None:
     # --- 修正箇所: v6.2.55 ---
     # すでに rows に追加済みの current 行を、スポットカードではなく移動カードへ安全に変換する。
@@ -4689,6 +4748,14 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
 
         if _same_effective_place(origin_name, destination_name):
             log_event("Phase3", f"同一地点移動をスキップ: {origin_name} → {destination_name}", level="info")
+            continue
+
+        if _should_keep_hotel_departure_row_without_transport(current, actual_next):
+            log_event(
+                "Phase3ホテル出発ガード",
+                f"ホテル出発行を予定として保持し、移動カード化をスキップ: Day{safe_text(current.get('day'), '')} {origin_name} → {destination_name}",
+                level="info",
+            )
             continue
 
         # --- 修正箇所: v6.2.52 Phase3二重移動防止ガード ---

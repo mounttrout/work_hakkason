@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 VoyageFlow / Dynamic Checklist Agent
-v6.2.65-dynamic-checklist-execution-monitor
+v6.2.66-checklist-dedupe-hotel-departure-guard
 
 目的:
 - 固定チェックリストではなく、旅行条件・完成旅程・同行者・目的・移動手段から動的にToDo/持ち物を生成する。
@@ -64,9 +64,17 @@ def _item(item_id: str, text: str, category: str = "general", priority: str = "n
     }
 
 
+def _canonical_item_text(value: Any) -> str:
+    text = _safe_text(value).lower()
+    text = re.sub(r"[\s\u3000・,，.．:：/／\-ー〜~()（）［］\[\]「」『』<>〈〉]+", "", text)
+    return text
+
+
 def _append_unique(items: List[ChecklistItem], item: ChecklistItem) -> None:
-    existing_texts = {_safe_text(x.get("text")) for x in items}
-    if _safe_text(item.get("text")) not in existing_texts:
+    item_text = _safe_text(item.get("text"))
+    item_key = _canonical_item_text(item_text)
+    existing_texts = {_canonical_item_text(x.get("text")) for x in items}
+    if item_key and item_key not in existing_texts:
         items.append(item)
 
 
@@ -92,6 +100,33 @@ def _is_hotel(row: Dict[str, Any]) -> bool:
     purpose = _safe_text(row.get("purpose")).lower()
     genre = _safe_text(row.get("genre")).lower()
     return purpose in {"accommodation", "hotel", "stay", "lodging"} or genre == "hotel" or any(k in destination.lower() for k in ["ホテル", "旅館", "hotel", "inn", "resort"])
+
+
+def _is_tokyo_area_name(value: str) -> bool:
+    text = _safe_text(value)
+    tokens = ["東京", "両国", "浅草", "上野", "渋谷", "新宿", "後楽園", "水道橋", "神楽坂", "銀座", "表参道", "秋葉原", "池袋", "品川", "台東", "墨田", "文京", "千代田"]
+    return any(token in text for token in tokens)
+
+
+def _is_long_distance_train_segment(seg: Dict[str, Any]) -> bool:
+    text = " ".join([
+        _safe_text(seg.get("label")),
+        _safe_text(seg.get("origin")),
+        _safe_text(seg.get("destination")),
+        _safe_text(seg.get("one_point")),
+        _safe_text(seg.get("route_data_source")),
+    ])
+    if _contains_any(text, ["新幹線", "特急", "かがやき", "はくたか", "サンダーバード", "しらさぎ"]):
+        return True
+    try:
+        minutes = int(float(seg.get("duration_minutes") or 0))
+    except Exception:
+        minutes = 0
+    origin = _safe_text(seg.get("origin"))
+    dest = _safe_text(seg.get("destination"))
+    if minutes >= 90 and not (_is_tokyo_area_name(origin) and _is_tokyo_area_name(dest)):
+        return True
+    return False
 
 
 def _transport_mode(row: Dict[str, Any]) -> str:
@@ -163,16 +198,24 @@ def _infer_purpose_text(planning_state: Dict[str, Any], rows: List[Dict[str, Any
 
 def _extract_hotels(rows: List[Dict[str, Any]]) -> List[str]:
     hotels: List[str] = []
+    seen = set()
     for row in rows:
+        if _is_transport(row):
+            continue
         if _is_hotel(row):
             name = _safe_text(row.get("destination"))
-            if name and name not in hotels and name not in {"ホテル", "宿泊先"}:
+            if not name or "→" in name or name in {"ホテル", "宿泊先"}:
+                continue
+            key = _canonical_item_text(name)
+            if key and key not in seen:
+                seen.add(key)
                 hotels.append(name)
     return hotels
 
 
-def _extract_transport_segments(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    segments: List[Dict[str, str]] = []
+def _extract_transport_segments(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    seen = set()
     for row in rows:
         if not _is_transport(row):
             continue
@@ -184,6 +227,10 @@ def _extract_transport_segments(rows: List[Dict[str, Any]]) -> List[Dict[str, st
             origin = parts[0].strip()
             dest = parts[-1].strip()
         label = f"{origin}→{dest}" if origin and dest and origin != dest else (dest or _safe_text(row.get("destination"), "移動"))
+        key = (mode, _canonical_item_text(origin), _canonical_item_text(dest), _safe_text(row.get("date")), _safe_text(row.get("start_time")))
+        if key in seen:
+            continue
+        seen.add(key)
         segments.append({
             "mode": mode,
             "origin": origin,
@@ -191,6 +238,9 @@ def _extract_transport_segments(rows: List[Dict[str, Any]]) -> List[Dict[str, st
             "label": label,
             "date": _safe_text(row.get("date")),
             "start_time": _safe_text(row.get("start_time")),
+            "duration_minutes": row.get("duration_minutes"),
+            "one_point": _safe_text(row.get("one_point")),
+            "route_data_source": _safe_text(row.get("route_data_source")),
         })
     return segments
 
@@ -205,13 +255,13 @@ def _detect_context_flags(destination: str, purpose: str, companions: str, perso
     ])
     return {
         "overseas": _contains_any(all_text, ["海外", "ハワイ", "hawaii", "グアム", "韓国", "台湾", "シンガポール", "ヨーロッパ", "アメリカ"]),
-        "beach": _contains_any(all_text, ["ハワイ", "海水浴", "ビーチ", "海", "シュノーケル", "ダイビング", "リゾート", "沖縄", "グアム"]),
+        "beach": _contains_any(all_text, ["ハワイ", "海水浴", "ビーチ", "シュノーケル", "ダイビング", "沖縄", "グアム", "プール", "マリンスポーツ"]),
         "business": _contains_any(all_text, ["仕事", "出張", "会議", "商談", "展示会", "セミナー", "business", "同僚"]),
         "children": _contains_any(all_text, ["子供", "子ども", "こども", "子連れ", "家族", "小学生", "中学生", "幼児", "乳児", "赤ちゃん", "ベビ"]),
         "baby": _contains_any(all_text, ["乳児", "赤ちゃん", "0歳", "1歳", "2歳", "ベビ", "おむつ", "ミルク"]),
         "school_child": _contains_any(all_text, ["小学生", "小学校", "低学年", "高学年", "6年生", "子供2人", "子ども2人"]),
         "senior": _contains_any(all_text, ["高齢", "シニア", "70代", "80代", "祖父", "祖母"]),
-        "outdoor": _contains_any(all_text, ["登山", "ハイキング", "キャンプ", "アウトドア", "トレッキング", "山"]),
+        "outdoor": _contains_any(all_text, ["登山", "ハイキング", "キャンプ", "アウトドア", "トレッキング", "山歩き", "高原"]),
         "formal": _contains_any(all_text, ["法事", "葬儀", "結婚式", "式典", "礼服", "喪服"]),
         "gadget": _contains_any(all_text, ["ガジェット", "データサイエンティスト", "エンジニア", "pc", "カメラ", "撮影", "動画"]),
         "running": _contains_any(all_text, ["ランニング", "ジョギング", "ランナー"]),
@@ -220,13 +270,17 @@ def _detect_context_flags(destination: str, purpose: str, companions: str, perso
     }
 
 
-def _add_transport_todos(before: List[ChecklistItem], day_of: List[ChecklistItem], segments: List[Dict[str, str]]) -> None:
-    modes = {seg.get("mode", "") for seg in segments}
-    for idx, seg in enumerate(segments[:8], start=1):
+def _add_transport_todos(before: List[ChecklistItem], day_of: List[ChecklistItem], during: List[ChecklistItem], segments: List[Dict[str, Any]]) -> None:
+    local_train_seen = False
+    for idx, seg in enumerate(segments[:12], start=1):
         mode = seg.get("mode", "unknown")
         label = seg.get("label") or "移動"
         if mode in {"train", "rail"}:
-            _append_unique(before, _item(f"todo_before_train_{idx}", f"{label} の電車・新幹線チケットを予約/確認する", "reservation", "high", "🚄 予約/確認", _google_search_url(f"{label} 新幹線 電車 予約")))
+            if _is_long_distance_train_segment(seg):
+                _append_unique(before, _item(f"todo_before_train_{idx}", f"{label} の長距離列車・新幹線チケットを予約/確認する", "reservation", "high", "🚄 予約/確認", _google_search_url(f"{label} 新幹線 電車 予約")))
+            elif not local_train_seen:
+                local_train_seen = True
+                _append_unique(during, _item("todo_during_local_train_route", "都市内の電車移動は、各移動前に現在地からの経路・乗り場を確認する", "transport", "normal"))
         elif mode == "air":
             _append_unique(before, _item(f"todo_before_air_{idx}", f"{label} の航空券・搭乗時刻を確認する", "reservation", "high", "✈️ 航空券確認", _google_search_url(f"{label} 航空券 予約 確認")))
             _append_unique(day_of, _item(f"todo_day_air_{idx}", "空港到着時刻・保安検査締切・手荷物条件を確認する", "transport", "high"))
@@ -268,7 +322,7 @@ def build_trip_checklist(planning_state: Optional[Dict[str, Any]] = None, itiner
         _append_unique(before, _item(f"todo_before_hotel_{idx}", f"{hotel} の予約・チェックイン時刻を確認する", "reservation", "high", "🏨 予約/確認", _google_search_url(f"{hotel} 予約 確認")))
         _append_unique(day_of, _item(f"todo_day_hotel_{idx}", f"{hotel} の住所・チェックイン方法をスマホですぐ見られるようにする", "hotel", "normal", "🗺️ 地図", _google_maps_search_url(hotel)))
 
-    _add_transport_todos(before, day_of, transport_segments)
+    _add_transport_todos(before, day_of, during, transport_segments)
 
     if flags["overseas"]:
         _append_unique(before, _item("todo_before_passport", "パスポート残存期限・入国条件・海外旅行保険を確認する", "documents", "high"))
@@ -410,6 +464,19 @@ def build_trip_checklist(planning_state: Optional[Dict[str, Any]] = None, itiner
             advice.append("スマホの電池切れが旅程実行の大きなリスクになるため、モバイルバッテリーは最優先で準備してください。")
         else:
             advice.append("予約情報・地図リンク・ホテル住所はオフラインでも見られるように保存しておくと安心です。")
+
+    # --- v6.2.66: 生成後にも念のためセクション内重複を除去 ---
+    def _dedupe_items(items: List[ChecklistItem]) -> List[ChecklistItem]:
+        cleaned: List[ChecklistItem] = []
+        for item in items:
+            _append_unique(cleaned, item)
+        return cleaned
+
+    before = _dedupe_items(before)
+    day_of = _dedupe_items(day_of)
+    during = _dedupe_items(during)
+    for section_name in list(packing.keys()):
+        packing[section_name] = _dedupe_items(packing[section_name])
 
     return {
         "meta": {
