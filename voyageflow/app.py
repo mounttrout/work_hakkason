@@ -60,6 +60,29 @@ except Exception:
 
 
 # =========================================================
+# 修正箇所(v6.2.65): Checklist Agent / Execution Monitor Agent 外付け
+# - app.pyは画面遷移と表示だけを担当
+# - チェックリスト生成・実行中ナビ判定はservices側に分離
+# - Phase2 / Phase3 / 簡易一覧 / 戻るボタンは触らない
+# =========================================================
+try:
+    from services.checklist_agent import build_trip_checklist
+except Exception:
+    build_trip_checklist = None
+
+try:
+    from services.execution_monitor_agent import (
+        build_dummy_current_location,
+        evaluate_execution_progress,
+        coords_for_name,
+    )
+except Exception:
+    build_dummy_current_location = None
+    evaluate_execution_progress = None
+    coords_for_name = None
+
+
+# =========================================================
 # 【バージョン名】VoyageFlow v6.2.55-hotel-destination-and-long-return-guard
 # 【制作日】2026-04-27
 # 【前バージョンからの修正内容】
@@ -70,6 +93,7 @@ except Exception:
 # - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
+# - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
 # - v6.2.60: v6.2.47の正常な簡易旅程・戻るボタン挙動だけを局所復元
 # - v6.2.61: 簡易一覧の移動手段が徒歩に落ちる表示問題を修正
 # - v6.2.62: 左サイドバーのトライ用スペースに Directions transit 駅名抽出診断を追加（完成旅程には未反映）
@@ -80,8 +104,8 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.64-spot-info-agent-externalized"
-APP_UPDATED_DATE = "2026-04-28"
+APP_VERSION_NAME = "v6.2.65-dynamic-checklist-execution-monitor"
+APP_UPDATED_DATE = "2026-04-29"
 
 
 # =========================================================
@@ -158,6 +182,10 @@ st.markdown(
         font-size: 14px; font-weight: 800; white-space: nowrap;
     }
     .vf-simple-btn:hover { background: #ffffff; border-color: rgba(0,0,0,0.28); }
+    .vf-checklist-card { padding: 10px 12px; border-radius: 12px; border: 1px solid #e4e7ec; margin-bottom: 8px; background: #ffffff; }
+    .vf-checklist-card-done { background: #eeeeee; color: #667085; text-decoration: line-through; border-color: #d0d5dd; }
+    .vf-checklist-note { font-size: 12px; opacity: 0.78; margin-top: 3px; }
+    .vf-monitor-box { padding: 12px 14px; border-radius: 12px; background: #f8fafc; border: 1px solid #d0d5dd; margin-bottom: 10px; }
 
     @media (max-width: 768px) {
         .stTabs [data-baseweb="tab-list"] button { font-size: 13px; padding: 8px 10px; }
@@ -618,8 +646,20 @@ def init_session_state() -> None:
         "validation_source_plan_text": "",
         "validation_source_itinerary_text": "",
         "simple_itinerary_page_mode": False,
+        "checklist_page_mode": False,
         "force_final_itinerary_page_mode": False,
         "spot_reliability_logged_keys": set(),
+        "checklist_checked_items": {},
+        "checklist_context": {
+            "purpose": "",
+            "companions": "",
+            "personal_info": "",
+        },
+        "execution_monitor_current_time": "",
+        "execution_monitor_location_mode": "予定地点付近",
+        "execution_monitor_manual_location": "",
+        "execution_monitor_manual_lat": "",
+        "execution_monitor_manual_lng": "",
     }
 
     for key, value in defaults.items():
@@ -5965,6 +6005,273 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
 
 
 
+# =========================================================
+# 修正箇所(v6.2.65): 動的チェックリスト疑似画面
+# - services/checklist_agent.py で生成
+# - app.pyは表示・チェック状態保持・戻るボタンのみ担当
+# - 固定リストではなく、目的/行き先/同行者/移動手段/旅程から動的生成
+# =========================================================
+def _checklist_item_action_button(item: Dict[str, object], key_suffix: str) -> None:
+    label = safe_text(item.get("action_label"), "")
+    url = safe_text(item.get("action_url"), "")
+    if label and url and url != "-":
+        st.link_button(label, url, use_container_width=True)
+
+
+def _render_checklist_item(item: Dict[str, object], section_key: str) -> None:
+    item_id = safe_text(item.get("id"), "") or f"{section_key}_{abs(hash(str(item)))}"
+    state_key = f"checklist_checked_{item_id}"
+    checked_map = st.session_state.get("checklist_checked_items", {})
+    if not isinstance(checked_map, dict):
+        checked_map = {}
+    default_checked = bool(checked_map.get(item_id, False))
+
+    col_check, col_text, col_action = st.columns([0.13, 0.62, 0.25])
+    with col_check:
+        checked = st.checkbox("", value=default_checked, key=state_key, label_visibility="collapsed")
+    checked_map[item_id] = bool(checked)
+    st.session_state.checklist_checked_items = checked_map
+
+    css_class = "vf-checklist-card vf-checklist-card-done" if checked else "vf-checklist-card"
+    priority = safe_text(item.get("priority"), "normal")
+    priority_badge = "🔥" if priority == "high" else ""
+    note = safe_text(item.get("note"), "")
+    with col_text:
+        st.markdown(
+            f"<div class='{css_class}'><b>{priority_badge} {html.escape(safe_text(item.get('text'), ''))}</b>"
+            + (f"<div class='vf-checklist-note'>{html.escape(note)}</div>" if note else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    with col_action:
+        _checklist_item_action_button(item, item_id)
+
+
+def _render_checklist_sections(title: str, sections: Dict[str, List[Dict[str, object]]], prefix: str) -> None:
+    st.markdown(f"### {title}")
+    for section_name, items in sections.items():
+        with st.expander(section_name, expanded=True):
+            if not items:
+                st.caption("該当項目はありません。")
+                continue
+            for item in items:
+                _render_checklist_item(item, f"{prefix}_{section_name}")
+
+
+def _infer_default_checklist_purpose(df: pd.DataFrame) -> str:
+    text_parts = []
+    try:
+        if df is not None and not df.empty:
+            for _, row in df.head(20).iterrows():
+                text_parts.append(f"{safe_text(row.get('purpose'), '')} {safe_text(row.get('one_point'), '')} {safe_text(row.get('destination'), '')}")
+    except Exception:
+        pass
+    text = " ".join(text_parts)
+    if any(token in text for token in ["出張", "仕事", "会議", "business"]):
+        return "仕事・出張"
+    if any(token in text for token in ["海", "ビーチ", "海水浴", "ハワイ", "沖縄"]):
+        return "海・リゾート"
+    if any(token in text for token in ["登山", "ハイキング", "アウトドア"]):
+        return "登山・アウトドア"
+    return "観光"
+
+
+def render_checklist_page() -> None:
+    st.title("✅ 旅行チェックリスト")
+    st.caption("旅行目的・行き先・同行者・移動手段・完成旅程から、ToDoと持ち物を動的に作成します。予約が必要な項目には確認ボタンを出します。")
+
+    top_left, top_right = st.columns([1, 2])
+    with top_left:
+        if st.button("⬅ 完成旅程に戻る", use_container_width=True, key="back_to_final_itinerary_from_checklist"):
+            st.session_state.checklist_page_mode = False
+            st.session_state.force_final_itinerary_page_mode = True
+            st.session_state.active_tab = "final_itinerary"
+            st.rerun()
+    with top_right:
+        st.info("チェックすると項目がグレーアウトします。チェック状態はこのセッション中保持されます。")
+
+    df = st.session_state.get("df_phase3")
+    if df is None or df.empty:
+        st.warning("チェックリストを作る完成旅程がありません。")
+        return
+
+    context = st.session_state.get("checklist_context", {})
+    if not isinstance(context, dict):
+        context = {}
+    default_purpose = context.get("purpose") or _infer_default_checklist_purpose(df)
+
+    with st.expander("条件を補足してチェックリストを最適化", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            purpose = st.text_input("旅行目的", value=safe_text(default_purpose, "観光"), key="checklist_purpose_input", placeholder="観光、出張、海水浴、登山、法事など")
+        with c2:
+            companions = st.text_input("同行者", value=safe_text(context.get("companions"), ""), key="checklist_companions_input", placeholder="一人、家族、子供2人、職場の同僚など")
+        with c3:
+            personal_info = st.text_input("パーソナル情報", value=safe_text(context.get("personal_info"), ""), key="checklist_personal_input", placeholder="50代男性、ガジェット好き、ランニングが趣味など")
+        st.session_state.checklist_context = {
+            "purpose": purpose,
+            "companions": companions,
+            "personal_info": personal_info,
+        }
+
+    if build_trip_checklist is None:
+        st.error("Checklist Agentを読み込めませんでした。services/checklist_agent.py を確認してください。")
+        return
+
+    try:
+        checklist = build_trip_checklist(
+            planning_state=st.session_state.get("planning_state", {}),
+            itinerary_df=df,
+            user_context=st.session_state.get("checklist_context", {}),
+        )
+    except Exception as e:
+        st.error(f"チェックリスト生成に失敗しました: {e}")
+        if st.session_state.debug_mode:
+            st.exception(e)
+        return
+
+    meta = checklist.get("meta", {}) if isinstance(checklist, dict) else {}
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("目的", safe_text(meta.get("purpose"), "-"))
+    m2.metric("行き先", safe_text(meta.get("destination"), "-"))
+    m3.metric("旅行日数", f"{safe_text(meta.get('trip_days'), '-')}日")
+    m4.metric("移動手段", ", ".join(meta.get("transport_modes") or []) or "-")
+
+    _render_checklist_sections("1. 【時系列別】必須ToDoリスト", checklist.get("todo_sections", {}) or {}, "todo")
+    _render_checklist_sections("2. 【カテゴリ別】持ち物リスト", checklist.get("packing_sections", {}) or {}, "packing")
+
+    st.markdown("### 3. コンシェルジュのアドバイス")
+    for idx, advice in enumerate(checklist.get("advice", []) or [], start=1):
+        st.info(f"{idx}. {safe_text(advice, '')}")
+
+
+# =========================================================
+# 修正箇所(v6.2.65): 実行中ナビ/現在地チェック実験
+# - services/execution_monitor_agent.py で判定
+# - 再計画はまだしない。予定通り/遅延/到着済み/予定外移動のみ表示
+# =========================================================
+def _first_itinerary_datetime_text(df: pd.DataFrame) -> str:
+    try:
+        if df is not None and not df.empty:
+            working = df.copy().reset_index(drop=True)
+            if "day" in working.columns and "sequence" in working.columns:
+                working = working.sort_values(["day", "sequence"], kind="stable")
+            for _, row in working.iterrows():
+                date_text = safe_text(row.get("date"), "")
+                time_text = safe_text(row.get("start_time"), "")
+                if date_text and time_text and time_text != "-":
+                    return f"{date_text} {time_text}"
+    except Exception:
+        pass
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _build_monitor_current_location(df: pd.DataFrame, mode: str, current_time_text: str) -> Dict[str, object]:
+    if mode in {"予定地点付近", "遅延サンプル", "予定外移動サンプル"} and build_dummy_current_location:
+        return build_dummy_current_location(df, mode, current_time=current_time_text)
+    if mode == "スポット名から推定":
+        label = safe_text(st.session_state.get("execution_monitor_manual_location"), "")
+        coords = coords_for_name(label) if coords_for_name else None
+        if coords:
+            return {"label": label, "lat": coords[0], "lng": coords[1]}
+        return {"label": label or "未指定"}
+    if mode == "緯度経度を手入力":
+        label = safe_text(st.session_state.get("execution_monitor_manual_location"), "手入力位置")
+        try:
+            lat = float(st.session_state.get("execution_monitor_manual_lat") or "")
+            lng = float(st.session_state.get("execution_monitor_manual_lng") or "")
+            return {"label": label, "lat": lat, "lng": lng}
+        except Exception:
+            return {"label": label}
+    return {"label": "未指定"}
+
+
+def render_execution_monitor_trial(df: pd.DataFrame, title: str = "🧭 実行中ナビ実験") -> None:
+    st.markdown(f"### {title}")
+    st.caption("ハッカソン用の安全な実験機能です。完成旅程を変更せず、現在地/現在時刻から進行状況だけを判定します。")
+
+    if evaluate_execution_progress is None:
+        st.warning("Execution Monitor Agentを読み込めませんでした。services/execution_monitor_agent.py を確認してください。")
+        return
+    if df is None or df.empty:
+        st.info("完成旅程がないため、実行中ナビ判定はできません。")
+        return
+
+    default_time = st.session_state.get("execution_monitor_current_time") or _first_itinerary_datetime_text(df)
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        current_time_text = st.text_input(
+            "現在時刻（YYYY-MM-DD HH:MM / now）",
+            value=safe_text(default_time, "now"),
+            key="execution_monitor_current_time_input",
+        )
+        st.session_state.execution_monitor_current_time = current_time_text
+    with c2:
+        mode_options = ["予定地点付近", "遅延サンプル", "予定外移動サンプル", "スポット名から推定", "緯度経度を手入力"]
+        current_mode = st.session_state.get("execution_monitor_location_mode", "予定地点付近")
+        location_mode = st.selectbox(
+            "現在地の指定方法",
+            mode_options,
+            index=mode_options.index(current_mode) if current_mode in mode_options else 0,
+            key="execution_monitor_location_mode_select",
+        )
+        st.session_state.execution_monitor_location_mode = location_mode
+
+    if location_mode in {"スポット名から推定", "緯度経度を手入力"}:
+        c3, c4, c5 = st.columns([1.2, 0.8, 0.8])
+        with c3:
+            st.session_state.execution_monitor_manual_location = st.text_input(
+                "現在地名",
+                value=safe_text(st.session_state.get("execution_monitor_manual_location"), "東京駅"),
+                key="execution_monitor_location_name_input",
+            )
+        if location_mode == "緯度経度を手入力":
+            with c4:
+                st.session_state.execution_monitor_manual_lat = st.text_input("lat", value=safe_text(st.session_state.get("execution_monitor_manual_lat"), ""), key="execution_monitor_lat_input")
+            with c5:
+                st.session_state.execution_monitor_manual_lng = st.text_input("lng", value=safe_text(st.session_state.get("execution_monitor_manual_lng"), ""), key="execution_monitor_lng_input")
+
+    current_location = _build_monitor_current_location(df, location_mode, current_time_text)
+    try:
+        result = evaluate_execution_progress(
+            itinerary_df=df,
+            current_time=current_time_text,
+            current_location=current_location,
+        )
+    except Exception as e:
+        st.error(f"実行中ナビ判定に失敗しました: {e}")
+        if st.session_state.debug_mode:
+            st.exception(e)
+        return
+
+    severity = safe_text(result.get("severity"), "info")
+    status_label = safe_text(result.get("status_label"), "確認")
+    message = safe_text(result.get("message"), "")
+    if severity == "success":
+        st.success(f"{status_label}: {message}")
+    elif severity == "warning":
+        st.warning(f"{status_label}: {message}")
+    else:
+        st.info(f"{status_label}: {message}")
+
+    target = result.get("target_step", {}) or {}
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("判定時刻", safe_text(result.get("current_time"), "-"))
+    m2.metric("現在地", safe_text(result.get("current_location_label"), "-"))
+    m3.metric("対象予定", safe_text(target.get("label"), "-"))
+    distance = result.get("distance_m")
+    m4.metric("対象まで", f"{distance}m" if distance is not None else "位置未確定")
+
+    with st.expander("判定詳細", expanded=False):
+        st.json(result)
+
+    actions = result.get("actions") or []
+    if actions:
+        st.markdown("**次の確認候補（まだ自動再計画はしません）**")
+        for action in actions:
+            st.write(f"- {safe_text(action, '')}")
+
+
 def render_simple_itinerary_page() -> None:
     # --- 修正箇所: 簡易一覧を完成旅程タブ内の追加表示ではなく、疑似画面遷移ページとして表示 ---
     st.title("📋 簡易旅程一覧")
@@ -6941,14 +7248,19 @@ def render_final_itinerary_content() -> None:
         render_google_calendar_sync_panel(df_phase3)
         render_phase35_validation_panel(st.session_state.trip_plan or "", df_phase3)
 
-        col_simple, col_note = st.columns([1, 2])
+        col_simple, col_checklist, col_note = st.columns([1, 1, 2])
         with col_simple:
             if st.button("📋 簡易一覧で見る", use_container_width=True, key="open_simple_itinerary_page"):
                 st.session_state.simple_itinerary_page_mode = True
                 st.session_state.active_tab = "final_itinerary"
                 st.rerun()
+        with col_checklist:
+            if st.button("✅ チェックリスト", use_container_width=True, key="open_checklist_page"):
+                st.session_state.checklist_page_mode = True
+                st.session_state.active_tab = "final_itinerary"
+                st.rerun()
         with col_note:
-            st.caption("簡易一覧は別画面風に表示します。スポット・移動・ホテルを色分けし、Google Maps / Uber / ホテル予約だけを残します。")
+            st.caption("簡易一覧・チェックリストは別画面風に表示します。旅程確認と旅行準備を分けて管理できます。")
 
         render_timeline_visibility_controls("plan", title="完成旅程の表示切替")
         render_itinerary_cards(
@@ -6967,6 +7279,10 @@ def render_final_itinerary_content() -> None:
 # - Streamlitの別ウインドウではなく、session_stateで安全に全画面相当へ切り替える
 # - 既存タブや完成旅程カード表示は変更しない
 # =========================================================
+if st.session_state.get("checklist_page_mode", False):
+    render_checklist_page()
+    st.stop()
+
 if st.session_state.get("simple_itinerary_page_mode", False):
     render_simple_itinerary_page()
     st.stop()
@@ -7307,6 +7623,9 @@ with tabs[3]:
                 hide_cancelled=st.session_state.hide_cancelled_execution,
             )
 
+            st.divider()
+            render_execution_monitor_trial(preview_df, title="🧭 実行中ナビ実験（開始前デモ）")
+
             if st.button("🚀 旅程実行を開始", use_container_width=True):
                 try:
                     result = engine.start_execution()
@@ -7340,6 +7659,9 @@ with tabs[3]:
 
             st.divider()
             render_mock_weather_panel(st.session_state.planning_state, context_label="execution")
+
+            st.divider()
+            render_execution_monitor_trial(df_status, title="🧭 実行中ナビ実験")
 
             st.divider()
             st.markdown("### ステップ操作")
