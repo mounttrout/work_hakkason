@@ -92,6 +92,7 @@ except Exception:
 # - 福井駅→東京駅などで、駅発の長時間移動ブロックに対して重複transportを追加しないガードを追加
 # - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
+# - v6.2.69: 自家用車旅行では原則private_carを維持し、明示例外のみbus/walk/train等を許可
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
 # - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
 # - v6.2.66: ホテル出発行を移動カードへ誤昇格しないガード、同一大都市圏ホテル継続判定、チェックリスト重複抑制
@@ -105,7 +106,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.68-checklist-user-add-delete"
+APP_VERSION_NAME = "v6.2.69-private-car-mode-guard"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -1304,6 +1305,138 @@ def _compose_transport_bridge_hints(bridge_rows: list) -> tuple[str, str]:
             mode_hint = _infer_mode_from_service_hint(purpose, "")
     service_hint = " / ".join([part for part in service_parts if part])
     return service_hint, (mode_hint or "train")
+
+
+def _planning_transport_context_text(planning_state: Dict[str, object], *extra_texts: str) -> str:
+    # --- 修正箇所(v6.2.69): 自家用車旅行の意図検出用に、会話条件と区間文脈をまとめる ---
+    parts: List[str] = []
+    if isinstance(planning_state, dict):
+        for key in ("primary_destination", "transport_style", "budget_style", "departure_place", "return_place"):
+            value = planning_state.get(key)
+            if value:
+                parts.append(str(value))
+        for key in ("conversation_notes", "revision_requests"):
+            values = planning_state.get(key) or []
+            if isinstance(values, list):
+                parts.extend(str(v) for v in values if v)
+            elif values:
+                parts.append(str(values))
+    parts.extend(str(v) for v in extra_texts if v)
+    return " ".join(parts)
+
+
+def _has_private_car_trip_intent(planning_state: Dict[str, object], *extra_texts: str) -> bool:
+    # --- 修正箇所(v6.2.69): 「自家用車で」「マイカー」「ドライブ旅行」など明示時は全体を車移動寄りに固定する ---
+    text = _planning_transport_context_text(planning_state, *extra_texts)
+    if not text.strip():
+        return False
+
+    private_car_tokens = [
+        "自家用車", "マイカー", "自分の車", "自分のクルマ", "家の車",
+        "車で", "車移動", "車利用", "車旅行", "自動車", "ドライブ旅行", "ドライブで",
+        "private car", "my car",
+    ]
+    rental_car_tokens = ["レンタカー", "レンタルカー", "借りた車", "借りる車"]
+
+    return any(token in text for token in private_car_tokens + rental_car_tokens)
+
+
+def _private_car_exception_mode_from_context(*texts: str) -> str:
+    # --- 修正箇所(v6.2.69): 自家用車旅行でも、マイカー規制・明示乗換・徒歩圏だけは例外として許可する ---
+    context = " ".join(str(t or "") for t in texts)
+    lowered = context.lower()
+
+    # 上高地など、車で直接入れない場所は「電車」ではなくバス/シャトル扱いに寄せる。
+    shuttle_tokens = [
+        "シャトルバス", "路線バス", "バスに乗り換", "バスへ乗り換", "バス乗換",
+        "マイカー規制", "沢渡", "さわんど", "平湯", "上高地",
+    ]
+    if any(token in context for token in shuttle_tokens) or "shuttle" in lowered:
+        return "bus"
+
+    if any(token in context for token in ["タクシー", "taxi"]):
+        return "taxi"
+
+    # 徒歩が明示されている場合だけ徒歩を許可。単なる「散策」はスポット滞在の可能性が高いのでここでは使わない。
+    if any(token in context for token in ["徒歩", "歩いて移動", "徒歩移動", "walk"]):
+        return "walk"
+
+    # ユーザー・Phase2側で明確に公共交通が指定されている区間だけ許可する。
+    rail_tokens = [
+        "新幹線", "特急", "列車", "鉄道", "電車で", "電車に乗", "電車移動",
+        "公共交通", "train", "rail", "transit",
+    ]
+    if any(token in context for token in rail_tokens):
+        return "train"
+
+    if any(token in context for token in ["飛行機", "航空", "フライト", "空港", "flight", "air"]):
+        return "air"
+
+    if any(token in context for token in ["船", "フェリー", "ship", "ferry"]):
+        return "ship"
+
+    return ""
+
+
+def _preferred_mode_for_private_car_trip(
+    planning_state: Dict[str, object],
+    proposed_mode: str,
+    *context_texts: str,
+) -> str:
+    # --- 修正箇所(v6.2.69): 自家用車旅行ではLLMのtrain寄りfallbackを抑止する ---
+    if not _has_private_car_trip_intent(planning_state):
+        return proposed_mode
+
+    proposed = safe_text(proposed_mode, "").lower()
+    exception_mode = _private_car_exception_mode_from_context(*context_texts)
+
+    # 例外が明示されている区間は、ユーザー意図/現地制約を優先する。
+    if exception_mode:
+        return exception_mode
+
+    # 既に徒歩・航空・船など明確な特殊モードなら残す。train/busは明示がなければ車へ戻す。
+    if proposed in {"walk", "walking"}:
+        return "walk"
+    if proposed in {"air", "flight"}:
+        return "air"
+    if proposed in {"ship", "ferry"}:
+        return "ship"
+
+    return "private_car"
+
+
+def _apply_private_car_mode_guard(
+    planning_state: Dict[str, object],
+    proposed_mode: str,
+    origin_name: str = "",
+    destination_name: str = "",
+    service_hint: str = "",
+    current_purpose: str = "",
+    next_purpose: str = "",
+    current_note: str = "",
+    next_note: str = "",
+    route_source: str = "",
+) -> str:
+    # --- 修正箇所(v6.2.69): 自家用車旅行の移動カード最終補正 ---
+    context_texts = [
+        origin_name,
+        destination_name,
+        service_hint,
+        current_purpose,
+        next_purpose,
+        current_note,
+        next_note,
+        route_source,
+    ]
+    guarded = _preferred_mode_for_private_car_trip(planning_state, proposed_mode, *context_texts)
+    before = safe_text(proposed_mode, "").lower()
+    if _has_private_car_trip_intent(planning_state) and guarded != before:
+        log_event(
+            "自家用車モードガード",
+            f"{origin_name} → {destination_name}: {before or '未設定'} を {guarded} に補正",
+            level="info",
+        )
+    return guarded
 
 
 def _extract_concrete_hotel_name_from_plan_text(plan_text: str) -> str:
@@ -2936,12 +3069,29 @@ def enrich_transport_rows_with_estimates(df: pd.DataFrame, planning_state: Dict[
                 "電車メイン": "train",
                 "タクシー": "taxi",
                 "レンタカー": "car",
+                "自家用車": "private_car",
+                "マイカー": "private_car",
             }.get(preferred, "train" if distance_km >= 2.0 else "walk")
             enriched.at[idx, "transport_mode"] = mode
         elif mode in {"car", "private_car"} and preferred == "電車メイン":
             # 表示だけでもユーザー意図に寄せる
             mode = "train"
             enriched.at[idx, "transport_mode"] = mode
+
+        # --- 修正箇所(v6.2.69): 自家用車旅行では既存transport行も最終表示前に補正 ---
+        mode = _apply_private_car_mode_guard(
+            planning_state,
+            mode,
+            origin_name=origin_name,
+            destination_name=destination_name,
+            service_hint=safe_text(enriched.at[idx, "destination"], ""),
+            current_purpose=safe_text(prev_row.get("purpose"), ""),
+            next_purpose=safe_text(next_row.get("purpose"), ""),
+            current_note=safe_text(prev_row.get("one_point"), ""),
+            next_note=safe_text(next_row.get("one_point"), ""),
+            route_source=safe_text(enriched.at[idx, "route_data_source"], ""),
+        )
+        enriched.at[idx, "transport_mode"] = mode
 
         google_result = None
         origin_query = _build_google_directions_location_query(origin_name, origin_lat, origin_lng)
@@ -4408,13 +4558,22 @@ def ensure_daily_hotel_rows(df: pd.DataFrame, planning_state: Dict) -> pd.DataFr
 
 
 def _infer_mode_from_transport_style(transport_style: str) -> str:
+    text = str(transport_style or "").strip()
     mapping = {
         "徒歩メイン": "walk",
         "電車メイン": "train",
         "タクシー": "taxi",
         "レンタカー": "car",
+        "自家用車": "private_car",
+        "マイカー": "private_car",
     }
-    return mapping.get(str(transport_style or "").strip(), "train")
+    if text in mapping:
+        return mapping[text]
+    if any(token in text for token in ["自家用車", "マイカー", "ドライブ", "車で", "車移動"]):
+        return "private_car"
+    if "レンタカー" in text:
+        return "car"
+    return "train"
 
 
 def _llm_transport_duration_from_sequence(
@@ -4428,8 +4587,10 @@ def _llm_transport_duration_from_sequence(
     current_note: str,
     next_note: str,
     service_hint: str = "",
+    default_mode: str = "",
 ) -> Optional[Dict[str, object]]:
     # --- 修正箇所: destination の意味解釈を増やさず、隣接スポットの自然文だけを LLM に渡す ---
+    expected_mode = default_mode or _infer_mode_from_transport_style(transport_style)
     prompt = f"""
 あなたは旅行プランの移動時間推定補助です。
 
@@ -4460,8 +4621,8 @@ def _llm_transport_duration_from_sequence(
 {{
   "minutes": 170,
   "confidence": "medium",
-  "reason": "一般的な都市間移動の概算",
-  "mode": "train"
+  "reason": "一般的な移動の概算",
+  "mode": "{expected_mode}"
 }}
 
 minutes を出せない場合:
@@ -4469,7 +4630,7 @@ minutes を出せない場合:
   "minutes": null,
   "confidence": "low",
   "reason": "情報不足で妥当な概算を出せない",
-  "mode": "train"
+  "mode": "{expected_mode}"
 }}
 """.strip()
     try:
@@ -4485,8 +4646,8 @@ minutes を出せない場合:
         if minutes <= 0 or minutes > 24 * 60:
             return None
         mode = str(data.get("mode", "") or "").strip().lower()
-        if mode not in {"walk", "train", "taxi", "car", "private_car", "bike", "air"}:
-            mode = _infer_mode_from_transport_style(transport_style)
+        if mode not in {"walk", "train", "taxi", "car", "private_car", "bike", "air", "bus", "ship"}:
+            mode = expected_mode
         mode = _infer_mode_from_service_hint(service_hint, mode)
         confidence = str(data.get("confidence", "medium") or "medium").strip().lower()
         reason = str(data.get("reason", "") or "").strip()
@@ -4502,6 +4663,17 @@ def _fallback_transport_estimate_from_sequence(
     planning_state: Dict[str, object],
 ) -> Dict[str, object]:
     mode = _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）"))
+    mode = _apply_private_car_mode_guard(
+        planning_state,
+        mode,
+        origin_name=safe_text(_row_value(current_row, "destination", ""), ""),
+        destination_name=safe_text(_row_value(next_row, "destination", ""), ""),
+        current_purpose=safe_text(_row_value(current_row, "purpose", ""), ""),
+        next_purpose=safe_text(_row_value(next_row, "purpose", ""), ""),
+        current_note=safe_text(_row_value(current_row, "one_point", ""), ""),
+        next_note=safe_text(_row_value(next_row, "one_point", ""), ""),
+        route_source="sequence_fallback",
+    )
     existing_gap = _minutes_between_clock(current_row.get("end_time"), next_row.get("start_time"))
     if existing_gap is not None and 5 <= existing_gap <= 12 * 60:
         minutes = existing_gap
@@ -4684,6 +4856,18 @@ def _promote_last_row_to_embedded_transport(rows: List[Dict[str, object]], curre
     if minutes <= 0:
         return
     mode = _infer_mode_from_service_hint(service_hint, _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）")))
+    mode = _apply_private_car_mode_guard(
+        planning_state,
+        mode,
+        origin_name=origin_name,
+        destination_name=destination_name,
+        service_hint=service_hint,
+        current_purpose=safe_text(_row_value(current, "purpose", ""), ""),
+        next_purpose=safe_text(_row_value(actual_next, "purpose", ""), ""),
+        current_note=safe_text(_row_value(current, "one_point", ""), ""),
+        next_note=safe_text(_row_value(actual_next, "one_point", ""), ""),
+        route_source="phase2_embedded_long_transport_guard",
+    )
     last = rows[-1]
     last["destination"] = f"{origin_name} → {destination_name}"
     last["purpose"] = "transport"
@@ -4790,6 +4974,18 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
 
         departure_time = safe_text(current.get("end_time"), safe_text(current.get("start_time"), planning_state.get("departure_time", "09:00")))
         departure_date = safe_text(current.get("date"), safe_text(planning_state.get("start_date"), ""))
+        default_transport_mode = _apply_private_car_mode_guard(
+            planning_state,
+            _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）")),
+            origin_name=origin_name,
+            destination_name=destination_name,
+            service_hint=service_hint,
+            current_purpose=safe_text(current.get("purpose"), ""),
+            next_purpose=safe_text(actual_next.get("purpose"), ""),
+            current_note=safe_text(current.get("one_point"), ""),
+            next_note=safe_text(actual_next.get("one_point"), ""),
+            route_source="phase3_default_mode",
+        )
 
         llm_result = _llm_transport_duration_from_sequence(
             origin_name=origin_name,
@@ -4802,11 +4998,12 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             current_note=safe_text(current.get("one_point"), ""),
             next_note=safe_text(actual_next.get("one_point"), ""),
             service_hint=service_hint,
+            default_mode=default_transport_mode,
         )
 
         if llm_result:
             transport_minutes = int(llm_result["minutes"])
-            transport_mode = _infer_mode_from_service_hint(service_hint, str(llm_result.get("mode", _infer_mode_from_transport_style(planning_state.get("transport_style", "")))))
+            transport_mode = _infer_mode_from_service_hint(service_hint, str(llm_result.get("mode", default_transport_mode)))
             duration_label = f"約{transport_minutes}分"
             route_source = "llm_sequence_estimate" if not service_hint else "llm_train_bridge_estimate"
             one_point = safe_text(llm_result.get("reason"), "")
@@ -4817,6 +5014,19 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             duration_label = str(fallback["label"])
             route_source = str(fallback["source"]) if not service_hint else "train_bridge_fallback"
             one_point = str(fallback["note"])
+
+        transport_mode = _apply_private_car_mode_guard(
+            planning_state,
+            transport_mode,
+            origin_name=origin_name,
+            destination_name=destination_name,
+            service_hint=service_hint,
+            current_purpose=safe_text(current.get("purpose"), ""),
+            next_purpose=safe_text(actual_next.get("purpose"), ""),
+            current_note=safe_text(current.get("one_point"), ""),
+            next_note=safe_text(actual_next.get("one_point"), ""),
+            route_source=route_source,
+        )
 
         next_start_time = safe_text(actual_next.get("start_time"), "")
         consistent_gap = _minutes_between_clock(departure_time, next_start_time) if departure_time and next_start_time else None
