@@ -105,7 +105,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.66-checklist-dedupe-hotel-departure-guard"
+APP_VERSION_NAME = "v6.2.67-nav-shortcut-checklist-personal-filter-hotel-cafe-guard"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -1185,6 +1185,11 @@ def _is_bad_hotel_label(name: str) -> bool:
     if stripped in bad_exact:
         return True
     if any(token in stripped for token in ["目的:", "目的：", "ワンポイント", "翌日に備えて", "荷物整理", "休息を優先"]):
+        return True
+    # --- 修正箇所(v6.2.67): 「ホテル周辺のカフェ」等を宿泊先の具体名として扱わない ---
+    # LLM/構造化の揺れで accommodation 行の destination に飲食・周辺表現が入ることがある。
+    # ここで generic/bad 扱いにし、既存のホテル名伝播・fallbackで安全に補正する。
+    if any(token in stripped for token in ["カフェ", "喫茶", "レストラン", "食堂", "居酒屋", "バー", "周辺の店", "周辺の飲食"]):
         return True
     if "チェックイン" in stripped and len(stripped) <= 16:
         return True
@@ -6143,7 +6148,43 @@ def _infer_default_checklist_purpose(df: pd.DataFrame) -> str:
     return "観光"
 
 
+# =========================================================
+# 修正箇所(v6.2.67): 疑似ページでも上部ショートカットを消さない
+# - 簡易一覧/チェックリスト/完成旅程の疑似遷移は st.stop 前に表示されるため、
+#   通常の st.tabs が描画されず上部ショートカットが消えて見える。
+# - 既存タブ構造は大きく作り替えず、疑似ページ専用の軽量ナビを先頭に表示する。
+# =========================================================
+def render_pseudo_page_navigation(current: str = "final_itinerary") -> None:
+    nav_labels = {
+        "travel_consultation": "🗣️ 旅行相談",
+        "plan_review": "📄 プラン確認",
+        "final_itinerary": "🛣️ 完成旅程",
+        "execution": "🎬 実行シミュレーション",
+    }
+    st.markdown(
+        """
+<style>
+.vf-pseudo-nav-note { font-size: 12px; color: #667085; margin-top: -6px; margin-bottom: 10px; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(len(nav_labels))
+    for idx, (tab_key, label) in enumerate(nav_labels.items()):
+        shown_label = f"● {label}" if tab_key == current else label
+        with cols[idx]:
+            if st.button(shown_label, use_container_width=True, key=f"pseudo_nav_{current}_{tab_key}"):
+                st.session_state.simple_itinerary_page_mode = False
+                st.session_state.checklist_page_mode = False
+                st.session_state.force_final_itinerary_page_mode = (tab_key == "final_itinerary")
+                st.session_state.active_tab = tab_key
+                st.rerun()
+    st.markdown("<div class='vf-pseudo-nav-note'>簡易画面表示中も、上部ショートカットを残しています。</div>", unsafe_allow_html=True)
+
+
+
 def render_checklist_page() -> None:
+    render_pseudo_page_navigation("final_itinerary")
     st.title("✅ 旅行チェックリスト")
     st.caption("旅行目的・行き先・同行者・移動手段・完成旅程から、ToDoと持ち物を動的に作成します。予約が必要な項目には確認ボタンを出します。")
 
@@ -6341,6 +6382,7 @@ def render_execution_monitor_trial(df: pd.DataFrame, title: str = "🧭 実行�
 
 def render_simple_itinerary_page() -> None:
     # --- 修正箇所: 簡易一覧を完成旅程タブ内の追加表示ではなく、疑似画面遷移ページとして表示 ---
+    render_pseudo_page_navigation("final_itinerary")
     st.title("📋 簡易旅程一覧")
     st.caption("スマホでも見やすいよう、目的・最新情報列を省いた簡易ビューです。近接移動は表示上だけ『徒歩候補』として出します。")
 
@@ -7342,7 +7384,7 @@ def render_final_itinerary_content() -> None:
 
 
 # =========================================================
-# 修正箇所: 簡易一覧ページへの疑似画面遷移
+# 修正箇所: 簡易一覧/チェックリストページへの疑似画面遷移
 # - Streamlitの別ウインドウではなく、session_stateで安全に全画面相当へ切り替える
 # - 既存タブや完成旅程カード表示は変更しない
 # =========================================================
@@ -7356,6 +7398,7 @@ if st.session_state.get("simple_itinerary_page_mode", False):
 
 if st.session_state.get("force_final_itinerary_page_mode", False):
     st.session_state.force_final_itinerary_page_mode = False
+    render_pseudo_page_navigation("final_itinerary")
     render_final_itinerary_content()
     st.stop()
 

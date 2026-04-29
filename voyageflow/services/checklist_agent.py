@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 VoyageFlow / Dynamic Checklist Agent
-v6.2.66-checklist-dedupe-hotel-departure-guard
+v6.2.67-nav-shortcut-checklist-personal-filter-hotel-cafe-guard
 
 目的:
 - 固定チェックリストではなく、旅行条件・完成旅程・同行者・目的・移動手段から動的にToDo/持ち物を生成する。
@@ -246,25 +246,43 @@ def _extract_transport_segments(rows: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def _detect_context_flags(destination: str, purpose: str, companions: str, personal_info: str, rows: List[Dict[str, Any]]) -> Dict[str, bool]:
-    all_text = " ".join([
-        destination,
-        purpose,
-        companions,
-        personal_info,
-        " ".join(_safe_text(r.get("destination")) + " " + _safe_text(r.get("purpose")) + " " + _safe_text(r.get("one_point")) for r in rows),
-    ])
+    # --- v6.2.67 ---
+    # 「家族・同僚へのお土産」など旅程メモ由来の単語だけで、
+    # 子連れ/パーソナル特化項目を誤発火させない。
+    # 子供・年齢・趣味系は、同行者/パーソナル情報/旅行目的の明示を優先する。
+    row_text = " ".join(
+        _safe_text(r.get("destination")) + " " + _safe_text(r.get("purpose")) + " " + _safe_text(r.get("one_point"))
+        for r in rows
+    )
+    explicit_text = " ".join([destination, purpose, companions, personal_info])
+    all_text = " ".join([explicit_text, row_text])
+
+    child_explicit_text = " ".join([companions, personal_info, purpose])
+    child_keywords = ["子供", "子ども", "こども", "子連れ", "小学生", "中学生", "幼児", "乳児", "赤ちゃん", "ベビ", "未就学", "園児"]
+    baby_keywords = ["乳児", "赤ちゃん", "0歳", "1歳", "2歳", "ベビ", "おむつ", "ミルク"]
+    school_keywords = ["小学生", "小学校", "低学年", "高学年", "6年生", "子供2人", "子ども2人", "こども2人"]
+
+    children = _contains_any(child_explicit_text, child_keywords)
+    # 「家族」はお土産先として旅程メモに出やすいため、同行者欄で明示された場合だけ子連れ扱い。
+    if not children and _contains_any(companions, ["家族", "親子"]):
+        children = True
+
+    business = _contains_any(explicit_text, ["仕事", "出張", "会議", "商談", "展示会", "セミナー", "business", "同僚", "職場"])
+    if not business and _contains_any(row_text, ["訪問先企業", "商談", "会議", "アポイント", "打ち合わせ"]):
+        business = True
+
     return {
         "overseas": _contains_any(all_text, ["海外", "ハワイ", "hawaii", "グアム", "韓国", "台湾", "シンガポール", "ヨーロッパ", "アメリカ"]),
         "beach": _contains_any(all_text, ["ハワイ", "海水浴", "ビーチ", "シュノーケル", "ダイビング", "沖縄", "グアム", "プール", "マリンスポーツ"]),
-        "business": _contains_any(all_text, ["仕事", "出張", "会議", "商談", "展示会", "セミナー", "business", "同僚"]),
-        "children": _contains_any(all_text, ["子供", "子ども", "こども", "子連れ", "家族", "小学生", "中学生", "幼児", "乳児", "赤ちゃん", "ベビ"]),
-        "baby": _contains_any(all_text, ["乳児", "赤ちゃん", "0歳", "1歳", "2歳", "ベビ", "おむつ", "ミルク"]),
-        "school_child": _contains_any(all_text, ["小学生", "小学校", "低学年", "高学年", "6年生", "子供2人", "子ども2人"]),
-        "senior": _contains_any(all_text, ["高齢", "シニア", "70代", "80代", "祖父", "祖母"]),
+        "business": business,
+        "children": children,
+        "baby": children and _contains_any(child_explicit_text, baby_keywords),
+        "school_child": children and _contains_any(child_explicit_text, school_keywords),
+        "senior": _contains_any(explicit_text, ["高齢", "シニア", "70代", "80代", "祖父", "祖母"]),
         "outdoor": _contains_any(all_text, ["登山", "ハイキング", "キャンプ", "アウトドア", "トレッキング", "山歩き", "高原"]),
         "formal": _contains_any(all_text, ["法事", "葬儀", "結婚式", "式典", "礼服", "喪服"]),
-        "gadget": _contains_any(all_text, ["ガジェット", "データサイエンティスト", "エンジニア", "pc", "カメラ", "撮影", "動画"]),
-        "running": _contains_any(all_text, ["ランニング", "ジョギング", "ランナー"]),
+        "gadget": _contains_any(explicit_text, ["ガジェット", "データサイエンティスト", "エンジニア", "pc", "カメラ", "撮影", "動画"]),
+        "running": _contains_any(explicit_text, ["ランニング", "ジョギング", "ランナー"]),
         "themepark": _contains_any(all_text, ["ディズニー", "usj", "ユニバ", "テーマパーク", "遊園地"]),
         "onsen": _contains_any(all_text, ["温泉", "旅館", "スパ"]),
     }
