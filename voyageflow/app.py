@@ -105,7 +105,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.67-nav-shortcut-checklist-personal-filter-hotel-cafe-guard"
+APP_VERSION_NAME = "v6.2.68-checklist-user-add-delete"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -186,6 +186,7 @@ st.markdown(
     .vf-checklist-card { padding: 10px 12px; border-radius: 12px; border: 1px solid #e4e7ec; margin-bottom: 8px; background: #ffffff; }
     .vf-checklist-card-done { background: #eeeeee; color: #667085; text-decoration: line-through; border-color: #d0d5dd; }
     .vf-checklist-note { font-size: 12px; opacity: 0.78; margin-top: 3px; }
+    .vf-checklist-delete-note { font-size: 12px; color: #667085; margin-top: 6px; }
     .vf-monitor-box { padding: 12px 14px; border-radius: 12px; background: #f8fafc; border: 1px solid #d0d5dd; margin-bottom: 10px; }
 
     @media (max-width: 768px) {
@@ -651,6 +652,12 @@ def init_session_state() -> None:
         "force_final_itinerary_page_mode": False,
         "spot_reliability_logged_keys": set(),
         "checklist_checked_items": {},
+        # 修正箇所(v6.2.68): チェックリストのユーザー追加・削除状態
+        # - LLM/ルール生成項目を削除しても再表示で復活しにくいよう、idと文言シグネチャを保持
+        # - ユーザー追加項目はToDo/持ち物別に保持
+        "checklist_deleted_item_ids": {},
+        "checklist_deleted_item_signatures": {},
+        "checklist_user_items": {"todo": [], "packing": []},
         "checklist_context": {
             "purpose": "",
             "companions": "",
@@ -6082,7 +6089,117 @@ def render_simple_itinerary_table(df: pd.DataFrame, city_hint: str = "") -> None
 # - services/checklist_agent.py で生成
 # - app.pyは表示・チェック状態保持・戻るボタンのみ担当
 # - 固定リストではなく、目的/行き先/同行者/移動手段/旅程から動的生成
+#
+# 修正箇所(v6.2.68): チェックリスト項目のユーザー追加・削除
+# - 生成済みToDo/持ち物をユーザーが削除できる
+# - ToDo/持ち物をユーザーが任意追加できる
+# - 削除済み項目はidと文言シグネチャで保持し、再描画時に復活しにくくする
+# - Phase2 / Phase3 / 簡易一覧 / 移動ロジックは触らない
 # =========================================================
+def _normalize_checklist_text(value: str) -> str:
+    text = safe_text(value, "")
+    text = text.replace("　", " ").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[□☑✓✅🔥・\-–—:：,，。.!！?？\[\]（）()]", "", text)
+    return text.strip()
+
+
+def _checklist_item_id(item: Dict[str, object], section_key: str) -> str:
+    item_id = safe_text(item.get("id"), "")
+    if item_id:
+        return item_id
+    return f"{section_key}_{abs(hash(safe_text(item.get('text'), '') + section_key))}"
+
+
+def _checklist_item_signature(item: Dict[str, object], section_key: str) -> str:
+    text = _normalize_checklist_text(safe_text(item.get("text"), ""))
+    return f"{section_key}::{text}"
+
+
+def _checklist_deleted_maps() -> tuple[Dict[str, bool], Dict[str, bool]]:
+    deleted_ids = st.session_state.get("checklist_deleted_item_ids", {})
+    deleted_signatures = st.session_state.get("checklist_deleted_item_signatures", {})
+    if not isinstance(deleted_ids, dict):
+        deleted_ids = {}
+    if not isinstance(deleted_signatures, dict):
+        deleted_signatures = {}
+    return deleted_ids, deleted_signatures
+
+
+def _is_checklist_item_deleted(item: Dict[str, object], section_key: str) -> bool:
+    item_id = _checklist_item_id(item, section_key)
+    signature = _checklist_item_signature(item, section_key)
+    deleted_ids, deleted_signatures = _checklist_deleted_maps()
+    return bool(deleted_ids.get(item_id) or deleted_signatures.get(signature))
+
+
+def _delete_checklist_item(item: Dict[str, object], section_key: str) -> None:
+    item_id = _checklist_item_id(item, section_key)
+    signature = _checklist_item_signature(item, section_key)
+    deleted_ids, deleted_signatures = _checklist_deleted_maps()
+    deleted_ids[item_id] = True
+    deleted_signatures[signature] = True
+    st.session_state.checklist_deleted_item_ids = deleted_ids
+    st.session_state.checklist_deleted_item_signatures = deleted_signatures
+
+    checked_map = st.session_state.get("checklist_checked_items", {})
+    if isinstance(checked_map, dict) and item_id in checked_map:
+        checked_map.pop(item_id, None)
+        st.session_state.checklist_checked_items = checked_map
+
+
+def _checklist_user_items() -> Dict[str, List[Dict[str, object]]]:
+    user_items = st.session_state.get("checklist_user_items", {"todo": [], "packing": []})
+    if not isinstance(user_items, dict):
+        user_items = {"todo": [], "packing": []}
+    user_items.setdefault("todo", [])
+    user_items.setdefault("packing", [])
+    return user_items
+
+
+def _add_user_checklist_item(kind: str, section_name: str, text: str) -> None:
+    kind = "packing" if kind == "packing" else "todo"
+    clean_text = safe_text(text, "")
+    if not clean_text or clean_text == "-":
+        return
+
+    item = {
+        "id": f"user_{kind}_{uuid.uuid4().hex[:12]}",
+        "text": clean_text,
+        "priority": "normal",
+        "note": "ユーザー追加",
+        "source": "user",
+        "section_name": safe_text(section_name, "ユーザー追加"),
+    }
+    section_key = f"{kind}_{section_name}"
+    signature = _checklist_item_signature(item, section_key)
+    deleted_ids, deleted_signatures = _checklist_deleted_maps()
+    deleted_signatures.pop(signature, None)
+    deleted_ids.pop(item["id"], None)
+    st.session_state.checklist_deleted_item_ids = deleted_ids
+    st.session_state.checklist_deleted_item_signatures = deleted_signatures
+
+    user_items = _checklist_user_items()
+    # 同じセクション内の完全同名追加は重複させない
+    existing = [
+        _normalize_checklist_text(safe_text(v.get("text"), ""))
+        for v in user_items.get(kind, [])
+        if safe_text(v.get("section_name"), "") == item["section_name"]
+    ]
+    if _normalize_checklist_text(clean_text) not in existing:
+        user_items[kind].append(item)
+        st.session_state.checklist_user_items = user_items
+
+
+def _user_checklist_items_for_section(kind: str, section_name: str) -> List[Dict[str, object]]:
+    user_items = _checklist_user_items()
+    result = []
+    for item in user_items.get(kind, []):
+        if safe_text(item.get("section_name"), "") == safe_text(section_name, ""):
+            result.append(item)
+    return result
+
+
 def _checklist_item_action_button(item: Dict[str, object], key_suffix: str) -> None:
     label = safe_text(item.get("action_label"), "")
     url = safe_text(item.get("action_url"), "")
@@ -6091,14 +6208,14 @@ def _checklist_item_action_button(item: Dict[str, object], key_suffix: str) -> N
 
 
 def _render_checklist_item(item: Dict[str, object], section_key: str) -> None:
-    item_id = safe_text(item.get("id"), "") or f"{section_key}_{abs(hash(str(item)))}"
+    item_id = _checklist_item_id(item, section_key)
     state_key = f"checklist_checked_{item_id}"
     checked_map = st.session_state.get("checklist_checked_items", {})
     if not isinstance(checked_map, dict):
         checked_map = {}
     default_checked = bool(checked_map.get(item_id, False))
 
-    col_check, col_text, col_action = st.columns([0.13, 0.62, 0.25])
+    col_check, col_text, col_action = st.columns([0.12, 0.58, 0.30])
     with col_check:
         checked = st.checkbox("", value=default_checked, key=state_key, label_visibility="collapsed")
     checked_map[item_id] = bool(checked)
@@ -6117,17 +6234,47 @@ def _render_checklist_item(item: Dict[str, object], section_key: str) -> None:
         )
     with col_action:
         _checklist_item_action_button(item, item_id)
+        if st.button("🗑️ 削除", use_container_width=True, key=f"delete_checklist_{section_key}_{item_id}"):
+            _delete_checklist_item(item, section_key)
+            st.rerun()
 
 
 def _render_checklist_sections(title: str, sections: Dict[str, List[Dict[str, object]]], prefix: str) -> None:
     st.markdown(f"### {title}")
+    kind = "packing" if prefix == "packing" else "todo"
     for section_name, items in sections.items():
         with st.expander(section_name, expanded=True):
-            if not items:
-                st.caption("該当項目はありません。")
-                continue
-            for item in items:
-                _render_checklist_item(item, f"{prefix}_{section_name}")
+            section_key = f"{kind}_{section_name}"
+            combined_items = []
+            for item in items or []:
+                if isinstance(item, dict) and not _is_checklist_item_deleted(item, section_key):
+                    combined_items.append(item)
+            for item in _user_checklist_items_for_section(kind, section_name):
+                if not _is_checklist_item_deleted(item, section_key):
+                    combined_items.append(item)
+
+            if not combined_items:
+                st.caption("該当項目はありません。必要なら下の入力欄から追加できます。")
+            else:
+                for item in combined_items:
+                    _render_checklist_item(item, section_key)
+
+            st.markdown("<div class='vf-checklist-delete-note'>不要な項目は削除できます。自分用の項目も追加できます。</div>", unsafe_allow_html=True)
+            add_key_base = f"add_checklist_{kind}_{abs(hash(section_name))}"
+            c_text, c_button = st.columns([0.75, 0.25])
+            placeholder = "例：上司に出張日程を共有する" if kind == "todo" else "例：予備の充電ケーブル"
+            with c_text:
+                new_text = st.text_input(
+                    "項目を追加",
+                    value="",
+                    key=f"{add_key_base}_text",
+                    placeholder=placeholder,
+                    label_visibility="collapsed",
+                )
+            with c_button:
+                if st.button("＋追加", use_container_width=True, key=f"{add_key_base}_button"):
+                    _add_user_checklist_item(kind, section_name, new_text)
+                    st.rerun()
 
 
 def _infer_default_checklist_purpose(df: pd.DataFrame) -> str:
