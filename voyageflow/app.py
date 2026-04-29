@@ -98,6 +98,7 @@ except Exception:
 # - v6.2.70: 自家用車意図をplanning_stateだけでなくPhase1プロンプト/自然文案/session_stateから検出するよう補強
 # - v6.2.71: 自家用車意図をresolve_planning_stateで確定し、内部train文字列による例外誤発火を抑止。Phase2ホテル宿泊行の時刻逆転を補正
 # - v6.2.72: 実行シミュレーション画面の実行中ナビ実験をハッカソン説明用に見やすく整理。デモシナリオを追加し、再計画は行わず提案表示に限定
+# - v6.2.73: 自家用車検出を厳格化。「電車で」に含まれる「車で」を自家用車指定として誤検出しないよう修正
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
 # - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
 # - v6.2.66: ホテル出発行を移動カードへ誤昇格しないガード、同一大都市圏ホテル継続判定、チェックリスト重複抑制
@@ -111,7 +112,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.72-execution-monitor-demo-polish"
+APP_VERSION_NAME = "v6.2.73-private-car-detection-tighten"
 APP_UPDATED_DATE = "2026-04-29"
 
 
@@ -1344,11 +1345,10 @@ def _planning_transport_context_text(planning_state: Dict[str, object], *extra_t
     # session_state 側にだけ残る相談メモ・Phase1プロンプト・自然文案も参照する。
     # 失敗しても本体を止めないため try で囲む。
     try:
+        # v6.2.73: trip_plan/trip_plan_draft はAI生成結果なので、自家用車誤判定の自己増幅を避けるため除外。
+        # ユーザー条件が入る phase1_prompt_text / 入力履歴 / resolved_conditions を中心に見る。
         session_keys = (
             "phase1_prompt_text",
-            "trip_plan_draft",
-            "trip_plan",
-            "validation_source_plan_text",
             "user_request",
             "last_user_input",
             "original_user_input",
@@ -1376,21 +1376,54 @@ def _planning_transport_context_text(planning_state: Dict[str, object], *extra_t
     return " ".join(parts)
 
 
+def _has_public_transport_intent_text(text: str) -> bool:
+    # --- 修正箇所(v6.2.73): 「電車で」の中の「車で」を自家用車扱いしないため、公共交通意図を先に検出する ---
+    value = str(text or "")
+    if not value.strip():
+        return False
+    public_patterns = [
+        r"電車\s*で", r"電車\s*移動", r"電車\s*に乗",
+        r"新幹線\s*で", r"新幹線\s*移動", r"列車\s*で", r"鉄道\s*で",
+        r"公共交通", r"公共交通機関", r"地下鉄", r"バス\s*で", r"はとバス",
+    ]
+    return any(re.search(pattern, value) for pattern in public_patterns)
+
+
+def _has_strong_private_car_phrase_text(text: str) -> bool:
+    # --- 修正箇所(v6.2.73): bareな「車で」は使わず、明確な自家用車/車旅行表現だけを採用する ---
+    value = str(text or "")
+    if not value.strip():
+        return False
+
+    strong_tokens = [
+        "自家用車", "マイカー", "自分の車", "自分のクルマ", "家の車", "私の車",
+        "車移動", "車利用", "車旅行", "車旅", "自動車で",
+        "車で旅行", "車で行く", "車で向か", "車で巡", "車で回", "車で移動", "車を使", "車に乗",
+        "ドライブ旅行", "ドライブ旅", "ドライブで", "ドライビング",
+        "private car", "my car",
+        "レンタカー", "レンタルカー", "借りた車", "借りる車",
+    ]
+    if any(token in value for token in strong_tokens):
+        return True
+
+    # 「福井→岐阜→長野を車でめぐる」のような自然表現は拾うが、「電車で」は拾わない。
+    car_regexes = [
+        r"(?<!電)車\s*で\s*(?:旅行|旅|行く|向か|巡る|めぐる|回る|移動|走る)",
+        r"(?<!電)車\s*を\s*(?:使う|利用|運転)",
+        r"(?<!電)車\s*に\s*乗って",
+    ]
+    return any(re.search(pattern, value) for pattern in car_regexes)
+
+
 def _has_private_car_trip_intent(planning_state: Dict[str, object], *extra_texts: str) -> bool:
-    # --- 修正箇所(v6.2.69): 「自家用車で」「マイカー」「ドライブ旅行」など明示時は全体を車移動寄りに固定する ---
+    # --- 修正箇所(v6.2.73): 自家用車判定を厳格化。
+    # 「電車で」に含まれる「車で」を拾わない。
+    # また、AIが後から生成した trip_plan の「自家用車」表現で誤判定が自己増幅しないよう、
+    # _planning_transport_context_text 側で参照する情報もユーザー由来中心に限定する。
     text = _planning_transport_context_text(planning_state, *extra_texts)
     if not text.strip():
         return False
-
-    private_car_tokens = [
-        "自家用車", "マイカー", "自分の車", "自分のクルマ", "家の車",
-        "車で", "車移動", "車利用", "車旅行", "自動車",
-        "ドライブ旅行", "ドライブで", "ドライブ", "ドライビング", "driving",
-        "private car", "my car",
-    ]
-    rental_car_tokens = ["レンタカー", "レンタルカー", "借りた車", "借りる車"]
-
-    return any(token in text for token in private_car_tokens + rental_car_tokens)
+    return _has_strong_private_car_phrase_text(text)
 
 
 def _private_car_exception_mode_from_context(*texts: str) -> str:
@@ -3753,9 +3786,19 @@ def resolve_planning_state() -> Dict:
     latest_text = " / ".join(notes)
     resolved = dict(s)
 
-    # --- 修正箇所(v6.2.71): 相談メモに自家用車/ドライブ指定がある場合は、ここで主移動モードを確定する ---
-    # primary_destination が「宿は日替わりで」等に置換されても、移動手段指定を下流へ落とさない。
-    if _has_private_car_trip_intent(s, latest_text):
+    # --- 修正箇所(v6.2.73): 相談メモに明確な自家用車/ドライブ指定がある場合だけ主移動モードを確定する ---
+    # 「電車で」に含まれる「車で」には反応しない。公共交通指定が明確な場合は公共交通を優先。
+    if _has_public_transport_intent_text(latest_text) and not _has_strong_private_car_phrase_text(latest_text):
+        before_transport_style = safe_text(resolved.get("transport_style"), "")
+        if before_transport_style in {"自動（おすすめ）", "自家用車", "マイカー", "レンタカー", ""}:
+            resolved["transport_style"] = "電車メイン"
+            if before_transport_style != "電車メイン":
+                log_event(
+                    "条件解決",
+                    f"会話内の公共交通指定を主移動モードへ反映: {before_transport_style or '未設定'} → 電車メイン",
+                    level="info",
+                )
+    elif _has_private_car_trip_intent(s, latest_text):
         before_transport_style = safe_text(resolved.get("transport_style"), "")
         if before_transport_style not in {"自家用車", "マイカー"}:
             resolved["transport_style"] = "自家用車"
@@ -4207,18 +4250,17 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     before_trip_days = s.get("trip_days", "")
     text = user_text.strip()
 
-    # --- 修正箇所(v6.2.71): 自家用車/ドライブ旅行は「自動」や「レンタカー」ではなく主移動モードとして保持 ---
-    if any(token in text for token in ["自家用車", "マイカー", "自分の車", "家の車", "ドライブ旅行", "ドライブで", "ドライビング", "車で"]):
+    # --- 修正箇所(v6.2.73): 移動手段の明示指定は公共交通を優先し、「電車で」を「車で」と誤判定しない ---
+    if _has_public_transport_intent_text(text):
+        s["transport_style"] = "電車メイン"
+    elif _has_strong_private_car_phrase_text(text):
         s["transport_style"] = "自家用車"
     elif "徒歩" in text:
         s["transport_style"] = "徒歩メイン"
-    elif "電車" in text:
-        s["transport_style"] = "電車メイン"
     elif "タクシー" in text:
         s["transport_style"] = "タクシー"
-    elif "レンタカー" in text or "車" in text:
+    elif "レンタカー" in text:
         s["transport_style"] = "レンタカー"
-
     if "節約" in text or "安く" in text:
         s["budget_style"] = "節約"
     elif "贅沢" in text or "高め" in text:
@@ -4703,7 +4745,7 @@ def _infer_mode_from_transport_style(transport_style: str) -> str:
     }
     if text in mapping:
         return mapping[text]
-    if any(token in text for token in ["自家用車", "マイカー", "ドライブ", "車で", "車移動"]):
+    if _has_strong_private_car_phrase_text(text):
         return "private_car"
     if "レンタカー" in text:
         return "car"
