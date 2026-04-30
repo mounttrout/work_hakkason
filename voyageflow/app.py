@@ -107,7 +107,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.74-base68-execution-monitor-private-car-tighten"
+APP_VERSION_NAME = "v6.2.74.1-base68-execution-monitor-private-car-tighten-hotfix"
 APP_UPDATED_DATE = "2026-04-30"
 
 
@@ -6498,6 +6498,16 @@ def _build_monitor_current_location(df: pd.DataFrame, mode: str, current_time_te
             return {"label": label}
     return {"label": "未指定"}
 
+
+def _execution_monitor_relation_label(relation: str) -> str:
+    # --- 修正箇所(v6.2.74.1): v6.2.72からの再適用漏れを復旧 ---
+    # render_execution_monitor_trial 内で利用する表示ラベル。
+    # 実行中ナビの表示補助だけで、完成旅程・Phase2/Phase3・チェックリストには影響しない。
+    return {
+        "active": "現在の予定",
+        "next": "次の予定",
+        "past_last": "最終予定後",
+    }.get(safe_text(relation, ""), "対象予定")
 
 def render_execution_monitor_trial(df: pd.DataFrame, title: str = "🧭 実行中ナビ実験") -> None:
     # --- 修正箇所(v6.2.72): 実行シミュレーション画面だけを局所修正 ---
