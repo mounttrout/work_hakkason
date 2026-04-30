@@ -107,7 +107,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.74.1-base68-execution-monitor-private-car-tighten-hotfix"
+APP_VERSION_NAME = "v6.2.74.2-final-return-leg-guard"
 APP_UPDATED_DATE = "2026-04-30"
 
 
@@ -4759,6 +4759,160 @@ def _promote_last_row_to_embedded_transport(rows: List[Dict[str, object]], curre
     guard_note = "Phase2の時刻に含まれる長距離移動として扱い、追加の推測移動カードは作成しません。"
     last["one_point"] = (existing_note + " / " + guard_note).strip(" /")[:180]
 
+
+# =========================================================
+# 修正箇所(v6.2.74.2): 最終帰着カード補正
+# - Phase2が「東京駅 17:00-20:00 / 新幹線で福井へ戻ります」のように
+#   帰着地への長距離移動を最終スポット行として出した場合、
+#   完成旅程で「東京駅」止まりにならないよう、最終移動カードへ昇格し、
+#   帰着地スポットを末尾に補う。
+# - Phase2生成本体・ホテル時刻補正・実行中ナビには触らない。
+# =========================================================
+def _terminal_return_context_text(row: pd.Series | Dict, planning_state: Dict[str, object]) -> str:
+    parts = [
+        safe_text(_row_value(row, "destination", ""), ""),
+        safe_text(_row_value(row, "purpose", ""), ""),
+        safe_text(_row_value(row, "genre", ""), ""),
+        safe_text(_row_value(row, "one_point", ""), ""),
+        safe_text(planning_state.get("return_place"), ""),
+    ]
+    return " ".join([p for p in parts if p and p != "-"])
+
+
+def _infer_terminal_return_mode(row: pd.Series | Dict, planning_state: Dict[str, object]) -> str:
+    context = _terminal_return_context_text(row, planning_state)
+    # 「電車」に含まれる「車」で private_car に倒れないよう、公共交通を先に判定する。
+    if any(token in context for token in ["新幹線", "電車", "列車", "特急", "北陸新幹線", "かがやき", "はくたか", "サンダーバード"]):
+        return "train"
+    if any(token in context for token in ["飛行機", "航空", "フライト", "空港"]):
+        return "air"
+    if any(token in context for token in ["自家用車", "マイカー", "レンタカー", "ドライブ", "車で行く", "車で戻", "車で帰"]):
+        return "private_car"
+    if any(token in context for token in ["バス", "シャトル"]):
+        return "bus"
+    if any(token in context for token in ["タクシー"]):
+        return "taxi"
+    return _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）"))
+
+
+def _looks_like_terminal_return_embedded_row(row: pd.Series | Dict, planning_state: Dict[str, object]) -> bool:
+    return_place = safe_text(planning_state.get("return_place"), "")
+    if not return_place:
+        return False
+
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    if not destination or _same_effective_place(destination, return_place):
+        return False
+
+    start_time = safe_text(_row_value(row, "start_time", ""), "")
+    end_time = safe_text(_row_value(row, "end_time", ""), "")
+    minutes = _minutes_between_clock(start_time, end_time) if start_time and end_time else None
+    if minutes is not None and minutes <= 0:
+        return False
+
+    context = _terminal_return_context_text(row, planning_state)
+    return_area = return_place.replace("駅", "")
+    mentions_return = (return_place in context) or (return_area and return_area in context)
+    transportish = any(token in context for token in [
+        "移動", "帰路", "帰着", "帰る", "戻る", "戻ります", "戻り", "向かう", "向かいます",
+        "新幹線", "電車", "列車", "特急", "自家用車", "マイカー", "レンタカー", "ドライブ"
+    ])
+    purpose = safe_text(_row_value(row, "purpose", ""), "").lower()
+    purpose_transport = purpose in {"transport", "move", "return", "arrival"} or "移動" in purpose
+    return bool(mentions_return and (transportish or purpose_transport))
+
+
+def _append_terminal_return_arrival(df: pd.DataFrame, base_row: pd.Series | Dict, planning_state: Dict[str, object]) -> pd.DataFrame:
+    return_place = safe_text(planning_state.get("return_place"), "")
+    if not return_place:
+        return df
+    end_time = safe_text(_row_value(base_row, "end_time", ""), safe_text(_row_value(base_row, "start_time", ""), ""))
+    day = int(_row_value(base_row, "day", 1) or 1)
+    date_value = safe_text(_row_value(base_row, "date", ""), "")
+    max_sequence = float(df["sequence"].max()) if "sequence" in df.columns and not df.empty else len(df) + 1
+    arrival_row = {
+        "day": day,
+        "sequence": max_sequence + 1,
+        "date": date_value,
+        "start_time": end_time,
+        "end_time": end_time,
+        "destination": return_place,
+        "purpose": "arrival",
+        "genre": "arrival",
+        "duration_minutes": 0,
+        "is_transport": False,
+        "transport_mode": None,
+        "one_point": "お疲れ様でした。無事に帰着です。",
+        "address": "",
+        "route_from": "",
+        "route_to": "",
+        "route_url": "",
+        "route_data_source": "final_return_arrival_guard",
+        "estimated_duration_label": "",
+        "route_departure_at": "",
+    }
+    for col in df.columns:
+        if col not in arrival_row:
+            arrival_row[col] = ""
+    return pd.concat([df, pd.DataFrame([arrival_row])], ignore_index=True)
+
+
+def _ensure_final_return_leg(df3: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    if df3 is None or df3.empty or "day" not in df3.columns or "destination" not in df3.columns:
+        return df3
+
+    return_place = safe_text(planning_state.get("return_place"), "")
+    if not return_place:
+        return df3
+
+    fixed = df3.copy().reset_index(drop=True)
+    activities = fixed[fixed["is_transport"] == False].reset_index()
+    if not activities.empty and _same_effective_place(safe_text(activities.iloc[-1].get("destination"), ""), return_place):
+        return fixed
+
+    final_day = int(fixed["day"].dropna().astype(int).max())
+    final_day_indexes = fixed.index[fixed["day"].astype(int) == final_day].tolist()
+    if not final_day_indexes:
+        return fixed
+    last_idx = final_day_indexes[-1]
+    last_row = fixed.loc[last_idx]
+
+    # 末尾がすでに帰着地へ向かうtransportなら、到着スポットだけ補う。
+    if bool(last_row.get("is_transport", False)):
+        route_to = safe_text(last_row.get("route_to"), "")
+        destination = safe_text(last_row.get("destination"), "")
+        if _same_effective_place(route_to, return_place) or return_place in destination:
+            fixed = _append_terminal_return_arrival(fixed, last_row, planning_state)
+            log_event("Phase3帰着補正", f"最終transport後に帰着地スポットを追加: {return_place}", level="info")
+    elif _looks_like_terminal_return_embedded_row(last_row, planning_state):
+        origin_name = safe_text(last_row.get("destination"), "")
+        start_time = safe_text(last_row.get("start_time"), "")
+        end_time = safe_text(last_row.get("end_time"), "")
+        minutes = _minutes_between_clock(start_time, end_time) or int(float(last_row.get("duration_minutes") or 0) or 0)
+        mode = _infer_terminal_return_mode(last_row, planning_state)
+        fixed.at[last_idx, "destination"] = f"{origin_name} → {return_place}"
+        fixed.at[last_idx, "purpose"] = "transport"
+        fixed.at[last_idx, "genre"] = "transport"
+        fixed.at[last_idx, "is_transport"] = True
+        fixed.at[last_idx, "transport_mode"] = mode if mode != "air" else "train"
+        fixed.at[last_idx, "duration_minutes"] = minutes
+        fixed.at[last_idx, "route_from"] = origin_name
+        fixed.at[last_idx, "route_to"] = return_place
+        fixed.at[last_idx, "route_url"] = build_google_maps_dir_url(origin_name, return_place, mode if mode != "air" else "train")
+        fixed.at[last_idx, "route_data_source"] = "final_return_embedded_row_guard"
+        fixed.at[last_idx, "estimated_duration_label"] = f"約{minutes}分" if minutes else "目安"
+        fixed.at[last_idx, "route_departure_at"] = f"{safe_text(last_row.get('date'), '')} {start_time}".strip()
+        existing_note = safe_text(last_row.get("one_point"), "")
+        guard_note = "最終行に含まれていた帰着地への移動を、帰路の移動カードとして扱います。"
+        fixed.at[last_idx, "one_point"] = (existing_note + " / " + guard_note).strip(" /")[:180]
+        fixed = _append_terminal_return_arrival(fixed, fixed.loc[last_idx], planning_state)
+        log_event("Phase3帰着補正", f"最終行を帰路transportへ昇格し、帰着地を追加: {origin_name} → {return_place}", level="warning")
+
+    if "day" in fixed.columns and "sequence" in fixed.columns:
+        fixed = fixed.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+        fixed["sequence"] = fixed.groupby("day").cumcount() + 1
+    return fixed
+
 def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
     # --- 修正箇所: train / transport 行は独立スポットにせず、前後スポットを橋渡しする移動ヒントとして扱う ---
     if df2 is None or df2.empty:
@@ -4940,6 +5094,9 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
     if "day" in df3.columns and "sequence" in df3.columns:
         df3 = df3.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
         df3["sequence"] = df3.groupby("day").cumcount() + 1
+
+    # --- 修正箇所(v6.2.74.2): 最終行に帰路移動が埋め込まれた場合、帰着地までのtransportと到着スポットを補う ---
+    df3 = _ensure_final_return_leg(df3, planning_state)
 
     return df3
 
