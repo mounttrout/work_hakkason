@@ -107,7 +107,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.74.2-final-return-leg-guard"
+APP_VERSION_NAME = "v6.2.74.3-private-car-output-override"
 APP_UPDATED_DATE = "2026-04-30"
 
 
@@ -4474,6 +4474,108 @@ def _infer_mode_from_transport_style(transport_style: str) -> str:
     return mapping.get(str(transport_style or "").strip(), "train")
 
 
+# =========================================================
+# 修正箇所(v6.2.74.3): 自家用車旅行の出力段階ガード
+# - v6.2.73 で自家用車検出は弱めたが、LLM移動時間推定が局所的に train を返すと、
+#   自家用車旅行の途中区間が電車へ戻ることがあった。
+# - Phase2生成本体やホテル時刻補正には触らず、Phase3で移動カードへ出す直前にだけ
+#   「自家用車旅行なら原則 private_car」を再適用する。
+# - 例外は、上高地/沢渡などのマイカー規制・シャトルバス、明示的な徒歩/タクシー、
+#   「車を置いて電車」等の明示的な公共交通切替だけ。
+# =========================================================
+def _is_private_car_trip(planning_state: Dict[str, object]) -> bool:
+    style = safe_text(planning_state.get("transport_style"), "")
+    return style == "自家用車" or _infer_mode_from_transport_style(style) == "private_car"
+
+
+def _normalize_transport_mode_key(mode: str) -> str:
+    value = str(mode or "").strip().lower()
+    mode_map = {
+        "自家用車": "private_car",
+        "マイカー": "private_car",
+        "車": "private_car",
+        "車移動": "private_car",
+        "レンタカー": "car",
+        "電車": "train",
+        "列車": "train",
+        "新幹線": "train",
+        "公共交通": "train",
+        "徒歩": "walk",
+        "歩き": "walk",
+        "タクシー": "taxi",
+        "バス": "bus",
+        "シャトルバス": "bus",
+    }
+    return mode_map.get(value, value)
+
+
+def _private_car_segment_context(
+    origin_name: str,
+    destination_name: str,
+    current_note: str = "",
+    next_note: str = "",
+    service_hint: str = "",
+    extra_text: str = "",
+) -> str:
+    return " ".join([
+        safe_text(origin_name, ""),
+        safe_text(destination_name, ""),
+        safe_text(current_note, ""),
+        safe_text(next_note, ""),
+        safe_text(service_hint, ""),
+        safe_text(extra_text, ""),
+    ])
+
+
+def _private_car_allows_public_transport(context: str) -> bool:
+    # 「自家用車で旅行。ただしここから電車」など、ユーザー/旅程が明示的に切り替えを書いた場合だけ許可。
+    explicit_switch_patterns = [
+        r"車を(?:置いて|停めて|駐車して).{0,12}(?:電車|地下鉄|鉄道|公共交通)",
+        r"駐車場に(?:停め|置き).{0,12}(?:電車|地下鉄|鉄道|公共交通)",
+        r"ここからは(?:電車|地下鉄|鉄道|公共交通)",
+        r"公共交通に切り替",
+        r"電車に切り替",
+        r"地下鉄に切り替",
+        r"飲酒.{0,12}(?:電車|タクシー|公共交通)",
+    ]
+    return any(re.search(pattern, context) for pattern in explicit_switch_patterns)
+
+
+def _enforce_private_car_mode_for_segment(
+    mode: str,
+    planning_state: Dict[str, object],
+    origin_name: str,
+    destination_name: str,
+    current_note: str = "",
+    next_note: str = "",
+    service_hint: str = "",
+    extra_text: str = "",
+) -> str:
+    # 自家用車旅行以外は一切触らない。
+    if not _is_private_car_trip(planning_state):
+        return mode
+
+    mode_key = _normalize_transport_mode_key(mode)
+    context = _private_car_segment_context(origin_name, destination_name, current_note, next_note, service_hint, extra_text)
+
+    # 上高地など、車で直接入れない文脈は bus/shuttle を優先。
+    if any(token in context for token in ["上高地", "沢渡", "さわんど", "マイカー規制", "シャトルバス", "シャトル", "乗り換え"]):
+        return "bus"
+
+    # 明示的な徒歩・タクシーは許可。
+    if mode_key == "walk" and any(token in context for token in ["徒歩", "歩いて", "徒歩圏", "散策", "同一エリア", "周辺"]):
+        return "walk"
+    if mode_key == "taxi" or any(token in context for token in ["タクシー"]):
+        return "taxi"
+
+    # 明示的に車を置いて公共交通へ切り替える場合だけ公共交通を許可。
+    if mode_key in {"train", "transit", "rail", "bus"} and _private_car_allows_public_transport(context):
+        return "bus" if mode_key == "bus" else "train"
+
+    # それ以外は LLM が train を返しても private_car に戻す。
+    return "private_car"
+
+
 def _llm_transport_duration_from_sequence(
     origin_name: str,
     destination_name: str,
@@ -4543,9 +4645,20 @@ minutes を出せない場合:
         if minutes <= 0 or minutes > 24 * 60:
             return None
         mode = str(data.get("mode", "") or "").strip().lower()
-        if mode not in {"walk", "train", "taxi", "car", "private_car", "bike", "air"}:
+        if mode not in {"walk", "train", "taxi", "car", "private_car", "bike", "air", "bus"}:
             mode = _infer_mode_from_transport_style(transport_style)
         mode = _infer_mode_from_service_hint(service_hint, mode)
+        # v6.2.74.3: 自家用車旅行では、LLMが局所的にtrainを返しても出力直前で戻す。
+        mode = _enforce_private_car_mode_for_segment(
+            mode,
+            {"transport_style": transport_style},
+            origin_name,
+            destination_name,
+            current_note=current_note,
+            next_note=next_note,
+            service_hint=service_hint,
+            extra_text=reason if 'reason' in locals() else "",
+        )
         confidence = str(data.get("confidence", "medium") or "medium").strip().lower()
         reason = str(data.get("reason", "") or "").strip()
         return {"minutes": minutes, "mode": mode, "confidence": confidence, "reason": reason}
@@ -4742,6 +4855,15 @@ def _promote_last_row_to_embedded_transport(rows: List[Dict[str, object]], curre
     if minutes <= 0:
         return
     mode = _infer_mode_from_service_hint(service_hint, _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）")))
+    mode = _enforce_private_car_mode_for_segment(
+        mode,
+        planning_state,
+        origin_name,
+        destination_name,
+        current_note=safe_text(_row_value(current, "one_point", ""), ""),
+        next_note=safe_text(_row_value(actual_next, "one_point", ""), ""),
+        service_hint=service_hint,
+    )
     last = rows[-1]
     last["destination"] = f"{origin_name} → {destination_name}"
     last["purpose"] = "transport"
@@ -4789,10 +4911,19 @@ def _infer_terminal_return_mode(row: pd.Series | Dict, planning_state: Dict[str,
     if any(token in context for token in ["自家用車", "マイカー", "レンタカー", "ドライブ", "車で行く", "車で戻", "車で帰"]):
         return "private_car"
     if any(token in context for token in ["バス", "シャトル"]):
-        return "bus"
-    if any(token in context for token in ["タクシー"]):
-        return "taxi"
-    return _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）"))
+        mode = "bus"
+    elif any(token in context for token in ["タクシー"]):
+        mode = "taxi"
+    else:
+        mode = _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）"))
+    return _enforce_private_car_mode_for_segment(
+        mode,
+        planning_state,
+        safe_text(_row_value(row, "destination", ""), ""),
+        safe_text(planning_state.get("return_place"), ""),
+        current_note=safe_text(_row_value(row, "one_point", ""), ""),
+        extra_text=context,
+    )
 
 
 def _looks_like_terminal_return_embedded_row(row: pd.Series | Dict, planning_state: Dict[str, object]) -> bool:
@@ -5029,6 +5160,18 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
             duration_label = str(fallback["label"])
             route_source = str(fallback["source"]) if not service_hint else "train_bridge_fallback"
             one_point = str(fallback["note"])
+
+        # v6.2.74.3: 自家用車旅行では、LLM/フォールバック結果がtrainへ戻ってもここで最終補正する。
+        transport_mode = _enforce_private_car_mode_for_segment(
+            transport_mode,
+            planning_state,
+            origin_name,
+            destination_name,
+            current_note=safe_text(current.get("one_point"), ""),
+            next_note=safe_text(actual_next.get("one_point"), ""),
+            service_hint=service_hint,
+            extra_text=one_point,
+        )
 
         next_start_time = safe_text(actual_next.get("start_time"), "")
         consistent_gap = _minutes_between_clock(departure_time, next_start_time) if departure_time and next_start_time else None
