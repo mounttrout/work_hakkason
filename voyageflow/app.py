@@ -107,7 +107,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.74.3-private-car-output-override"
+APP_VERSION_NAME = "v6.2.74.4-private-car-final-sweep-hotel-departure-fix"
 APP_UPDATED_DATE = "2026-04-30"
 
 
@@ -3687,6 +3687,8 @@ def build_google_maps_dir_url(origin: str, destination: str, travelmode: str = "
         "driving": "driving",
         "taxi": "driving",
         "タクシー": "driving",
+        "bus": "transit",
+        "バス": "transit",
         None: "walking",
         "": "walking",
     }
@@ -5044,6 +5046,171 @@ def _ensure_final_return_leg(df3: pd.DataFrame, planning_state: Dict[str, object
         fixed["sequence"] = fixed.groupby("day").cumcount() + 1
     return fixed
 
+
+# =========================================================
+# 修正箇所(v6.2.74.4): 自家用車モード最終掃き直し + ホテル出発重なり補正
+# - v6.2.74.3 で移動生成時の private_car override を入れたが、既存transport行・最終帰着補正・
+#   時刻重なりのホテル出発行など、別経路で train が残るケースがあった。
+# - Phase2生成本体、v6.2.71のホテル時刻補正、実行中ナビには触らず、完成旅程df3の出力直前だけを補正する。
+# =========================================================
+def _route_pair_from_transport_row(row: pd.Series | Dict) -> tuple[str, str]:
+    route_from = safe_text(_row_value(row, "route_from", ""), "")
+    route_to = safe_text(_row_value(row, "route_to", ""), "")
+    if route_from and route_to and route_from != "-" and route_to != "-":
+        return route_from, route_to
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    if "→" in destination:
+        left, right = [part.strip() for part in destination.split("→", 1)]
+        return left, right
+    return "", ""
+
+
+def _enforce_private_car_modes_on_df(df3: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    """自家用車旅行の最終出力に train/bus が別経路で残った場合の最後の保険。"""
+    if df3 is None or df3.empty or not _is_private_car_trip(planning_state):
+        return df3
+    if "is_transport" not in df3.columns or "transport_mode" not in df3.columns:
+        return df3
+
+    fixed = df3.copy().reset_index(drop=True)
+    for idx in fixed.index[fixed["is_transport"] == True].tolist():  # noqa: E712
+        row = fixed.loc[idx]
+        origin_name, destination_name = _route_pair_from_transport_row(row)
+        if not origin_name or not destination_name:
+            continue
+
+        current_note = safe_text(row.get("one_point"), "")
+        prev_note = ""
+        next_note = ""
+        if idx > 0:
+            prev_note = safe_text(fixed.loc[idx - 1].get("one_point"), "")
+        if idx + 1 < len(fixed):
+            next_note = safe_text(fixed.loc[idx + 1].get("one_point"), "")
+
+        before_mode = safe_text(row.get("transport_mode"), "")
+        after_mode = _enforce_private_car_mode_for_segment(
+            before_mode,
+            planning_state,
+            origin_name,
+            destination_name,
+            current_note=current_note,
+            next_note=next_note,
+            extra_text=" ".join([
+                safe_text(row.get("destination"), ""),
+                current_note,
+                prev_note,
+                next_note,
+            ]),
+        )
+        if after_mode != before_mode:
+            fixed.at[idx, "transport_mode"] = after_mode
+            fixed.at[idx, "route_from"] = origin_name
+            fixed.at[idx, "route_to"] = destination_name
+            fixed.at[idx, "route_url"] = build_google_maps_dir_url(origin_name, destination_name, after_mode if after_mode != "air" else "train")
+            source = safe_text(row.get("route_data_source"), "")
+            fixed.at[idx, "route_data_source"] = (source + "+private_car_final_sweep").strip("+")[:80]
+            log_event(
+                "Phase3自家用車ガード",
+                f"最終出力直前に移動手段を補正: {origin_name}→{destination_name} / {before_mode}→{after_mode}",
+                level="warning",
+            )
+    return fixed
+
+
+def _is_hotel_departure_overlap_candidate(current: pd.Series | Dict, actual_next: pd.Series | Dict) -> bool:
+    """ホテル出発行と次スポットの時刻が重なり、移動カードが抜けやすいケースを検知する。"""
+    if current is None or actual_next is None:
+        return False
+    if not _is_hotel_or_lodging_row(current):
+        return False
+    if bool(_row_value(current, "is_transport", False)) or bool(_row_value(actual_next, "is_transport", False)):
+        return False
+
+    purpose = safe_text(_row_value(current, "purpose", ""), "").lower()
+    one_point = safe_text(_row_value(current, "one_point", ""), "")
+    if not (purpose in {"departure", "出発"} or "出発" in one_point):
+        return False
+
+    origin_name = safe_text(_row_value(current, "destination", ""), "")
+    destination_name = safe_text(_row_value(actual_next, "destination", ""), "")
+    if not origin_name or not destination_name or _same_effective_place(origin_name, destination_name):
+        return False
+
+    current_start = _time_to_minutes(safe_text(_row_value(current, "start_time", ""), ""))
+    current_end = _time_to_minutes(safe_text(_row_value(current, "end_time", ""), ""))
+    next_start = _time_to_minutes(safe_text(_row_value(actual_next, "start_time", ""), ""))
+    if current_start is None or current_end is None or next_start is None:
+        return False
+    if current_end <= current_start:
+        return False
+
+    # 例: 08:30-09:00 ホテル出発 → 08:30 上高地 のような重なり。
+    return next_start <= current_end
+
+
+def _convert_hotel_departure_overlap_to_transport(df3: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    """ホテル出発行が次スポットと重なっている場合、そのホテル出発行自体を移動カードへ変換する。"""
+    if df3 is None or df3.empty or "day" not in df3.columns:
+        return df3
+
+    fixed = df3.copy().reset_index(drop=True)
+    for idx in range(len(fixed) - 1):
+        current = fixed.loc[idx]
+        actual_next = fixed.loc[idx + 1]
+        if int(current.get("day", 1) or 1) != int(actual_next.get("day", 1) or 1):
+            continue
+        if not _is_hotel_departure_overlap_candidate(current, actual_next):
+            continue
+
+        origin_name = safe_text(current.get("destination"), "")
+        destination_name = safe_text(actual_next.get("destination"), "")
+        start_time = safe_text(current.get("start_time"), "")
+        end_time = safe_text(current.get("end_time"), "")
+        minutes = _minutes_between_clock(start_time, end_time) or int(float(current.get("duration_minutes") or 0) or 0)
+        if minutes <= 0:
+            continue
+
+        mode = _enforce_private_car_mode_for_segment(
+            _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）")),
+            planning_state,
+            origin_name,
+            destination_name,
+            current_note=safe_text(current.get("one_point"), ""),
+            next_note=safe_text(actual_next.get("one_point"), ""),
+        )
+
+        fixed.at[idx, "destination"] = f"{origin_name} → {destination_name}"
+        fixed.at[idx, "purpose"] = "transport"
+        fixed.at[idx, "genre"] = "transport"
+        fixed.at[idx, "is_transport"] = True
+        fixed.at[idx, "transport_mode"] = mode
+        fixed.at[idx, "duration_minutes"] = minutes
+        fixed.at[idx, "route_from"] = origin_name
+        fixed.at[idx, "route_to"] = destination_name
+        fixed.at[idx, "route_url"] = build_google_maps_dir_url(origin_name, destination_name, mode if mode != "air" else "train")
+        fixed.at[idx, "route_data_source"] = "hotel_departure_overlap_transport_guard"
+        fixed.at[idx, "estimated_duration_label"] = f"約{minutes}分"
+        fixed.at[idx, "route_departure_at"] = f"{safe_text(current.get('date'), '')} {start_time}".strip()
+        note = safe_text(current.get("one_point"), "")
+        fixed.at[idx, "one_point"] = (note + " / ホテル出発行と次スポットの時刻重なりを、移動カードとして補正しました。").strip(" /")[:180]
+
+        # 次スポットが移動終了前に始まっている場合だけ、開始時刻を移動終了後へそろえる。
+        next_start_min = _time_to_minutes(safe_text(actual_next.get("start_time"), ""))
+        end_min = _time_to_minutes(end_time)
+        if next_start_min is not None and end_min is not None and next_start_min < end_min:
+            fixed.at[idx + 1, "start_time"] = end_time
+
+        log_event(
+            "Phase3ホテル出発補正",
+            f"ホテル出発行を移動カードへ変換: Day{safe_text(current.get('day'), '')} {origin_name}→{destination_name} / {mode}",
+            level="warning",
+        )
+
+    if "day" in fixed.columns and "sequence" in fixed.columns:
+        fixed = fixed.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+        fixed["sequence"] = fixed.groupby("day").cumcount() + 1
+    return fixed
+
 def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
     # --- 修正箇所: train / transport 行は独立スポットにせず、前後スポットを橋渡しする移動ヒントとして扱う ---
     if df2 is None or df2.empty:
@@ -5240,6 +5407,10 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
 
     # --- 修正箇所(v6.2.74.2): 最終行に帰路移動が埋め込まれた場合、帰着地までのtransportと到着スポットを補う ---
     df3 = _ensure_final_return_leg(df3, planning_state)
+
+    # --- 修正箇所(v6.2.74.4): ホテル出発重なり補正 + 自家用車モード最終掃き直し ---
+    df3 = _convert_hotel_departure_overlap_to_transport(df3, planning_state)
+    df3 = _enforce_private_car_modes_on_df(df3, planning_state)
 
     return df3
 
