@@ -85,9 +85,10 @@ except Exception:
 
 
 # =========================================================
-# 修正箇所(v6.2.82): Quality Gate / Sidebar Dev Tools 外付け
-# - Geminiには完成旅程の品質判定だけを任せる
-# - 自動修正は行わず、Phase2→Phase3再作成ボタンでユーザー判断に委ねる
+# 修正箇所(v6.2.83): Quality Gate / Sidebar Dev Tools 外付け
+# - Geminiには完成旅程の品質判定をチェックリスト形式で任せる
+# - 明確な安全補正だけはコード側のホワイトリストで即時反映する
+# - 判断が必要な問題は Phase2→Phase3再作成ボタン or ユーザー確認に委ねる
 # - サイドバー診断ツールは ui/sidebar_dev_tools.py 側へ分離し、通常時は非表示
 # =========================================================
 try:
@@ -133,9 +134,10 @@ except Exception:
 # - v6.2.81: 完成旅程の移動カードに距離ベース参考時間を表示。旅程時刻・duration・Phase3ロジックは変更しない。
 # - v6.2.82: Quality Gateを追加。自動修正はせず、問題判定後にPhase2→Phase3だけ再作成できるボタンを追加。
 # - v6.2.82: サイドバー診断ツールと生成温度/デバッグモードを開発者ツール内へ隠し、診断UIを ui/sidebar_dev_tools.py へ分離。
+# - v6.2.83: Phase3 Quality Gateをチェックリスト方式へ強化。短距離train→walk、ホテルpurpose誤分類、帰着後ノードなど明確なものだけコード側で安全補正する。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.82-quality-gate-devtools-cleanup"
+APP_VERSION_NAME = "v6.2.83-quality-gate-checklist-safe-autofix"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -708,13 +710,14 @@ def init_session_state() -> None:
         # 修正箇所(v6.2.82): 開発者ツールの通常時非表示化
         "show_developer_tools": False,
 
-        # 修正箇所(v6.2.82): Quality Gate / Phase2→Phase3再作成管理
+        # 修正箇所(v6.2.83): Quality Gate / Phase2→Phase3再作成管理
         "quality_gate_result": None,
         "quality_gate_raw": "",
         "quality_gate_last_signature": "",
         "quality_gate_retry_count": 0,
         "quality_gate_issue_history": [],
         "quality_gate_user_accepted": False,
+        "quality_gate_autofix_summary": [],
     }
 
     for key, value in defaults.items():
@@ -1078,10 +1081,10 @@ def render_phase35_validation_panel(natural_plan_text: str, df: pd.DataFrame) ->
 
 
 # =========================================================
-# 修正箇所(v6.2.82): Quality Gate + Phase2→Phase3再作成ボタン
-# - Geminiには判定だけをさせる
-# - 旅程データの修正は自動実行しない
-# - 必要時のみユーザー操作で Phase2→Phase3 を再作成する
+# 修正箇所(v6.2.83): Quality Gate + Phase2→Phase3再作成ボタン + 安全自動補正
+# - Geminiにはチェックリスト形式で品質判定だけをさせる
+# - 明確な安全補正だけはコード側のホワイトリストで即時反映する
+# - 判断が必要なものはユーザー操作で Phase2→Phase3 を再作成、または確認に委ねる
 # =========================================================
 def _quality_gate_dataframe_text(df: pd.DataFrame, label: str, max_rows: int = 80) -> str:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -1157,6 +1160,560 @@ def _quality_gate_issue_signature(result: Dict[str, object]) -> str:
     return "\n".join(parts)
 
 
+
+# --- 修正箇所(v6.2.83): Quality Gate チェックリストと安全自動補正 ---
+
+def _quality_gate_check_to_issue(check: Dict[str, object]) -> Dict[str, object]:
+    """チェックリスト1件を既存UI互換のissue形式へ変換する。"""
+    status = safe_text(check.get("status"), "warning").lower()
+    severity = safe_text(check.get("severity"), "medium").lower()
+    return {
+        "type": safe_text(check.get("id"), safe_text(check.get("type"), "quality_check")),
+        "severity": severity,
+        "location": safe_text(check.get("location"), ""),
+        "problem": safe_text(check.get("evidence"), safe_text(check.get("problem"), "")),
+        "suggestion": safe_text(check.get("suggestion"), ""),
+        "recommended_action": safe_text(check.get("recommended_action"), "ask_user"),
+        "user_message": safe_text(check.get("user_message"), ""),
+        "status": status,
+    }
+
+
+def _quality_gate_normalize_check(check: Dict[str, object], source: str = "llm") -> Dict[str, object]:
+    """LLM/コード由来のチェック結果を統一形式に寄せる。"""
+    if not isinstance(check, dict):
+        check = {}
+    status = safe_text(check.get("status"), "warning").lower()
+    if status not in {"pass", "warning", "fail"}:
+        status = "warning"
+    severity = safe_text(check.get("severity"), "medium").lower()
+    if severity not in {"low", "medium", "high", "critical"}:
+        severity = "medium"
+    action = safe_text(check.get("recommended_action"), "")
+    if action not in {"accept", "auto_fix", "retry_phase2_phase3", "ask_user", "block"}:
+        if status == "pass":
+            action = "accept"
+        elif severity in {"high", "critical"}:
+            action = "ask_user"
+        else:
+            action = "ask_user"
+    normalized = {
+        "id": safe_text(check.get("id"), safe_text(check.get("type"), "quality_check")),
+        "category": safe_text(check.get("category"), "quality"),
+        "status": status,
+        "severity": severity,
+        "location": safe_text(check.get("location"), ""),
+        "evidence": safe_text(check.get("evidence"), safe_text(check.get("problem"), "")),
+        "suggestion": safe_text(check.get("suggestion"), ""),
+        "recommended_action": action,
+        "user_message": safe_text(check.get("user_message"), ""),
+        "source": safe_text(check.get("source"), source),
+    }
+    auto_fix = check.get("auto_fix")
+    if isinstance(auto_fix, dict):
+        normalized["auto_fix"] = auto_fix
+    return normalized
+
+
+def _quality_gate_make_check(
+    *,
+    check_id: str,
+    category: str,
+    status: str,
+    severity: str,
+    location: str,
+    evidence: str,
+    suggestion: str,
+    recommended_action: str,
+    user_message: str = "",
+    auto_fix: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    check = {
+        "id": check_id,
+        "category": category,
+        "status": status,
+        "severity": severity,
+        "location": location,
+        "evidence": evidence,
+        "suggestion": suggestion,
+        "recommended_action": recommended_action,
+        "user_message": user_message,
+        "source": "code",
+    }
+    if isinstance(auto_fix, dict):
+        check["auto_fix"] = auto_fix
+    return check
+
+
+def _quality_gate_append_note(existing: object, note: str) -> str:
+    base = safe_text(existing, "")
+    note_text = safe_text(note, "")
+    if not note_text:
+        return base
+    if note_text in base:
+        return base
+    if not base or base == "-":
+        return note_text
+    return f"{base} / {note_text}"
+
+
+def _quality_gate_transport_distance(origin: str, destination: str) -> Optional[float]:
+    """Quality Gate専用の軽量距離取得。失敗時はNone。"""
+    origin_name = _normalize_route_query_name(origin)
+    destination_name = _normalize_route_query_name(destination)
+    if not origin_name or not destination_name:
+        return None
+    if origin_name in {"現在地", "-"} or destination_name in {"現在地", "-"}:
+        return None
+    try:
+        result = build_distance_transport_estimate_for_test(origin_name, destination_name)
+        if isinstance(result, dict) and result.get("ok") and result.get("distance_km") is not None:
+            return float(result.get("distance_km"))
+    except Exception as e:
+        log_event("Quality Gate距離検査", f"距離取得をスキップ: {origin_name} → {destination_name} / {e}", level="warning")
+    return None
+
+
+def _quality_gate_expected_nights(planning_state: Dict[str, object]) -> int:
+    try:
+        days = int(planning_state.get("trip_days", 1) or 1)
+    except Exception:
+        days = 1
+    return max(0, days - 1)
+
+
+def _quality_gate_build_code_checks(
+    df_phase2: pd.DataFrame,
+    df_phase3: pd.DataFrame,
+    planning_state: Dict[str, object],
+    natural_plan_text: str,
+) -> List[Dict[str, object]]:
+    """LLMに任せきりにせず、コードで明確に判定できる項目をチェックする。"""
+    checks: List[Dict[str, object]] = []
+
+    expected_nights = _quality_gate_expected_nights(planning_state)
+    if isinstance(df_phase3, pd.DataFrame) and not df_phase3.empty:
+        activity_rows = df_phase3[df_phase3.get("is_transport", False) == False].reset_index(drop=False)  # noqa: E712
+        hotel_rows = []
+        for _, row in activity_rows.iterrows():
+            try:
+                if _is_hotel_or_lodging_row(row):
+                    hotel_rows.append(row)
+            except Exception:
+                continue
+        if expected_nights > 0 and len(hotel_rows) < expected_nights:
+            checks.append(_quality_gate_make_check(
+                check_id="hotel_nights_insufficient",
+                category="hotel",
+                status="fail",
+                severity="high",
+                location="完成旅程全体",
+                evidence=f"{expected_nights}泊分が必要ですが、宿泊行として認識できる行は{len(hotel_rows)}件です。",
+                suggestion="Phase2構造化で宿泊行が落ちた可能性があります。Phase2→Phase3だけ再作成するか、ホテル行を確認してください。",
+                recommended_action="retry_phase2_phase3",
+                user_message="宿泊行が不足している可能性があります。構造化だけ再作成しますか？",
+            ))
+
+        return_place = safe_text(planning_state.get("return_place"), "")
+        if return_place:
+            terminal_index = None
+            for idx, row in df_phase3.reset_index(drop=True).iterrows():
+                if bool(row.get("is_transport", False)):
+                    continue
+                if _same_effective_place(safe_text(row.get("destination"), ""), return_place):
+                    terminal_index = idx
+            if terminal_index is not None and terminal_index < len(df_phase3) - 1:
+                tail = df_phase3.reset_index(drop=True).iloc[terminal_index + 1:]
+                tail_labels = [safe_text(v, "") for v in tail.get("destination", [])][:3]
+                checks.append(_quality_gate_make_check(
+                    check_id="post_return_node",
+                    category="route",
+                    status="fail",
+                    severity="high",
+                    location=f"帰着地 {return_place} 以降",
+                    evidence=f"最終帰着地の後に予定が残っています: {', '.join(tail_labels)}",
+                    suggestion="帰着後のホテル・観光ノードは削除または非表示にします。",
+                    recommended_action="auto_fix",
+                    user_message="帰着後の余計な予定を削除できます。",
+                    auto_fix={
+                        "target": "phase3_drop_after_index",
+                        "terminal_index": int(terminal_index),
+                    },
+                ))
+
+        for idx, row in df_phase3.reset_index(drop=True).iterrows():
+            destination = safe_text(row.get("destination"), "")
+            purpose = safe_text(row.get("purpose"), "").lower()
+            genre = safe_text(row.get("genre"), "").lower()
+            is_transport = bool(row.get("is_transport", False))
+            day = safe_text(row.get("day"), "")
+            start = safe_text(row.get("start_time"), "")
+
+            if not is_transport and (genre == "hotel" or _contains_hotel_token(destination)) and purpose == "transport":
+                checks.append(_quality_gate_make_check(
+                    check_id="hotel_purpose_transport_mismatch",
+                    category="hotel",
+                    status="fail",
+                    severity="high",
+                    location=f"Day{day} {start} {destination}",
+                    evidence="ホテル行なのに purpose=transport になっています。",
+                    suggestion="宿泊行として扱えるよう purpose=accommodation に補正します。",
+                    recommended_action="auto_fix",
+                    user_message="ホテル行の分類を宿泊へ補正できます。",
+                    auto_fix={
+                        "target": "phase3_update_row",
+                        "row_index": int(idx),
+                        "set": {"purpose": "accommodation", "genre": "hotel", "is_transport": False},
+                    },
+                ))
+
+            if not is_transport and purpose == "meal" and any(token in destination for token in ["資料館", "博物館", "美術館", "神宮", "寺", "神社"]):
+                checks.append(_quality_gate_make_check(
+                    check_id="obvious_purpose_mismatch",
+                    category="purpose",
+                    status="fail",
+                    severity="medium",
+                    location=f"Day{day} {start} {destination}",
+                    evidence="展示・参拝・観光施設が meal として分類されています。",
+                    suggestion="目的を activity に補正します。",
+                    recommended_action="auto_fix",
+                    user_message="目的分類を観光・体験へ補正できます。",
+                    auto_fix={
+                        "target": "phase3_update_row",
+                        "row_index": int(idx),
+                        "set": {"purpose": "activity"},
+                    },
+                ))
+
+            if is_transport:
+                origin = safe_text(row.get("route_from"), "")
+                to = safe_text(row.get("route_to"), "")
+                mode = safe_text(row.get("transport_mode"), "").lower()
+                if not origin or not to:
+                    continue
+                if _same_effective_place(origin, to):
+                    checks.append(_quality_gate_make_check(
+                        check_id="same_place_transport",
+                        category="transport",
+                        status="fail",
+                        severity="medium",
+                        location=f"Day{day} {start} {origin} → {to}",
+                        evidence="出発地と到着地が同一地点として扱えます。",
+                        suggestion="同一地点の移動カードを削除します。",
+                        recommended_action="auto_fix",
+                        user_message="同一地点の移動カードを削除できます。",
+                        auto_fix={
+                            "target": "phase3_drop_row",
+                            "row_index": int(idx),
+                        },
+                    ))
+                    continue
+
+                if mode in {"train", "transit", "bus"}:
+                    distance_km = _quality_gate_transport_distance(origin, to)
+                    if distance_km is not None and distance_km <= 1.2:
+                        walk_minutes = max(5, int(_estimate_minutes_from_distance(distance_km, "walk")))
+                        checks.append(_quality_gate_make_check(
+                            check_id="short_distance_train_to_walk",
+                            category="transport",
+                            status="fail",
+                            severity="medium",
+                            location=f"Day{day} {start} {origin} → {to}",
+                            evidence=f"直線距離が約{distance_km:.2f}kmで、徒歩圏内なのに {mode} になっています。",
+                            suggestion="近距離のため徒歩移動に補正します。時刻表・実経路ではなく表示上の安全補正です。",
+                            recommended_action="auto_fix",
+                            user_message="徒歩圏内のため、移動手段を徒歩へ補正できます。",
+                            auto_fix={
+                                "target": "phase3_update_transport_to_walk",
+                                "row_index": int(idx),
+                                "duration_minutes": int(walk_minutes),
+                                "distance_km": round(float(distance_km), 2),
+                            },
+                        ))
+
+    # Phase2側の明確な構造化ミスも、Phase3品質の前段原因として記録する
+    if isinstance(df_phase2, pd.DataFrame) and not df_phase2.empty:
+        for idx, row in df_phase2.reset_index(drop=True).iterrows():
+            destination = safe_text(row.get("destination"), "")
+            purpose = safe_text(row.get("purpose"), "").lower()
+            genre = safe_text(row.get("genre"), "").lower()
+            day = safe_text(row.get("day"), "")
+            start = safe_text(row.get("start_time"), "")
+            if (genre == "hotel" or _contains_hotel_token(destination)) and purpose == "transport":
+                checks.append(_quality_gate_make_check(
+                    check_id="phase2_hotel_purpose_transport_mismatch",
+                    category="phase2",
+                    status="fail",
+                    severity="high",
+                    location=f"Phase2 Day{day} {start} {destination}",
+                    evidence="Phase2構造化データでホテルが transport 扱いになっています。",
+                    suggestion="Phase2側の purpose を accommodation に補正し、必要ならPhase2→Phase3を再作成してください。",
+                    recommended_action="auto_fix",
+                    user_message="Phase2のホテル分類を宿泊へ補正できます。",
+                    auto_fix={
+                        "target": "phase2_update_row",
+                        "row_index": int(idx),
+                        "set": {"purpose": "accommodation", "genre": "hotel"},
+                    },
+                ))
+
+    # 相撲など日時依存イベントは自動補正せず、ユーザー確認へ回す
+    combined_text = " ".join([
+        safe_text(natural_plan_text, ""),
+        safe_text(planning_state.get("primary_destination"), ""),
+        " ".join([safe_text(v, "") for v in (planning_state.get("conversation_notes") or [])]),
+        " ".join([safe_text(v, "") for v in (planning_state.get("revision_requests") or [])]),
+    ])
+    wants_sumo = "相撲" in combined_text or "国技館" in combined_text
+    if wants_sumo and isinstance(df_phase3, pd.DataFrame) and not df_phase3.empty:
+        for _, row in df_phase3.reset_index(drop=True).iterrows():
+            destination = safe_text(row.get("destination"), "")
+            if "両国国技館" not in destination:
+                continue
+            date_text = safe_text(row.get("date"), "")
+            # v6.2.83時点の暫定イベント辞書。将来は data/spot_event_dictionary.py 側へ寄せる。
+            try:
+                visit_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+                sumo_start = datetime.strptime("2026-05-10", "%Y-%m-%d").date()
+                sumo_end = datetime.strptime("2026-05-24", "%Y-%m-%d").date()
+                if not (sumo_start <= visit_date <= sumo_end):
+                    checks.append(_quality_gate_make_check(
+                        check_id="sumo_event_date_mismatch",
+                        category="event",
+                        status="fail",
+                        severity="high",
+                        location=f"{date_text} {destination}",
+                        evidence="相撲観戦希望がありますが、登録済みの2026年五月場所期間（2026-05-10〜2026-05-24）外です。",
+                        suggestion="国技館見学・相撲博物館・ちゃんこ料理へ変更するか、開催期間内へ日程変更するかユーザー確認してください。",
+                        recommended_action="ask_user",
+                        user_message="相撲観戦日が開催期間外の可能性があります。国技館見学に変えるか、日程を変更するか確認してください。",
+                    ))
+            except Exception:
+                checks.append(_quality_gate_make_check(
+                    check_id="sumo_event_date_unknown",
+                    category="event",
+                    status="warning",
+                    severity="medium",
+                    location=f"{date_text} {destination}",
+                    evidence="相撲観戦希望がありますが、訪問日の解釈ができません。",
+                    suggestion="公式日程の確認を促してください。",
+                    recommended_action="ask_user",
+                    user_message="相撲観戦日は公式日程の確認が必要です。",
+                ))
+
+    return [_quality_gate_normalize_check(check, source=safe_text(check.get("source"), "code")) for check in checks]
+
+
+def _quality_gate_merge_checks(result: Dict[str, object], code_checks: List[Dict[str, object]]) -> Dict[str, object]:
+    """LLMチェックとコードチェックを統合し、status/score/retry判定を安定化する。"""
+    if not isinstance(result, dict):
+        result = {}
+    llm_checks_raw = result.get("checks") if isinstance(result.get("checks"), list) else []
+    checks: List[Dict[str, object]] = []
+    for check in llm_checks_raw[:20]:
+        if isinstance(check, dict):
+            checks.append(_quality_gate_normalize_check(check, source="llm"))
+    checks.extend(code_checks)
+
+    # 旧形式 issues だけが返った場合も checks へ寄せる
+    if not checks:
+        old_issues = result.get("issues") if isinstance(result.get("issues"), list) else []
+        for issue in old_issues[:12]:
+            if isinstance(issue, dict):
+                checks.append(_quality_gate_normalize_check({
+                    "id": issue.get("type"),
+                    "category": "legacy_issue",
+                    "status": "fail",
+                    "severity": issue.get("severity"),
+                    "location": issue.get("location"),
+                    "evidence": issue.get("problem") or issue.get("issue"),
+                    "suggestion": issue.get("suggestion"),
+                    "recommended_action": issue.get("recommended_action"),
+                    "user_message": issue.get("user_message"),
+                }, source="llm"))
+
+    issues = [_quality_gate_check_to_issue(check) for check in checks if safe_text(check.get("status"), "") in {"fail", "warning"}]
+    has_block = any(safe_text(c.get("recommended_action"), "") == "block" for c in checks)
+    has_ask_user = any(safe_text(c.get("recommended_action"), "") == "ask_user" for c in checks if c.get("status") != "pass")
+    has_retry = any(safe_text(c.get("recommended_action"), "") == "retry_phase2_phase3" for c in checks if c.get("status") != "pass")
+    has_auto_fix = any(safe_text(c.get("recommended_action"), "") == "auto_fix" for c in checks if c.get("status") != "pass")
+
+    if has_block:
+        status = "fatal"
+    elif has_ask_user:
+        status = "user_confirmation_required"
+    elif has_auto_fix:
+        status = "auto_fix_available"
+    elif has_retry:
+        status = "retry_recommended"
+    elif issues:
+        status = "user_confirmation_required"
+    else:
+        status = "ok"
+
+    score = 100
+    for check in checks:
+        if check.get("status") == "pass":
+            continue
+        sev = safe_text(check.get("severity"), "medium")
+        score -= {"low": 5, "medium": 10, "high": 22, "critical": 35}.get(sev, 10)
+    score = max(0, min(100, score))
+
+    result["checks"] = checks
+    result["issues"] = issues
+    result["overall_status"] = status
+    result["score"] = score
+    if not safe_text(result.get("summary"), ""):
+        if status == "ok":
+            result["summary"] = "チェックリスト上の大きな問題は見つかりませんでした。"
+        elif status == "auto_fix_available":
+            result["summary"] = "明確に安全補正できる項目が見つかりました。"
+        elif status == "retry_recommended":
+            result["summary"] = "Phase2→Phase3の再作成で改善する可能性があります。"
+        else:
+            result["summary"] = "ユーザー確認が必要な項目があります。"
+
+    if has_retry:
+        result["retry_scope"] = "phase2_phase3_only"
+        result["safe_to_auto_retry"] = True
+    else:
+        result["retry_scope"] = safe_text(result.get("retry_scope"), "none")
+        result["safe_to_auto_retry"] = bool(result.get("safe_to_auto_retry", False))
+    if has_ask_user or has_block:
+        result["safe_to_auto_retry"] = False
+    return result
+
+
+def _quality_gate_resequence(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    working = df.reset_index(drop=True).copy()
+    if "day" in working.columns and "sequence" in working.columns:
+        try:
+            working = working.sort_values(["day", "sequence"], kind="stable").reset_index(drop=True)
+            working["sequence"] = working.groupby("day").cumcount() + 1
+        except Exception:
+            pass
+    return working
+
+
+def _apply_quality_gate_safe_autofixes(result: Dict[str, object]) -> Dict[str, object]:
+    """Quality Gateのうち、コード側で明確に安全と判定できる補正だけを即時反映する。"""
+    checks = result.get("checks") if isinstance(result, dict) else []
+    if not isinstance(checks, list):
+        return result
+
+    df2 = st.session_state.get("df_phase2")
+    df3 = st.session_state.get("df_phase3")
+    if isinstance(df2, pd.DataFrame):
+        df2_work = df2.copy().reset_index(drop=True)
+    else:
+        df2_work = None
+    if isinstance(df3, pd.DataFrame):
+        df3_work = df3.copy().reset_index(drop=True)
+    else:
+        df3_work = None
+
+    notes: List[str] = []
+    drop_phase3_indexes = set()
+    changed_df2 = False
+    changed_df3 = False
+
+    for check in checks:
+        if not isinstance(check, dict) or safe_text(check.get("recommended_action"), "") != "auto_fix":
+            continue
+        auto_fix = check.get("auto_fix")
+        if not isinstance(auto_fix, dict):
+            continue
+        target = safe_text(auto_fix.get("target"), "")
+
+        if target == "phase3_drop_after_index" and df3_work is not None:
+            try:
+                terminal_index = int(auto_fix.get("terminal_index"))
+                if terminal_index >= 0 and terminal_index < len(df3_work) - 1:
+                    tail_count = len(df3_work) - terminal_index - 1
+                    df3_work = df3_work.iloc[:terminal_index + 1].reset_index(drop=True)
+                    changed_df3 = True
+                    notes.append(f"帰着後の後続ノード {tail_count} 件を削除しました。")
+            except Exception:
+                continue
+
+        elif target == "phase3_drop_row" and df3_work is not None:
+            try:
+                row_index = int(auto_fix.get("row_index"))
+                if 0 <= row_index < len(df3_work):
+                    drop_phase3_indexes.add(row_index)
+                    notes.append(f"同一地点移動カードを削除しました: row {row_index}")
+            except Exception:
+                continue
+
+        elif target == "phase3_update_transport_to_walk" and df3_work is not None:
+            try:
+                row_index = int(auto_fix.get("row_index"))
+                minutes = int(auto_fix.get("duration_minutes") or 5)
+                if 0 <= row_index < len(df3_work):
+                    df3_work.at[row_index, "transport_mode"] = "walk"
+                    df3_work.at[row_index, "duration_minutes"] = minutes
+                    df3_work.at[row_index, "estimated_duration_label"] = f"約{minutes}分（徒歩補正）"
+                    df3_work.at[row_index, "route_data_source"] = "quality_gate_safe_autofix"
+                    df3_work.at[row_index, "one_point"] = _quality_gate_append_note(
+                        df3_work.at[row_index, "one_point"] if "one_point" in df3_work.columns else "",
+                        "Quality Gate: 徒歩圏内のため徒歩移動に補正。元の時間枠は余裕時間として保持。"
+                    )
+                    changed_df3 = True
+                    origin = safe_text(df3_work.at[row_index, "route_from"], "")
+                    to = safe_text(df3_work.at[row_index, "route_to"], "")
+                    notes.append(f"近距離移動を徒歩へ補正しました: {origin} → {to} / 約{minutes}分")
+            except Exception:
+                continue
+
+        elif target == "phase3_update_row" and df3_work is not None:
+            try:
+                row_index = int(auto_fix.get("row_index"))
+                set_values = auto_fix.get("set") if isinstance(auto_fix.get("set"), dict) else {}
+                if 0 <= row_index < len(df3_work):
+                    for key, value in set_values.items():
+                        if key in df3_work.columns:
+                            df3_work.at[row_index, key] = value
+                    changed_df3 = True
+                    notes.append(f"完成旅程の分類を補正しました: row {row_index}")
+            except Exception:
+                continue
+
+        elif target == "phase2_update_row" and df2_work is not None:
+            try:
+                row_index = int(auto_fix.get("row_index"))
+                set_values = auto_fix.get("set") if isinstance(auto_fix.get("set"), dict) else {}
+                if 0 <= row_index < len(df2_work):
+                    for key, value in set_values.items():
+                        if key in df2_work.columns:
+                            df2_work.at[row_index, key] = value
+                    changed_df2 = True
+                    notes.append(f"Phase2の分類を補正しました: row {row_index}")
+            except Exception:
+                continue
+
+    if df3_work is not None and drop_phase3_indexes:
+        df3_work = df3_work.drop(index=sorted(drop_phase3_indexes)).reset_index(drop=True)
+        changed_df3 = True
+
+    if changed_df2 and df2_work is not None:
+        st.session_state.df_phase2 = _quality_gate_resequence(df2_work)
+    if changed_df3 and df3_work is not None:
+        st.session_state.df_phase3 = _quality_gate_resequence(df3_work)
+        st.session_state.execution_engine = ExecutionEngine(st.session_state.df_phase3)
+
+    if notes:
+        st.session_state.quality_gate_autofix_summary = notes
+        result["auto_fix_summary"] = notes
+        result["overall_status"] = "auto_fix_applied" if result.get("overall_status") == "auto_fix_available" else result.get("overall_status")
+        log_event("Quality Gate安全補正", " / ".join(notes), level="info")
+    else:
+        st.session_state.quality_gate_autofix_summary = []
+        result["auto_fix_summary"] = []
+    return result
+
+
 def run_current_quality_gate() -> Dict[str, object]:
     if external_run_quality_gate is None:
         return {
@@ -1173,11 +1730,12 @@ def run_current_quality_gate() -> Dict[str, object]:
     df_phase2 = st.session_state.get("df_phase2")
     df_phase3 = st.session_state.get("df_phase3")
 
+    planning_state = dict(st.session_state.get("planning_state") or {})
     result = external_run_quality_gate(
         natural_plan_text=natural_plan_text,
         phase2_text=_quality_gate_dataframe_text(df_phase2, "Phase2"),
         phase3_text=_quality_gate_dataframe_text(df_phase3, "Phase3"),
-        planning_state=dict(st.session_state.get("planning_state") or {}),
+        planning_state=planning_state,
         app_logs_text=_quality_gate_logs_text(),
         logger=log_event,
     )
@@ -1186,11 +1744,21 @@ def run_current_quality_gate() -> Dict[str, object]:
             "overall_status": "user_confirmation_required",
             "score": 0,
             "summary": "Quality Gate Agent の返却形式が不正です。",
+            "checks": [],
             "issues": [],
             "safe_to_auto_retry": False,
             "retry_scope": "none",
             "raw": safe_text(result, ""),
         }
+
+    code_checks = _quality_gate_build_code_checks(
+        df_phase2=df_phase2,
+        df_phase3=df_phase3,
+        planning_state=planning_state,
+        natural_plan_text=natural_plan_text,
+    )
+    result = _quality_gate_merge_checks(result, code_checks)
+    result = _apply_quality_gate_safe_autofixes(result)
     return result
 
 
@@ -1248,6 +1816,7 @@ def retry_phase2_phase3_from_existing_phase1_by_quality_gate() -> Dict[str, str]
     st.session_state.quality_gate_result = None
     st.session_state.quality_gate_raw = ""
     st.session_state.quality_gate_user_accepted = False
+    st.session_state.quality_gate_autofix_summary = []
     st.session_state.validation_agent_result = None
     st.session_state.validation_agent_raw = ""
 
