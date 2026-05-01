@@ -108,9 +108,10 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # - v6.2.79: 上高地bus例外を「沢渡/平湯等ゲート↔上高地内」に限定。ホテル宿泊時刻は表示専用で翌朝表記へ補正。2日目以降の出発地点アンカーを安定表示。
 # - v6.2.80: 本番transportへは接続せず、左サイドバーに距離ベース移動時間テストとGemini移動エージェントテストを追加。
+# - v6.2.81: 完成旅程の移動カードに距離ベース参考時間を表示。旅程時刻・duration・Phase3ロジックは変更しない。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.80-transport-estimation-test-panel"
+APP_VERSION_NAME = "v6.2.81-transport-distance-reference-card"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -8323,6 +8324,12 @@ def render_itinerary_cards(
                         st.markdown("<div class='vf-card-note' style='font-weight:700;background:#ececec;color:#555;'>キャンセル</div>", unsafe_allow_html=True)
                     if note:
                         st.markdown(f"<div class='vf-card-note'>差分: {note}</div>", unsafe_allow_html=True)
+
+                    # --- 修正箇所(v6.2.81): 完成旅程の移動カードに距離ベース参考時間だけを表示 ---
+                    # 旅程データや時刻は変更せず、完成旅程(plan)の表示専用に限定する。
+                    if transport_edit_scope == "plan" and status_label != "キャンセル":
+                        render_transport_distance_reference_for_card(origin, destination)
+
                     st.link_button("🗺️ Google Mapsでルートを見る", route_url, use_container_width=True)
 
                     # 修正箇所: タクシー移動カードのときだけ Uber 導線を表示
@@ -9251,6 +9258,62 @@ def _render_distance_transport_result_for_test(result: Dict[str, object]) -> Non
             "destination": result.get("destination_geocode"),
             "distance_km": result.get("distance_km"),
         })
+
+
+# =========================================================
+# 修正箇所(v6.2.81): 完成旅程の移動カード用 距離ベース参考時間
+# - v6.2.80の距離ベース推定を表示専用で再利用
+# - 完成旅程の時刻 / duration_minutes / Phase3生成ロジックは変更しない
+# - 取得失敗時はカード表示を邪魔しないよう非表示
+# =========================================================
+def render_transport_distance_reference_for_card(origin: str, destination: str) -> None:
+    origin_name = _normalize_route_query_name(origin)
+    destination_name = _normalize_route_query_name(destination)
+    if not origin_name or not destination_name:
+        return
+    if origin_name in {"現在地", "-"} or destination_name in {"現在地", "-"}:
+        return
+    if _same_effective_place(origin_name, destination_name):
+        return
+
+    try:
+        result = build_distance_transport_estimate_for_test(origin_name, destination_name)
+    except Exception as e:
+        log_event("距離ベース参考時間", f"表示用推定に失敗: {origin_name} → {destination_name} / {e}", level="warning")
+        return
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        if st.session_state.get("debug_mode"):
+            error_text = ""
+            if isinstance(result, dict):
+                error_text = safe_text(result.get("error"), "")
+            st.caption(f"距離ベース参考時間を表示できませんでした: {error_text}")
+        return
+
+    estimates = result.get("estimates") if isinstance(result.get("estimates"), list) else []
+    estimate_map = {}
+    for item in estimates:
+        if isinstance(item, dict):
+            estimate_map[safe_text(item.get("mode"), "")] = safe_text(item.get("display"), "")
+
+    walk_text = estimate_map.get("walk", "要確認")
+    car_text = estimate_map.get("car", "要確認")
+    train_text = estimate_map.get("train", "要確認")
+
+    try:
+        distance_text = f"{float(result.get('distance_km', 0)):.2f}km"
+    except Exception:
+        distance_text = safe_text(result.get("distance_km"), "-")
+
+    reference_html = (
+        '<div class="vf-card-note" style="background:#eef6ff;color:#17324d;border-color:#bdd7f2;">'
+        '<div style="font-weight:800;margin-bottom:4px;">📏 参考移動時間（距離ベース）</div>'
+        f'<div>直線距離: <b>{html.escape(distance_text)}</b></div>'
+        f'<div>徒歩: {html.escape(walk_text)}　/　車: {html.escape(car_text)}　/　電車: {html.escape(train_text)}</div>'
+        '<div style="font-size:12px;opacity:0.82;margin-top:4px;">直線距離からの推測です。実経路・時刻表ではありません。</div>'
+        '</div>'
+    )
+    st.markdown(reference_html, unsafe_allow_html=True)
 
 
 def _render_gemini_route_agent_result_for_test(result: Dict[str, object]) -> None:
