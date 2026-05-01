@@ -85,6 +85,28 @@ except Exception:
 
 
 # =========================================================
+# 修正箇所(v6.2.82): Quality Gate / Sidebar Dev Tools 外付け
+# - Geminiには完成旅程の品質判定だけを任せる
+# - 自動修正は行わず、Phase2→Phase3再作成ボタンでユーザー判断に委ねる
+# - サイドバー診断ツールは ui/sidebar_dev_tools.py 側へ分離し、通常時は非表示
+# =========================================================
+try:
+    from services.quality_gate_agent import run_quality_gate as external_run_quality_gate
+except Exception:
+    external_run_quality_gate = None
+
+try:
+    from ui.sidebar_dev_tools import render_sidebar_dev_tools
+except Exception:
+    render_sidebar_dev_tools = None
+
+try:
+    from ui.quality_gate_panel import render_quality_gate_panel_ui
+except Exception:
+    render_quality_gate_panel_ui = None
+
+
+# =========================================================
 # 【バージョン名】VoyageFlow v6.2.55-hotel-destination-and-long-return-guard
 # 【制作日】2026-04-27
 # 【前バージョンからの修正内容】
@@ -109,9 +131,11 @@ except Exception:
 # - v6.2.79: 上高地bus例外を「沢渡/平湯等ゲート↔上高地内」に限定。ホテル宿泊時刻は表示専用で翌朝表記へ補正。2日目以降の出発地点アンカーを安定表示。
 # - v6.2.80: 本番transportへは接続せず、左サイドバーに距離ベース移動時間テストとGemini移動エージェントテストを追加。
 # - v6.2.81: 完成旅程の移動カードに距離ベース参考時間を表示。旅程時刻・duration・Phase3ロジックは変更しない。
+# - v6.2.82: Quality Gateを追加。自動修正はせず、問題判定後にPhase2→Phase3だけ再作成できるボタンを追加。
+# - v6.2.82: サイドバー診断ツールと生成温度/デバッグモードを開発者ツール内へ隠し、診断UIを ui/sidebar_dev_tools.py へ分離。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.81-transport-distance-reference-card"
+APP_VERSION_NAME = "v6.2.82-quality-gate-devtools-cleanup"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -680,6 +704,17 @@ def init_session_state() -> None:
         "execution_monitor_manual_location": "",
         "execution_monitor_manual_lat": "",
         "execution_monitor_manual_lng": "",
+
+        # 修正箇所(v6.2.82): 開発者ツールの通常時非表示化
+        "show_developer_tools": False,
+
+        # 修正箇所(v6.2.82): Quality Gate / Phase2→Phase3再作成管理
+        "quality_gate_result": None,
+        "quality_gate_raw": "",
+        "quality_gate_last_signature": "",
+        "quality_gate_retry_count": 0,
+        "quality_gate_issue_history": [],
+        "quality_gate_user_accepted": False,
     }
 
     for key, value in defaults.items():
@@ -1038,6 +1073,199 @@ def render_phase35_validation_panel(natural_plan_text: str, df: pd.DataFrame) ->
 
     with st.expander("検証エージェントの生出力（デバッグ用）", expanded=False):
         st.code(st.session_state.get("validation_agent_raw", ""), language="json")
+
+
+
+
+# =========================================================
+# 修正箇所(v6.2.82): Quality Gate + Phase2→Phase3再作成ボタン
+# - Geminiには判定だけをさせる
+# - 旅程データの修正は自動実行しない
+# - 必要時のみユーザー操作で Phase2→Phase3 を再作成する
+# =========================================================
+def _quality_gate_dataframe_text(df: pd.DataFrame, label: str, max_rows: int = 80) -> str:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return f"{label}: empty"
+
+    cols = [
+        col for col in [
+            "day", "sequence", "date", "start_time", "end_time",
+            "destination", "purpose", "genre", "duration_minutes",
+            "is_transport", "transport_mode", "route_from", "route_to",
+            "one_point", "route_data_source", "estimated_duration_label"
+        ] if col in df.columns
+    ]
+    working = df[cols].copy().reset_index(drop=True).head(max_rows)
+    lines = [f"{label}: rows={len(df)} showing={len(working)}"]
+    for _, row in working.iterrows():
+        is_transport = bool(row.get("is_transport", False))
+        day = safe_text(row.get("day"), "")
+        start_time = safe_text(row.get("start_time"), "")
+        end_time = safe_text(row.get("end_time"), "")
+        destination = safe_text(row.get("destination"), "")
+        purpose = safe_text(row.get("purpose"), "")
+        genre = safe_text(row.get("genre"), "")
+        transport_mode = safe_text(row.get("transport_mode"), "")
+        route_from = safe_text(row.get("route_from"), "")
+        route_to = safe_text(row.get("route_to"), "")
+        note = safe_text(row.get("one_point"), "")
+        if is_transport:
+            lines.append(
+                f"Day{day} {start_time}-{end_time} TRANSPORT {route_from or destination} -> {route_to or destination} "
+                f"/ mode={transport_mode} / note={note}"
+            )
+        else:
+            lines.append(
+                f"Day{day} {start_time}-{end_time} SPOT {destination} "
+                f"/ purpose={purpose} / genre={genre} / note={note}"
+            )
+    return "\n".join(lines)
+
+
+def _quality_gate_logs_text(max_items: int = 36) -> str:
+    logs = st.session_state.get("app_logs") or []
+    if not isinstance(logs, list) or not logs:
+        return "logs: empty"
+    lines = []
+    for item in logs[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        ts = safe_text(item.get("timestamp"), "")
+        phase = safe_text(item.get("phase"), "")
+        level = safe_text(item.get("level"), "")
+        message = safe_text(item.get("message"), "")
+        lines.append(f"[{ts}] {phase} / {level}: {message}")
+    return "\n".join(lines)
+
+
+def _quality_gate_issue_signature(result: Dict[str, object]) -> str:
+    issues = result.get("issues") if isinstance(result, dict) else []
+    if not isinstance(issues, list):
+        return ""
+    parts = []
+    for issue in issues[:6]:
+        if not isinstance(issue, dict):
+            continue
+        parts.append(
+            "|".join([
+                safe_text(issue.get("type"), ""),
+                safe_text(issue.get("severity"), ""),
+                safe_text(issue.get("location"), ""),
+                safe_text(issue.get("problem"), ""),
+            ])
+        )
+    return "\n".join(parts)
+
+
+def run_current_quality_gate() -> Dict[str, object]:
+    if external_run_quality_gate is None:
+        return {
+            "overall_status": "user_confirmation_required",
+            "score": 0,
+            "summary": "Quality Gate Agent を読み込めませんでした。services/quality_gate_agent.py が配置されているか確認してください。",
+            "issues": [],
+            "safe_to_auto_retry": False,
+            "retry_scope": "none",
+            "raw": "",
+        }
+
+    natural_plan_text = safe_text(st.session_state.get("trip_plan"), "") or safe_text(st.session_state.get("trip_plan_draft"), "")
+    df_phase2 = st.session_state.get("df_phase2")
+    df_phase3 = st.session_state.get("df_phase3")
+
+    result = external_run_quality_gate(
+        natural_plan_text=natural_plan_text,
+        phase2_text=_quality_gate_dataframe_text(df_phase2, "Phase2"),
+        phase3_text=_quality_gate_dataframe_text(df_phase3, "Phase3"),
+        planning_state=dict(st.session_state.get("planning_state") or {}),
+        app_logs_text=_quality_gate_logs_text(),
+        logger=log_event,
+    )
+    if not isinstance(result, dict):
+        result = {
+            "overall_status": "user_confirmation_required",
+            "score": 0,
+            "summary": "Quality Gate Agent の返却形式が不正です。",
+            "issues": [],
+            "safe_to_auto_retry": False,
+            "retry_scope": "none",
+            "raw": safe_text(result, ""),
+        }
+    return result
+
+
+def retry_phase2_phase3_from_existing_phase1_by_quality_gate() -> Dict[str, str]:
+    trip_plan = safe_text(st.session_state.get("trip_plan"), "") or safe_text(st.session_state.get("trip_plan_draft"), "")
+    if not trip_plan:
+        raise ValueError("再作成に使う Phase1 自然文案がありません。")
+
+    s = _get_active_trip_context(st.session_state.planning_state)
+    st.session_state.planning_state.update({
+        "trip_days": s.get("trip_days", st.session_state.planning_state.get("trip_days")),
+        "primary_destination": s.get("primary_destination", st.session_state.planning_state.get("primary_destination")),
+        "transport_style": s.get("transport_style", st.session_state.planning_state.get("transport_style")),
+        "budget_style": s.get("budget_style", st.session_state.planning_state.get("budget_style")),
+    })
+
+    log_event("Quality Gate", "Phase1は維持し、Phase2→Phase3のみ再作成します。", level="info")
+    structurer = Phase2Structuring(logger=log_event)
+    df2 = structurer.structure_trip_plan(trip_plan, s["start_date"])
+    if df2 is None or df2.empty:
+        raise ValueError("Quality Gate再作成: Phase2構造化に失敗しました。")
+
+    df2 = normalize_phase2_dataframe(df2, s)
+    df2 = _annotate_phase2_transport_modes(df2, s)
+    log_phase2_transport_misclassification(df2)
+
+    df3 = build_phase3_from_sequential_destinations(df2, s)
+    if df3 is None or df3.empty:
+        raise ValueError("Quality Gate再作成: Phase3生成に失敗しました。")
+
+    df3 = _trim_rows_after_terminal_return(df3, s)
+    gap_messages = inspect_transport_step_gaps(df3)
+    if gap_messages:
+        for msg in gap_messages:
+            log_event("Quality Gate検査", msg, level="warning")
+    else:
+        log_event("Quality Gate検査", "再作成後、スポット間の移動カード欠落は検出されませんでした。", level="info")
+
+    st.session_state.trip_plan = trip_plan
+    st.session_state.df_phase2 = df2.reset_index(drop=True)
+    st.session_state.df_phase3 = df3.reset_index(drop=True)
+    st.session_state.execution_engine = ExecutionEngine(st.session_state.df_phase3)
+    st.session_state.plan_approved = True
+    st.session_state.active_tab = "final_itinerary"
+
+    st.session_state.quality_gate_retry_count = int(st.session_state.get("quality_gate_retry_count", 0) or 0) + 1
+    history = st.session_state.get("quality_gate_issue_history")
+    if not isinstance(history, list):
+        history = []
+    if st.session_state.get("quality_gate_last_signature"):
+        history.append(st.session_state.get("quality_gate_last_signature"))
+    st.session_state.quality_gate_issue_history = history[-6:]
+
+    # 再作成後の判定結果は古くなるためクリア
+    st.session_state.quality_gate_result = None
+    st.session_state.quality_gate_raw = ""
+    st.session_state.quality_gate_user_accepted = False
+    st.session_state.validation_agent_result = None
+    st.session_state.validation_agent_raw = ""
+
+    return {"message": "Phase1自然文案は維持し、Phase2→Phase3だけ再作成しました。"}
+
+
+def render_quality_gate_panel() -> None:
+    if render_quality_gate_panel_ui is None:
+        st.markdown("### 🧭 Quality Gate（完成旅程チェック）")
+        st.warning("ui/quality_gate_panel.py を読み込めませんでした。Quality Gate UIは非表示です。")
+        return
+
+    render_quality_gate_panel_ui(
+        run_current_quality_gate=run_current_quality_gate,
+        retry_phase2_phase3_from_existing_phase1=retry_phase2_phase3_from_existing_phase1_by_quality_gate,
+        safe_text=safe_text,
+        log_event=log_event,
+    )
 
 
 def _phase35_normalize_issue_type(issue_type: str) -> str:
@@ -9457,282 +9685,44 @@ def render_transport_estimation_test_panel() -> None:
 
 # =========================================================
 # サイドバー
+# 修正箇所(v6.2.82): 診断ツールを外部化し、通常時は非表示
 # =========================================================
 with st.sidebar:
-    st.title("⚙️ 設定")
-    st.session_state.temperature = st.slider("Gemini 生成温度", 0.0, 1.0, st.session_state.temperature, 0.1)
-    st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
-
-    st.divider()
-    render_internal_logs_sidebar()
-
-    st.divider()
-    st.markdown("### VoyageFlow")
-    st.caption("モデル: models/gemini-3.1-flash-lite-preview")
-
-    # --- 修正箇所: Gemini transport resolver A/Bテストをサイドバー固定スペースへ追加 ---
-    render_gemini_transport_ab_test_panel()
-
-    # --- 修正箇所(v6.2.80): 左サイドバー専用の距離ベース/Gemini移動エージェント診断を追加 ---
-    render_transport_estimation_test_panel()
-
-    # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
-    with st.expander("🛠 Routes診断", expanded=False):
-        diag_origin = st.text_input("出発地", value="福井駅", key="routes_diag_origin")
-        diag_destination = st.text_input("到着地", value="東京駅", key="routes_diag_destination")
-        diag_mode = st.selectbox("移動手段", options=["train", "walk", "car", "taxi", "bike"], index=0, key="routes_diag_mode")
-        diag_departure = st.text_input("出発日時 (YYYY-MM-DD HH:MM)", value="2026-04-19 12:05", key="routes_diag_departure")
-
-        if st.button("🚨 Routes診断を実行", use_container_width=True, key="run_routes_diagnostic"):
-            try:
-                from route_diagnostic import geocode_place, ROUTES_URL
-                import requests
-                api_key = st.secrets.get("MAPS_API_KEY") or os.getenv("MAPS_API_KEY")
-                if not api_key:
-                    st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
-                else:
-                    origin_raw = str(diag_origin or "")
-                    destination_raw = str(diag_destination or "")
-                    origin_clean = origin_raw.strip()
-                    destination_clean = destination_raw.strip()
-                    departure_raw = str(diag_departure or "").strip()
-                    departure_iso = parse_route_diagnostic_departure_iso(departure_raw)
-
-                    st.write("geocode入力値")
-                    st.json({
-                        "origin_raw": origin_raw,
-                        "origin_clean": origin_clean,
-                        "destination_raw": destination_raw,
-                        "destination_clean": destination_clean,
-                        "mode": diag_mode,
-                        "departure_raw": departure_raw,
-                        "departure_iso": departure_iso or departure_raw,
-                    })
-
-                    origin = geocode_place(origin_clean, api_key)
-                    destination = geocode_place(destination_clean, api_key)
-                    st.write("geocode結果")
-                    st.json({"origin": origin, "destination": destination})
-                    if not origin or not destination:
-                        st.error("地名解決に失敗しました。まずは geocode入力値 の origin_clean / destination_clean が駅名やスポット名だけになっているか確認してください。")
-                    else:
-                        body = build_route_diagnostic_body(origin, destination, diag_mode, departure_raw)
-                        headers = {
-                            "Content-Type": "application/json",
-                            "X-Goog-Api-Key": api_key,
-                            # 診断ではまずレスポンス全体を確認する
-                            "X-Goog-FieldMask": "*",
-                        }
-                        masked_headers = dict(headers)
-                        if masked_headers.get("X-Goog-Api-Key"):
-                            raw_key = str(masked_headers["X-Goog-Api-Key"])
-                            if len(raw_key) > 8:
-                                masked_headers["X-Goog-Api-Key"] = raw_key[:4] + "..." + raw_key[-4:]
-                            else:
-                                masked_headers["X-Goog-Api-Key"] = "***"
-                        st.write("request headers")
-                        st.json(masked_headers)
-                        st.write("request body")
-                        st.json(body)
-                        response = requests.post(ROUTES_URL, json=body, headers=headers, timeout=20)
-                        st.write(f"HTTP status: {response.status_code}")
-                        st.write("response headers")
-                        st.json(dict(response.headers))
-                        st.write("response text")
-                        st.code(response.text or "<empty response>", language="json")
-                        try:
-                            data = response.json() if response.text.strip() else {}
-                        except Exception:
-                            data = {"raw_text": response.text}
-                        st.write("response")
-                        st.json(data)
-                        routes = data.get("routes") if isinstance(data, dict) else None
-                        if isinstance(routes, list):
-                            st.write("routes件数")
-                            st.write(len(routes))
-                            if routes:
-                                first = routes[0]
-                                st.write("1件目の要約")
-                                st.json({
-                                    "distanceMeters": first.get("distanceMeters"),
-                                    "duration": first.get("duration"),
-                                    "legs_count": len(first.get("legs", []) or []),
-                                    "has_polyline": bool(((first.get("polyline") or {}).get("encodedPolyline"))),
-                                })
-            except Exception as e:
-                st.error(f"Routes診断エラー: {e}")
-
-    # --- 修正箇所: Google Directions API (Legacy) 単体診断をサイドバーに追加 ---
-    with st.expander("🧪 Google Directions診断", expanded=False):
-        gd_origin = st.text_input("Directions 出発地", value="東京駅", key="gd_diag_origin")
-        gd_destination = st.text_input("Directions 到着地", value="国立博物館", key="gd_diag_destination")
-        gd_mode = st.selectbox(
-            "Directions 移動手段",
-            options=["train", "bus", "walk", "car", "taxi"],
-            index=0,
-            key="gd_diag_mode",
+    if render_sidebar_dev_tools is not None:
+        render_sidebar_dev_tools(
+            app_name="VoyageFlow",
+            model_name="models/gemini-3.1-flash-lite-preview",
+            reset_all=reset_all,
+            render_internal_logs_sidebar=render_internal_logs_sidebar,
+            render_gemini_transport_ab_test_panel=render_gemini_transport_ab_test_panel,
+            render_transport_estimation_test_panel=render_transport_estimation_test_panel,
+            parse_route_diagnostic_departure_iso=parse_route_diagnostic_departure_iso,
+            build_route_diagnostic_body=build_route_diagnostic_body,
+            get_maps_api_key=_get_maps_api_key,
+            normalize_route_query_name=_normalize_route_query_name,
+            build_google_directions_location_query=_build_google_directions_location_query,
+            google_directions_mode_for_transport=_google_directions_mode_for_transport,
+            fetch_google_directions_legacy=_fetch_google_directions_legacy,
+            fetch_google_directions_transit_station_trial=_fetch_google_directions_transit_station_trial,
+            safe_text=safe_text,
         )
-        gd_departure = st.text_input(
-            "Directions 出発日時 (YYYY-MM-DD HH:MM)",
-            value="2026-04-30 10:00",
-            key="gd_diag_departure",
+    else:
+        # sidebar_dev_tools.py が未配置でも起動だけはできるようにする最小fallback
+        st.markdown("### VoyageFlow")
+        st.caption("モデル: models/gemini-3.1-flash-lite-preview")
+        st.warning("ui/sidebar_dev_tools.py を読み込めませんでした。開発者ツールは非表示です。")
+        st.session_state.show_developer_tools = st.checkbox(
+            "開発者ツールを表示",
+            value=bool(st.session_state.get("show_developer_tools", False)),
+            key="show_developer_tools_fallback",
         )
-
-        if st.button("🧪 Directions診断を実行", use_container_width=True, key="run_google_directions_diag"):
-            try:
-                api_key = _get_maps_api_key()
-                st.write("APIキー状態")
-                st.json({
-                    "has_api_key": bool(api_key),
-                    "api_key_preview": (api_key[:4] + "..." + api_key[-4:]) if api_key and len(api_key) > 8 else ("***" if api_key else ""),
-                })
-                if not api_key:
-                    st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
-                else:
-                    origin_raw = str(gd_origin or "")
-                    destination_raw = str(gd_destination or "")
-                    origin_clean = _normalize_route_query_name(origin_raw)
-                    destination_clean = _normalize_route_query_name(destination_raw)
-                    query_origin = _build_google_directions_location_query(origin_clean, None, None)
-                    query_destination = _build_google_directions_location_query(destination_clean, None, None)
-                    departure_raw = str(gd_departure or "").strip()
-                    api_mode = _google_directions_mode_for_transport(gd_mode)
-
-                    st.write("入力正規化")
-                    st.json({
-                        "origin_raw": origin_raw,
-                        "origin_clean": origin_clean,
-                        "origin_query": query_origin,
-                        "destination_raw": destination_raw,
-                        "destination_clean": destination_clean,
-                        "destination_query": query_destination,
-                        "transport_mode": gd_mode,
-                        "api_mode": api_mode,
-                        "departure": departure_raw,
-                    })
-
-                    result, debug_info = _fetch_google_directions_legacy(
-                        query_origin,
-                        query_destination,
-                        gd_mode,
-                        departure_raw[:10] if len(departure_raw) >= 10 else "",
-                        departure_raw[11:16] if len(departure_raw) >= 16 else "09:00",
-                        return_debug=True,
-                    )
-                    st.write("GoogleDirections 生レスポンス診断")
-                    st.json(debug_info or {})
-                    st.write("Directions結果（整形済み）")
-                    st.json(result or {})
-
-                    if not result:
-                        st.warning("Directions API から結果を取得できませんでした。上の GoogleDirections 生レスポンス診断 を確認してください。")
-                    else:
-                        st.markdown("**診断サマリー**")
-                        st.json({
-                            "source": result.get("source"),
-                            "mode": result.get("mode"),
-                            "minutes": result.get("minutes"),
-                            "distance_meters": result.get("distance_meters"),
-                            "fare_text": result.get("fare_text"),
-                            "summary": result.get("summary"),
-                            "steps_count": len(result.get("steps") or []),
-                            "has_transit_steps": any((step.get("travel_mode") == "TRANSIT") for step in (result.get("steps") or [])),
-                        })
-                        steps = result.get("steps") or []
-                        if steps:
-                            st.markdown("**ステップ詳細**")
-                            for idx, step in enumerate(steps, start=1):
-                                st.write(f"{idx}. {step.get('travel_mode')} / {step.get('duration_text')} / {step.get('instruction_text')}")
-                                if step.get("transit_details"):
-                                    st.json(step.get("transit_details"))
-            except Exception as e:
-                st.error(f"Directions診断エラー: {e}")
-
-
-    # --- 修正箇所(v6.2.62): 左サイドバー専用の駅名抽出トライ ---
-    # 完成旅程・簡易一覧には反映しない。Google Directions transit_details から駅名が取れるかだけ検証する。
-    with st.expander("🧪 Transit駅名抽出トライ", expanded=False):
-        st.caption("Directions API の transit_details から departure_stop / arrival_stop を取れるかだけ確認します。完成旅程には反映しません。")
-        st.caption("v6.2.63: 出発日時は Asia/Tokyo(JST) として epoch 化します。`now` または epoch秒の直接入力も診断できます。")
-        trial_origin = st.text_input("駅名抽出 出発地", value="仲見世商店街", key="station_trial_origin")
-        trial_destination = st.text_input("駅名抽出 到着地", value="上野", key="station_trial_destination")
-        trial_departure = st.text_input(
-            "駅名抽出 出発日時 (YYYY-MM-DD HH:MM / now / epoch秒)",
-            value="2026-05-06 12:00",
-            key="station_trial_departure",
-        )
-        if st.button("🚉 駅名抽出を試す", use_container_width=True, key="run_station_name_trial"):
-            try:
-                api_key = _get_maps_api_key()
-                if not api_key:
-                    st.error("MAPS_API_KEY が見つかりません。Secrets または環境変数を確認してください。")
-                else:
-                    origin_clean = _normalize_route_query_name(trial_origin)
-                    destination_clean = _normalize_route_query_name(trial_destination)
-                    query_origin = _build_google_directions_location_query(origin_clean, None, None)
-                    query_destination = _build_google_directions_location_query(destination_clean, None, None)
-                    departure_raw = str(trial_departure or "").strip()
-                    result, debug_info = _fetch_google_directions_transit_station_trial(
-                        origin_query=query_origin,
-                        destination_query=query_destination,
-                        departure_raw=departure_raw,
-                    )
-
-                    st.write("入力正規化")
-                    st.json({
-                        "origin_raw": trial_origin,
-                        "origin_clean": origin_clean,
-                        "origin_query": query_origin,
-                        "destination_raw": trial_destination,
-                        "destination_clean": destination_clean,
-                        "destination_query": query_destination,
-                        "departure": departure_raw,
-                        "timezone_assumption": "Asia/Tokyo",
-                        "note": "この結果は完成旅程には反映していません。",
-                    })
-                    st.write("時刻変換診断")
-                    st.json((debug_info or {}).get("departure_parse", {}))
-                    st.write("Directions API 診断")
-                    st.json(debug_info or {})
-
-                    if not result:
-                        st.warning("駅名抽出に使える transit 結果を取得できませんでした。API status / error_message / response preview を確認してください。")
-                    else:
-                        station_label = safe_text(result.get("station_label"), "")
-                        if station_label:
-                            st.success(f"抽出候補: 電車：{station_label}")
-                        else:
-                            st.warning("Directions結果は取得できましたが、departure_stop / arrival_stop が空でした。")
-                        st.write("駅名抽出結果")
-                        st.json({
-                            "station_label": station_label,
-                            "duration_text": result.get("duration_text"),
-                            "distance_text": result.get("distance_text"),
-                            "fare_text": result.get("fare_text"),
-                            "start_address": result.get("start_address"),
-                            "end_address": result.get("end_address"),
-                            "transit_station_steps_count": len(result.get("transit_station_steps") or []),
-                        })
-                        station_steps = result.get("transit_station_steps") or []
-                        if station_steps:
-                            st.markdown("**Transit station steps**")
-                            for idx, step in enumerate(station_steps, start=1):
-                                line = safe_text(step.get("line_name"), "")
-                                vehicle = safe_text(step.get("vehicle_name"), "公共交通")
-                                dep = safe_text(step.get("departure_stop"), "")
-                                arr = safe_text(step.get("arrival_stop"), "")
-                                dep_time = safe_text(step.get("departure_time"), "")
-                                arr_time = safe_text(step.get("arrival_time"), "")
-                                st.write(f"{idx}. {vehicle} {line}: {dep} → {arr} ({dep_time} - {arr_time})")
-                            with st.expander("駅名抽出 step JSON", expanded=False):
-                                st.json(station_steps)
-                        with st.expander("全 step JSON", expanded=False):
-                            st.json(result.get("steps") or [])
-            except Exception as e:
-                st.error(f"駅名抽出トライ エラー: {e}")
-    if st.button("🔄 全リセット", use_container_width=True):
-        reset_all()
-        st.rerun()
+        if st.session_state.show_developer_tools:
+            st.session_state.temperature = st.slider("Gemini 生成温度", 0.0, 1.0, st.session_state.temperature, 0.1)
+            st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
+            render_internal_logs_sidebar()
+        if st.button("🔄 全リセット", use_container_width=True):
+            reset_all()
+            st.rerun()
 
 
 
@@ -9773,6 +9763,7 @@ def render_final_itinerary_content() -> None:
         st.markdown("### 完成旅程タイムライン")
         render_google_calendar_sync_panel(df_phase3)
         render_phase35_validation_panel(st.session_state.trip_plan or "", df_phase3)
+        render_quality_gate_panel()
         render_transport_policy_warning_panel()
 
         col_simple, col_checklist, col_note = st.columns([1, 1, 2])
