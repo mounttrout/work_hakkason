@@ -95,6 +95,7 @@ except Exception:
 # - v6.2.58: 日跨ぎ宿泊前後を移動時間として誤採用しない cross-day transport guard を追加
 # - v6.2.59: ホテル名fallback、イベント開催日・休館日・営業時間の信頼性チェックを追加
 # - v6.2.64: Spot Info Agentをservices/dataへ外付け化し、app.pyは呼び出し側に限定
+# - v6.2.78: ユーザー移動手段意図をLLMで判定し、Phase2構造化データへ区間移動手段を付与
 # - v6.2.65: Dynamic Checklist AgentとExecution Monitor Agentを外付け化。チェックリスト疑似画面と実行中ナビ実験を追加
 # - v6.2.66: ホテル出発行を移動カードへ誤昇格しないガード、同一大都市圏ホテル継続判定、チェックリスト重複抑制
 # - v6.2.60: v6.2.47の正常な簡易旅程・戻るボタン挙動だけを局所復元
@@ -107,8 +108,8 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.76-transport-policy-day-start-and-public-mode-fix"
-APP_UPDATED_DATE = "2026-04-30"
+APP_VERSION_NAME = "v6.2.78-llm-transport-policy-structured-segments"
+APP_UPDATED_DATE = "2026-05-01"
 
 
 # =========================================================
@@ -639,6 +640,8 @@ def init_session_state() -> None:
         "resolved_trip_context": {},
         # 修正箇所(v6.2.75): ユーザー希望を優先した移動手段ポリシー上の注意表示
         "transport_policy_warnings": [],
+        # 修正箇所(v6.2.78): ユーザー移動希望をLLMで解釈した旅行全体ポリシー
+        "transport_intent_policy": {},
         "replan_preview_draft": None,
         "replan_preview_request": "",
         "replan_preview_source": "",
@@ -3567,13 +3570,18 @@ def resolve_planning_state() -> Dict:
     resolved["conversation_trip_days"] = conversation_trip_days
     resolved["primary_destination"] = safe_text(s.get("primary_destination"), "")
 
-    # --- 修正箇所(v6.2.74): v6.2.68基準に弱い自家用車検出だけを再適用 ---
-    # 生成済みtrip_planではなく、ユーザー会話メモ/修正希望に含まれる明示だけを見る。
+    # --- 修正箇所(v6.2.78): 移動スタイルは単語ルールではなくLLMで文脈判定する ---
     before_transport_style = safe_text(resolved.get("transport_style"), "自動（おすすめ）")
-    detected_transport_style = _resolve_transport_style_from_text(before_transport_style, latest_text)
-    if detected_transport_style != before_transport_style:
-        resolved["transport_style"] = detected_transport_style
-        log_event("条件解決", f"会話内の明示から移動スタイルを反映: {before_transport_style} → {detected_transport_style}", level="info")
+    transport_policy = _llm_resolve_transport_intent_policy(resolved, latest_text)
+    if transport_policy:
+        resolved["transport_style"] = safe_text(transport_policy.get("overall_transport_style"), before_transport_style)
+        resolved["base_transport_mode"] = safe_text(
+            transport_policy.get("base_transport_mode"),
+            _infer_mode_from_transport_style(resolved["transport_style"]),
+        )
+        resolved["transport_intent_policy"] = transport_policy
+        if resolved["transport_style"] != before_transport_style:
+            log_event("条件解決", f"LLM判定から移動スタイルを反映: {before_transport_style} → {resolved['transport_style']}", level="info")
 
     st.session_state.resolved_conditions = {
         "trip_days_form": int(s.get("trip_days", 2)),
@@ -3673,6 +3681,7 @@ def reset_all() -> None:
     st.session_state.resolved_conditions = {}
     st.session_state.resolved_trip_context = {}
     st.session_state.transport_policy_warnings = []
+    st.session_state.transport_intent_policy = {}
 
 
 def build_google_maps_search_url(place: str) -> str:
@@ -4017,11 +4026,56 @@ def _has_public_transport_intent_text(text: str) -> bool:
     return any(token in value for token in public_tokens)
 
 
-def _has_strong_private_car_phrase_text(text: str) -> bool:
-    # --- 修正箇所(v6.2.74): bareな「車で」は使わず、明確な自家用車/車旅行表現だけを採用 ---
+def _has_private_car_prohibition_text(text: str) -> bool:
+    """
+    修正箇所(v6.2.77):
+    「自家用車は使わない」「車なし」などの禁止表現を、
+    自家用車の強い希望として誤検出しないための判定。
+    """
     value = str(text or "").strip()
     if not value:
         return False
+    private_car_ng_patterns = [
+        r"自家用車\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)",
+        r"マイカー\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)",
+        r"レンタカー\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける|借りない)",
+        r"車\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)",
+        r"車なし",
+        r"車無し",
+        r"車では(?:行かない|移動しない)",
+        r"自家用車(?:禁止|NG|ＮＧ)",
+        r"マイカー(?:禁止|NG|ＮＧ)",
+        r"レンタカー(?:禁止|NG|ＮＧ)",
+    ]
+    return any(re.search(pattern, value) for pattern in private_car_ng_patterns)
+
+
+def _has_public_transport_prohibition_text(text: str) -> bool:
+    """公共交通を使わない明示。自家用車希望との競合整理に使う。"""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    public_ng_patterns = [
+        r"電車\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)",
+        r"新幹線\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)",
+        r"公共交通(?:機関)?\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)",
+        r"バス\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)",
+    ]
+    return any(re.search(pattern, value) for pattern in public_ng_patterns)
+
+
+def _has_strong_private_car_phrase_text(text: str) -> bool:
+    # --- 修正箇所(v6.2.77): 自家用車の禁止表現をpositive判定から除外 ---
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if _has_private_car_prohibition_text(value):
+        # 「自家用車は使わない」に含まれる「自家用車」を希望として扱わない。
+        value = re.sub(r"自家用車\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)", " ", value)
+        value = re.sub(r"マイカー\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)", " ", value)
+        value = re.sub(r"レンタカー\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける|借りない)", " ", value)
+        value = re.sub(r"車\s*(?:は|を|で)?\s*(?:使わない|使わず|使わないで|利用しない|不要|なし|無し|避ける)", " ", value)
+        value = re.sub(r"車(?:なし|無し)", " ", value)
     strong_patterns = [
         r"自家用車",
         r"マイカー",
@@ -4035,21 +4089,346 @@ def _has_strong_private_car_phrase_text(text: str) -> bool:
 
 
 def _resolve_transport_style_from_text(current_style: str, text: str) -> str:
-    # --- 修正箇所(v6.2.74): 公共交通明示を優先し、自家用車は強い表現のときだけ採用 ---
+    # --- 修正箇所(v6.2.77): 「自家用車は使わない」などの禁止表現を最優先 ---
     value = str(text or "")
     if not value.strip():
         return current_style
-    has_public = _has_public_transport_intent_text(value)
-    has_private = _has_strong_private_car_phrase_text(value)
+
+    private_forbidden = _has_private_car_prohibition_text(value)
+    public_forbidden = _has_public_transport_prohibition_text(value)
+    has_public = _has_public_transport_intent_text(value) and not public_forbidden
+    has_private = _has_strong_private_car_phrase_text(value) and not private_forbidden
+
+    # 明示的な禁止は、希望表現より上位。
+    # 例: 「電車メインで行きたい。自家用車は使わない」→ 電車メイン
+    if private_forbidden and has_public:
+        return "電車メイン"
+    if public_forbidden and has_private:
+        return "自家用車"
+    if private_forbidden and not has_private:
+        if has_public:
+            return "電車メイン"
+        # 禁止だけで代替がない場合は、既存が自家用車なら自動へ戻して誤固定を解除。
+        return "自動（おすすめ）" if current_style == "自家用車" else current_style
+
+    # positive同士の競合では、ユーザーの直接的な公共交通指定を優先。
+    # 例: 「はとバスで行くようなスポットに電車メイン、自家用車は使わない」
     if has_public and not has_private:
         return "電車メイン"
-    if has_private:
+    if has_private and not has_public:
         return "自家用車"
+    if has_public and has_private:
+        # どちらも肯定なら、文末に近い方を採用。ただし禁止は上で処理済み。
+        public_pos = max([value.rfind(token) for token in ["電車", "新幹線", "公共交通", "鉄道", "列車", "バス"]])
+        private_pos = max([value.rfind(token) for token in ["自家用車", "マイカー", "レンタカー", "ドライブ", "車で"]])
+        return "電車メイン" if public_pos >= private_pos else "自家用車"
+
     if "徒歩" in value:
         return "徒歩メイン"
     if "タクシー" in value:
         return "タクシー"
     return current_style
+
+
+# =========================================================
+# 修正箇所(v6.2.78): LLM Transport Intent Resolver
+# - 「自家用車は使わない」等の否定・混合条件を、単語検出ではなくLLMに文脈判定させる。
+# - 旅行全体の移動方針をJSON化し、Phase2→Phase3の区間移動手段決定にも渡す。
+# =========================================================
+def _transport_style_from_mode(mode: str, fallback: str = "自動（おすすめ）") -> str:
+    mode_key = _normalize_transport_mode_key(mode)
+    mapping = {
+        "train": "電車メイン",
+        "bus": "電車メイン",
+        "private_car": "自家用車",
+        "car": "レンタカー",
+        "taxi": "タクシー",
+        "walk": "徒歩メイン",
+        "bike": "徒歩メイン",
+        "air": "電車メイン",
+    }
+    return mapping.get(mode_key, fallback or "自動（おすすめ）")
+
+
+def _normalize_llm_policy_mode(mode: str) -> str:
+    mode_key = _normalize_transport_mode_key(mode)
+    if mode_key in {"train", "bus", "private_car", "car", "taxi", "walk", "bike", "air", "ship"}:
+        return mode_key
+    value = safe_text(mode, "").lower()
+    if "public" in value or "transit" in value or "rail" in value:
+        return "train"
+    if "private" in value or "mycar" in value:
+        return "private_car"
+    if "rent" in value:
+        return "car"
+    return "train"
+
+
+def _compact_transport_source_text(planning_state: Dict[str, object], extra_text: str = "") -> str:
+    notes = planning_state.get("conversation_notes", []) or []
+    revisions = planning_state.get("revision_requests", []) or []
+    parts = [
+        safe_text(extra_text, ""),
+        safe_text(planning_state.get("primary_destination"), ""),
+        safe_text(planning_state.get("transport_style"), ""),
+        " / ".join([safe_text(x, "") for x in notes]),
+        " / ".join([safe_text(x, "") for x in revisions]),
+    ]
+    return " / ".join([p for p in parts if p]).strip()
+
+
+def _llm_resolve_transport_intent_policy(
+    planning_state: Dict[str, object],
+    user_text: str = "",
+    force: bool = False,
+) -> Dict[str, object]:
+    """ユーザーの自然文から、旅行全体の移動手段ポリシーをLLMで判定する。
+
+    重要: ここでは「自家用車」という単語だけでは判定しない。
+    否定・禁止・優先順位・例外を含む文脈をLLMに読ませ、JSONとして保存する。
+    """
+    source_text = _compact_transport_source_text(planning_state, extra_text=user_text)
+    current_style = safe_text(planning_state.get("transport_style"), "自動（おすすめ）")
+    if not source_text:
+        return {}
+
+    cache_key = json.dumps({
+        "source_text": source_text,
+        "current_style": current_style,
+        "departure": safe_text(planning_state.get("departure_place"), ""),
+        "return": safe_text(planning_state.get("return_place"), ""),
+    }, ensure_ascii=False, sort_keys=True)
+    cached = st.session_state.get("transport_intent_policy", {}) or {}
+    if not force and isinstance(cached, dict) and cached.get("cache_key") == cache_key:
+        return dict(cached)
+
+    prompt = f"""
+あなたは旅行アプリ VoyageFlow の「移動手段ポリシー判定AI」です。
+ユーザーの自然文と現在の入力欄から、旅行全体で最優先すべき移動手段方針を判定してください。
+
+【最重要方針】
+- ユーザーの明示要望を最優先にする。
+- 「自家用車は使わない」「車なし」「電車は使わない」などの否定・禁止表現を正しく読む。
+- 単語が含まれるだけで肯定扱いしない。文脈で判断する。
+- 混合移動の場合は base_transport_mode に主手段を入れ、例外は segment_rules / allowed_exception_modes に入れる。
+- 法規制・マイカー規制などでユーザー希望をそのまま守れない場合は、希望を勝手に消さず warning に理由を書く。
+- 判断不能なら current_style を尊重し、confidence を low にする。
+- JSONだけを返す。
+
+【現在の入力欄】
+- 現在の移動スタイル: {current_style}
+- 出発地: {safe_text(planning_state.get('departure_place'), '')}
+- 帰着地: {safe_text(planning_state.get('return_place'), '')}
+- 主目的地: {safe_text(planning_state.get('primary_destination'), '')}
+
+【ユーザー由来テキスト】
+{source_text}
+
+【返すJSON】
+{{
+  "overall_transport_style": "電車メイン | 自家用車 | レンタカー | タクシー | 徒歩メイン | 自動（おすすめ）",
+  "base_transport_mode": "train | private_car | car | taxi | walk | bus",
+  "user_locked": true,
+  "confidence": "high | medium | low",
+  "forbidden_modes": ["private_car"],
+  "allowed_exception_modes": ["bus"],
+  "segment_rules": [
+    {{"condition": "上高地・沢渡・マイカー規制の区間", "mode": "bus", "reason": "マイカー規制の可能性"}}
+  ],
+  "reason": "判定理由を短く",
+  "warning": "ユーザー希望と現地制約・非効率が衝突する場合だけ短く。なければ空文字"
+}}
+""".strip()
+
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        data = _safe_json_extract(raw) or {}
+        if not isinstance(data, dict) or not data:
+            return {}
+
+        confidence = safe_text(data.get("confidence"), "medium").lower()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "medium"
+
+        mode = _normalize_llm_policy_mode(data.get("base_transport_mode", ""))
+        style = safe_text(data.get("overall_transport_style"), "")
+        allowed_styles = {"電車メイン", "自家用車", "レンタカー", "タクシー", "徒歩メイン", "自動（おすすめ）"}
+        if style not in allowed_styles:
+            style = _transport_style_from_mode(mode, current_style)
+
+        forbidden_modes = data.get("forbidden_modes") if isinstance(data.get("forbidden_modes"), list) else []
+        forbidden_modes = [_normalize_llm_policy_mode(x) for x in forbidden_modes if safe_text(x, "")]
+        allowed_exception_modes = data.get("allowed_exception_modes") if isinstance(data.get("allowed_exception_modes"), list) else []
+        allowed_exception_modes = [_normalize_llm_policy_mode(x) for x in allowed_exception_modes if safe_text(x, "")]
+        segment_rules = data.get("segment_rules") if isinstance(data.get("segment_rules"), list) else []
+
+        policy = {
+            "source": "llm_transport_intent",
+            "cache_key": cache_key,
+            "overall_transport_style": style,
+            "base_transport_mode": mode,
+            "user_locked": bool(data.get("user_locked", confidence in {"high", "medium"})),
+            "confidence": confidence,
+            "forbidden_modes": forbidden_modes,
+            "allowed_exception_modes": allowed_exception_modes,
+            "segment_rules": segment_rules,
+            "reason": safe_text(data.get("reason"), "LLMがユーザー文脈から移動方針を判定"),
+            "warning": safe_text(data.get("warning"), ""),
+        }
+        st.session_state.transport_intent_policy = policy
+        log_event(
+            "移動手段LLM判定",
+            f"overall={style} / base={mode} / locked={policy['user_locked']} / confidence={confidence} / reason={policy['reason']}",
+            level="info",
+        )
+        if policy.get("warning"):
+            _append_transport_policy_warning(policy["warning"], level="warning")
+        return dict(policy)
+    except Exception as e:
+        log_event("移動手段LLM判定", f"LLM判定に失敗したため既存入力欄を維持: {e}", level="warning")
+        return {}
+
+
+def _llm_resolve_phase2_segment_transport_modes(df2: pd.DataFrame, planning_state: Dict[str, object]) -> Dict[int, Dict[str, str]]:
+    """Phase2の隣接スポット間に、LLM判定の移動手段を付与するための区間判定。
+
+    構造化データ自体に transport_mode_to_next を持たせ、Phase3の移動カードはその値を優先する。
+    """
+    if df2 is None or df2.empty:
+        return {}
+
+    context_state = _get_active_trip_context(planning_state)
+    policy = context_state.get("transport_intent_policy") or st.session_state.get("transport_intent_policy", {}) or {}
+    base_mode = _normalize_llm_policy_mode(policy.get("base_transport_mode") or context_state.get("base_transport_mode") or _infer_mode_from_transport_style(context_state.get("transport_style", "")))
+    style = safe_text(context_state.get("transport_style"), safe_text(policy.get("overall_transport_style"), "自動（おすすめ）"))
+
+    segments = []
+    max_segments = 32
+    for idx in range(min(len(df2) - 1, max_segments)):
+        cur = df2.iloc[idx]
+        nxt = df2.iloc[idx + 1]
+        if int(cur.get("day", 1) or 1) != int(nxt.get("day", 1) or 1):
+            continue
+        origin = safe_text(cur.get("destination"), "")
+        dest = safe_text(nxt.get("destination"), "")
+        if not origin or not dest or _same_effective_place(origin, dest):
+            continue
+        segments.append({
+            "index": int(idx),
+            "day": int(cur.get("day", 1) or 1),
+            "origin": origin,
+            "destination": dest,
+            "origin_purpose": safe_text(cur.get("purpose"), ""),
+            "destination_purpose": safe_text(nxt.get("purpose"), ""),
+            "origin_note": safe_text(cur.get("one_point"), "")[:160],
+            "destination_note": safe_text(nxt.get("one_point"), "")[:160],
+            "start_time": safe_text(cur.get("end_time"), safe_text(cur.get("start_time"), "")),
+            "next_start_time": safe_text(nxt.get("start_time"), ""),
+        })
+    if not segments:
+        return {}
+
+    prompt = f"""
+あなたは旅行アプリ VoyageFlow の Phase2→Phase3 移動手段判定AIです。
+Phase2構造化データの隣接スポット間について、各区間の移動手段を決めてください。
+
+【優先順位】
+1. ユーザーの明示要望・禁止事項を絶対的に優先する。
+2. 上高地のマイカー規制など、現地制約・法規制がある場合は例外として扱い warning に出す。
+3. 構造化データ内の移動ヒント・スポットメモを参照する。
+4. 最後に効率性・自然さを考える。
+
+【重要】
+- ユーザー要望に反して勝手に電車・車へ変えない。
+- 明らかに非効率でも、要望を守ったうえで注意として warning を出す。
+- 観光体験としての「黒部峡谷トロッコ電車」は、旅行全体の通常移動手段ではなく activity として扱う。
+- JSONだけを返す。
+
+【旅行全体ポリシー】
+- overall_transport_style: {style}
+- base_transport_mode: {base_mode}
+- user_locked: {bool(policy.get('user_locked', False))}
+- forbidden_modes: {json.dumps(policy.get('forbidden_modes', []), ensure_ascii=False)}
+- allowed_exception_modes: {json.dumps(policy.get('allowed_exception_modes', []), ensure_ascii=False)}
+- segment_rules: {json.dumps(policy.get('segment_rules', []), ensure_ascii=False)}
+- policy_reason: {safe_text(policy.get('reason'), '')}
+
+【区間一覧】
+{json.dumps(segments, ensure_ascii=False)}
+
+【返すJSON】
+{{
+  "segments": [
+    {{"index": 0, "mode": "train | private_car | car | taxi | walk | bus", "reason": "短い理由", "warning": "必要な場合だけ。なければ空文字"}}
+  ],
+  "overall_notes": ["必要なら全体注意"]
+}}
+""".strip()
+
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        data = _safe_json_extract(raw) or {}
+        result: Dict[int, Dict[str, str]] = {}
+        for item in data.get("segments", []) if isinstance(data.get("segments"), list) else []:
+            try:
+                idx = int(item.get("index"))
+            except Exception:
+                continue
+            mode = _normalize_llm_policy_mode(item.get("mode", base_mode))
+            result[idx] = {
+                "mode": mode,
+                "reason": safe_text(item.get("reason"), "LLMが区間文脈から判定"),
+                "warning": safe_text(item.get("warning"), ""),
+            }
+        for note in data.get("overall_notes", []) if isinstance(data.get("overall_notes"), list) else []:
+            _append_transport_policy_warning(safe_text(note, ""), level="warning")
+        if result:
+            log_event("Phase2移動手段LLM", f"{len(result)}区間の移動手段をLLMで構造化データへ付与", level="info")
+        return result
+    except Exception as e:
+        log_event("Phase2移動手段LLM", f"区間移動手段のLLM判定に失敗: {e}", level="warning")
+        return {}
+
+
+def _annotate_phase2_transport_modes(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    """Phase2構造化データの各スポット行に、次スポットへの移動手段を追加する。"""
+    if df2 is None or df2.empty:
+        return df2
+    annotated = df2.copy().reset_index(drop=True)
+    for col in ["transport_mode_to_next", "transport_reason_to_next", "transport_warning_to_next"]:
+        if col not in annotated.columns:
+            annotated[col] = ""
+
+    llm_segments = _llm_resolve_phase2_segment_transport_modes(annotated, planning_state)
+    context_state = _get_active_trip_context(planning_state)
+    base_mode = _normalize_llm_policy_mode(context_state.get("base_transport_mode") or _infer_mode_from_transport_style(context_state.get("transport_style", "")))
+
+    for idx in range(len(annotated) - 1):
+        cur = annotated.iloc[idx]
+        nxt = annotated.iloc[idx + 1]
+        if int(cur.get("day", 1) or 1) != int(nxt.get("day", 1) or 1):
+            continue
+        if idx in llm_segments:
+            seg = llm_segments[idx]
+            annotated.at[idx, "transport_mode_to_next"] = seg.get("mode", base_mode)
+            annotated.at[idx, "transport_reason_to_next"] = seg.get("reason", "")
+            annotated.at[idx, "transport_warning_to_next"] = seg.get("warning", "")
+        elif not safe_text(annotated.at[idx, "transport_mode_to_next"], ""):
+            annotated.at[idx, "transport_mode_to_next"] = base_mode
+            annotated.at[idx, "transport_reason_to_next"] = "LLM区間判定が欠損したため、旅行全体ポリシーの主移動手段を補完"
+
+    return annotated
+
+
+def _phase2_row_transport_policy(current: pd.Series | Dict) -> Dict[str, str]:
+    if not safe_text(_row_value(current, "transport_mode_to_next", ""), ""):
+        return {}
+    mode = _normalize_llm_policy_mode(_row_value(current, "transport_mode_to_next", ""))
+    reason = safe_text(_row_value(current, "transport_reason_to_next", ""), "")
+    warning = safe_text(_row_value(current, "transport_warning_to_next", ""), "")
+    return {"mode": mode, "reason": reason, "warning": warning}
 
 def update_planning_state_from_user_text(user_text: str) -> None:
     # --- 修正箇所: v6.2.50 条件トレースログ（入口） ---
@@ -4060,11 +4439,18 @@ def update_planning_state_from_user_text(user_text: str) -> None:
     before_trip_days = s.get("trip_days", "")
     text = user_text.strip()
 
-    # --- 修正箇所(v6.2.74): 自家用車検出を弱く再適用。"電車で"を"車で"と誤検出しない ---
+    # --- 修正箇所(v6.2.78): 会話入力直後の移動スタイルもLLMで文脈判定する ---
     before_transport_style = s.get("transport_style", "自動（おすすめ）")
-    s["transport_style"] = _resolve_transport_style_from_text(before_transport_style, text)
+    input_transport_policy = _llm_resolve_transport_intent_policy(s, text, force=True)
+    if input_transport_policy:
+        s["transport_style"] = safe_text(input_transport_policy.get("overall_transport_style"), before_transport_style)
+        s["base_transport_mode"] = safe_text(
+            input_transport_policy.get("base_transport_mode"),
+            _infer_mode_from_transport_style(s["transport_style"]),
+        )
+        s["transport_intent_policy"] = input_transport_policy
     if s.get("transport_style") != before_transport_style:
-        log_event("条件解決", f"会話から移動スタイルを採用: {before_transport_style} → {s.get('transport_style')}", level="info")
+        log_event("条件解決", f"会話から移動スタイルをLLM採用: {before_transport_style} → {s.get('transport_style')}", level="info")
 
     if "節約" in text or "安く" in text:
         s["budget_style"] = "節約"
@@ -4503,6 +4889,10 @@ def _transport_context_text(planning_state: Dict[str, object]) -> str:
 
 
 def _transport_style_is_user_locked(planning_state: Dict[str, object]) -> bool:
+    # 修正箇所(v6.2.78): ユーザー固定判定はLLMポリシーを最優先する。
+    policy = planning_state.get("transport_intent_policy") or st.session_state.get("transport_intent_policy", {}) or {}
+    if isinstance(policy, dict) and policy:
+        return bool(policy.get("user_locked", False))
     style = safe_text(planning_state.get("transport_style"), "自動（おすすめ）")
     if style and style != "自動（おすすめ）":
         return True
@@ -4514,11 +4904,23 @@ def _build_resolved_trip_context(resolved: Dict[str, object]) -> Dict[str, objec
     base = dict(st.session_state.get("planning_state", {}) or {})
     context = dict(base)
     context.update(dict(resolved or {}))
-    style = safe_text(context.get("transport_style"), "自動（おすすめ）")
-    context["transport_style"] = style
-    context["base_transport_mode"] = _infer_mode_from_transport_style(style)
-    context["transport_user_locked"] = _transport_style_is_user_locked(context)
-    context["transport_policy_priority"] = "user_request_first"
+    policy = context.get("transport_intent_policy") or st.session_state.get("transport_intent_policy", {}) or {}
+    if isinstance(policy, dict) and policy:
+        context["transport_intent_policy"] = policy
+        context["transport_style"] = safe_text(
+            policy.get("overall_transport_style"),
+            safe_text(context.get("transport_style"), "自動（おすすめ）"),
+        )
+        context["base_transport_mode"] = _normalize_llm_policy_mode(
+            policy.get("base_transport_mode", _infer_mode_from_transport_style(context["transport_style"]))
+        )
+        context["transport_user_locked"] = bool(policy.get("user_locked", False))
+    else:
+        style = safe_text(context.get("transport_style"), "自動（おすすめ）")
+        context["transport_style"] = style
+        context["base_transport_mode"] = _infer_mode_from_transport_style(style)
+        context["transport_user_locked"] = _transport_style_is_user_locked(context)
+    context["transport_policy_priority"] = "user_request_first_llm"
     return context
 
 
@@ -4534,6 +4936,7 @@ def _sync_resolved_trip_context(resolved: Dict[str, object]) -> Dict[str, object
         "trip_days", "primary_destination", "transport_style", "budget_style",
         "departure_place", "return_place", "departure_time", "start_date",
         "hotel_required", "conversation_notes", "revision_requests",
+        "base_transport_mode", "transport_intent_policy",
     ]:
         if key in context:
             planning_state[key] = context[key]
@@ -4549,6 +4952,8 @@ def _get_active_trip_context(fallback_state: Optional[Dict[str, object]] = None)
         merged.update(context)
         if "base_transport_mode" not in merged:
             merged["base_transport_mode"] = _infer_mode_from_transport_style(safe_text(merged.get("transport_style"), "自動（おすすめ）"))
+        if "transport_intent_policy" not in merged or not merged.get("transport_intent_policy"):
+            merged["transport_intent_policy"] = st.session_state.get("transport_intent_policy", {}) or {}
         if "transport_user_locked" not in merged:
             merged["transport_user_locked"] = _transport_style_is_user_locked(merged)
         return merged
@@ -4592,6 +4997,17 @@ def _resolve_segment_transport_policy(
 ) -> Dict[str, object]:
     """区間ごとの移動手段を、ユーザー希望を最優先にして決める。"""
     context_state = _get_active_trip_context(planning_state)
+
+    # 修正箇所(v6.2.78): Phase2構造化データに付与済みの「次区間移動手段」を最優先する。
+    row_policy = _phase2_row_transport_policy(current)
+    if row_policy:
+        return {
+            "mode": row_policy.get("mode", "train"),
+            "reason": row_policy.get("reason", "Phase2構造化データに付与されたLLM区間移動手段を採用"),
+            "warning": row_policy.get("warning", ""),
+            "user_locked": bool(context_state.get("transport_user_locked", False)),
+        }
+
     style = safe_text(context_state.get("transport_style"), "自動（おすすめ）")
     base_mode = _normalize_transport_mode_key(context_state.get("base_transport_mode") or _infer_mode_from_transport_style(style))
     user_locked = bool(context_state.get("transport_user_locked"))
@@ -5547,6 +5963,8 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
     st.session_state.transport_policy_warnings = []
 
     source_df = df2.copy().reset_index(drop=True)
+    if "transport_mode_to_next" not in source_df.columns:
+        source_df = _annotate_phase2_transport_modes(source_df, planning_state)
     rows: List[Dict[str, object]] = []
 
     for idx in range(len(source_df)):
@@ -5791,6 +6209,9 @@ def approve_and_build_phase2_phase3() -> None:
         raise ValueError("フェーズ2で構造化データを生成できませんでした。")
 
     df2 = normalize_phase2_dataframe(df2, s)
+
+    # --- 修正箇所(v6.2.78): Phase2構造化データに「次スポットへの移動手段」をLLMで付与 ---
+    df2 = _annotate_phase2_transport_modes(df2, s)
 
     # --- 修正箇所: v6.2.51 Phase2移動誤分類検査ログ（非破壊） ---
     log_phase2_transport_misclassification(df2)
