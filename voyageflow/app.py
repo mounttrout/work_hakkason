@@ -107,9 +107,10 @@ except Exception:
 # - スポットカード下部・簡易一覧の公式情報リンクを辞書ベース優先に変更
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # - v6.2.79: 上高地bus例外を「沢渡/平湯等ゲート↔上高地内」に限定。ホテル宿泊時刻は表示専用で翌朝表記へ補正。2日目以降の出発地点アンカーを安定表示。
+# - v6.2.80: 本番transportへは接続せず、左サイドバーに距離ベース移動時間テストとGemini移動エージェントテストを追加。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.79-transport-segment-exception-tighten-hotel-display-fix"
+APP_VERSION_NAME = "v6.2.80-transport-estimation-test-panel"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -8808,6 +8809,590 @@ def render_gemini_transport_ab_test_panel() -> None:
 
 
 # =========================================================
+# 修正箇所(v6.2.80): 左サイドバー専用の移動時間テスト
+# - 完成旅程 / Phase3 / 実行シミュレーションには接続しない
+# - 直線距離から徒歩・車・電車の仮時間を算出
+# - Gemini移動エージェントはハルシネーション抑制プロンプトで診断のみ行う
+# =========================================================
+def _transport_test_safe_int(value, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def _geocode_place_for_transport_test(place_name: str) -> Dict[str, object]:
+    query = _normalize_route_query_name(place_name)
+    if not query:
+        return {
+            "ok": False,
+            "source": "input",
+            "query": query,
+            "error": "地名が空です。",
+        }
+
+    # まず外付けExecution Monitorの簡易座標辞書があれば使う。
+    # APIが使えない環境でも、東京駅など一部の既知地点で診断を続けられるようにする。
+    try:
+        if coords_for_name is not None:
+            coords = coords_for_name(query)
+            if coords and len(coords) >= 2:
+                return {
+                    "ok": True,
+                    "source": "execution_monitor_agent_coords",
+                    "query": query,
+                    "formatted_address": query,
+                    "lat": float(coords[0]),
+                    "lng": float(coords[1]),
+                    "place_id": "",
+                }
+    except Exception:
+        pass
+
+    # Google Geocoding APIは経路検索ではなく、距離計算用の座標取得だけに限定する。
+    try:
+        api_key = _get_maps_api_key()
+        if api_key:
+            url = "https://maps.googleapis.com/maps/api/geocode/json"
+            params = {
+                "address": query,
+                "region": "jp",
+                "language": "ja",
+                "key": api_key,
+            }
+            response = requests.get(url, params=params, timeout=12)
+            data = response.json() if response.text else {}
+            status = data.get("status")
+            results = data.get("results") if isinstance(data, dict) else []
+            if response.status_code == 200 and status == "OK" and results:
+                first = results[0]
+                location = ((first.get("geometry") or {}).get("location") or {})
+                lat = location.get("lat")
+                lng = location.get("lng")
+                if lat is not None and lng is not None:
+                    return {
+                        "ok": True,
+                        "source": "google_geocoding",
+                        "query": query,
+                        "formatted_address": safe_text(first.get("formatted_address"), query),
+                        "lat": float(lat),
+                        "lng": float(lng),
+                        "place_id": safe_text(first.get("place_id"), ""),
+                    }
+            return {
+                "ok": False,
+                "source": "google_geocoding",
+                "query": query,
+                "status": status,
+                "error": data.get("error_message") or f"Geocoding failed: {status}",
+            }
+    except Exception as e:
+        geocoding_error = str(e)
+    else:
+        geocoding_error = "MAPS_API_KEY が未設定です。"
+
+    # 最後にOpen-Meteoの都市名ジオコードへfallback。
+    # スポット名には弱いが、都市間テストは続けられる。
+    try:
+        weather_geo = _weather_geocode(query)
+        if weather_geo and weather_geo.get("latitude") is not None and weather_geo.get("longitude") is not None:
+            return {
+                "ok": True,
+                "source": "open_meteo_geocoding_fallback",
+                "query": query,
+                "formatted_address": " / ".join(
+                    [
+                        safe_text(weather_geo.get("name"), query),
+                        safe_text(weather_geo.get("admin1"), ""),
+                        safe_text(weather_geo.get("country"), ""),
+                    ]
+                ).strip(" /"),
+                "lat": float(weather_geo["latitude"]),
+                "lng": float(weather_geo["longitude"]),
+                "place_id": "",
+                "fallback_note": geocoding_error,
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "source": "geocoding_fallback",
+            "query": query,
+            "error": f"{geocoding_error} / Open-Meteo fallback failed: {e}",
+        }
+
+    return {
+        "ok": False,
+        "source": "geocoding_unavailable",
+        "query": query,
+        "error": geocoding_error,
+    }
+
+
+def build_distance_transport_estimate_for_test(origin: str, destination: str) -> Dict[str, object]:
+    origin_geo = _geocode_place_for_transport_test(origin)
+    destination_geo = _geocode_place_for_transport_test(destination)
+
+    if not origin_geo.get("ok") or not destination_geo.get("ok"):
+        return {
+            "ok": False,
+            "origin": origin,
+            "destination": destination,
+            "origin_geocode": origin_geo,
+            "destination_geocode": destination_geo,
+            "error": "出発地または到着地の座標取得に失敗しました。",
+        }
+
+    try:
+        distance_km = _haversine_km(
+            float(origin_geo["lat"]),
+            float(origin_geo["lng"]),
+            float(destination_geo["lat"]),
+            float(destination_geo["lng"]),
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "origin": origin,
+            "destination": destination,
+            "origin_geocode": origin_geo,
+            "destination_geocode": destination_geo,
+            "error": f"距離計算に失敗しました: {e}",
+        }
+
+    estimates = []
+    mode_specs = [
+        ("walk", "徒歩", "直線距離から徒歩速度ベースで算出。実経路ではありません。"),
+        ("car", "車", "直線距離から道路移動を距離帯ベースで算出。渋滞・高速道路は未反映です。"),
+        ("train", "電車", "直線距離から鉄道移動を距離帯ベースで算出。時刻表・乗換は未反映です。"),
+    ]
+    for mode, label, note in mode_specs:
+        fallback = _build_safe_distance_fallback(distance_km, mode, origin, destination)
+        minutes = _transport_test_safe_int(fallback.get("minutes"), None)
+        estimates.append({
+            "mode": mode,
+            "label": label,
+            "minutes": minutes,
+            "display": safe_text(fallback.get("label"), f"約{minutes}分（推測）" if minutes else "要確認"),
+            "source": safe_text(fallback.get("source"), "distance_estimate"),
+            "note": note if not fallback.get("note") else f"{fallback.get('note')} / {note}",
+        })
+
+    return {
+        "ok": True,
+        "origin": origin,
+        "destination": destination,
+        "origin_geocode": origin_geo,
+        "destination_geocode": destination_geo,
+        "distance_km": round(float(distance_km), 2),
+        "distance_note": "緯度経度からの直線距離です。道路・線路の実経路距離ではありません。",
+        "estimates": estimates,
+        "signature": f"{safe_text(origin, '')}|{safe_text(destination, '')}",
+    }
+
+
+def _build_gemini_route_agent_test_prompt(
+    origin: str,
+    destination: str,
+    departure_datetime: str,
+    mode_hint: str,
+    distance_payload: Dict[str, object],
+) -> str:
+    distance_km = distance_payload.get("distance_km") if isinstance(distance_payload, dict) else None
+    estimates = distance_payload.get("estimates") if isinstance(distance_payload, dict) else []
+    estimate_lines = []
+    if isinstance(estimates, list):
+        for item in estimates:
+            if isinstance(item, dict):
+                estimate_lines.append(
+                    f"- {safe_text(item.get('label'), '')}: {safe_text(item.get('display'), '')}"
+                )
+
+    return f"""
+あなたは VoyageFlow の「移動経路・移動時間の診断用エージェント」です。
+この結果は本番旅程には反映されず、左サイドバーのテスト欄で比較するためだけに使います。
+
+最重要ルール:
+- Google Maps、公式サイト、時刻表、外部検索を確認したとは絶対に書かない。
+- 実在の路線名・乗換駅・駅名を、確信がないのに断定しない。
+- 不明な場合は unknown や空文字を使う。
+- 所要時間は「推定」として扱う。
+- 距離ベース推定と大きく矛盾する場合は、理由を書く。
+- 短すぎる時間を禁止する。例: 福井駅→京都駅が20分、東京駅→大阪駅が30分など。
+- JSONのみ返す。Markdown、コードフェンス、説明文は禁止。
+
+入力:
+- 出発地: {safe_text(origin, "")}
+- 到着地: {safe_text(destination, "")}
+- 出発日時: {safe_text(departure_datetime, "")}
+- 手段ヒント: {safe_text(mode_hint, "自動")}
+- 直線距離km: {safe_text(distance_km, "不明")}
+- 距離ベース推定:
+{chr(10).join(estimate_lines) if estimate_lines else "- なし"}
+
+出力JSON形式:
+{{
+  "ok": true,
+  "confidence": "high|medium|low",
+  "route_type": "estimated_public_transport|estimated_car|estimated_walk|unknown",
+  "origin": "出発地",
+  "destination": "到着地",
+  "mode": "train|bus|walk|taxi|car|air|ship|unknown",
+  "duration_min": 90,
+  "duration_max": 130,
+  "recommended_minutes": 110,
+  "route_summary": "断定できる範囲だけで書く。路線名が不確実なら書かない。",
+  "steps": [
+    {{
+      "from": "確実な場合のみ",
+      "to": "確実な場合のみ",
+      "mode": "walk|train|bus|taxi|car|air|ship|unknown",
+      "line": "確実な場合のみ。なければ空文字",
+      "duration_min": 10,
+      "duration_max": 20,
+      "note": "推定・要確認など"
+    }}
+  ],
+  "known_limitations": [
+    "実時刻表・運行状況は確認していない",
+    "乗換駅・路線名は断定しない"
+  ],
+  "estimated": true
+}}
+
+判断できない場合:
+{{
+  "ok": false,
+  "confidence": "low",
+  "route_type": "unknown",
+  "origin": "{safe_text(origin, "")}",
+  "destination": "{safe_text(destination, "")}",
+  "mode": "unknown",
+  "duration_min": null,
+  "duration_max": null,
+  "recommended_minutes": null,
+  "route_summary": "情報不足で妥当な推定を出せない",
+  "steps": [],
+  "known_limitations": ["情報不足"],
+  "estimated": true
+}}
+""".strip()
+
+
+def _normalize_gemini_route_agent_test_result(data: Dict[str, object]) -> Dict[str, object]:
+    if not isinstance(data, dict):
+        data = {}
+
+    allowed_modes = {"train", "bus", "walk", "taxi", "car", "air", "ship", "unknown"}
+    allowed_confidence = {"high", "medium", "low"}
+    allowed_route_types = {"estimated_public_transport", "estimated_car", "estimated_walk", "unknown"}
+
+    confidence = safe_text(data.get("confidence"), "low").lower()
+    if confidence not in allowed_confidence:
+        confidence = "low"
+
+    mode = safe_text(data.get("mode"), "unknown").lower()
+    if mode not in allowed_modes:
+        mode = _infer_mode_from_service_hint(mode, "unknown")
+        if mode not in allowed_modes:
+            mode = "unknown"
+
+    route_type = safe_text(data.get("route_type"), "unknown")
+    if route_type not in allowed_route_types:
+        route_type = "unknown"
+
+    duration_min = _transport_test_safe_int(data.get("duration_min"), None)
+    duration_max = _transport_test_safe_int(data.get("duration_max"), None)
+    recommended = _transport_test_safe_int(data.get("recommended_minutes"), None)
+
+    def _clip_minutes(value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        if value <= 0 or value > 24 * 60:
+            return None
+        return int(value)
+
+    duration_min = _clip_minutes(duration_min)
+    duration_max = _clip_minutes(duration_max)
+    recommended = _clip_minutes(recommended)
+
+    if duration_min and duration_max and duration_min > duration_max:
+        duration_min, duration_max = duration_max, duration_min
+
+    raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+    steps = []
+    for step in raw_steps[:10]:
+        if not isinstance(step, dict):
+            continue
+        step_mode = safe_text(step.get("mode"), "unknown").lower()
+        if step_mode not in allowed_modes:
+            step_mode = _infer_mode_from_service_hint(step_mode, "unknown")
+            if step_mode not in allowed_modes:
+                step_mode = "unknown"
+        step_min = _clip_minutes(_transport_test_safe_int(step.get("duration_min"), None))
+        step_max = _clip_minutes(_transport_test_safe_int(step.get("duration_max"), None))
+        if step_min and step_max and step_min > step_max:
+            step_min, step_max = step_max, step_min
+        steps.append({
+            "from": safe_text(step.get("from"), ""),
+            "to": safe_text(step.get("to"), ""),
+            "mode": step_mode,
+            "line": safe_text(step.get("line"), ""),
+            "duration_min": step_min,
+            "duration_max": step_max,
+            "note": safe_text(step.get("note"), ""),
+        })
+
+    limitations = data.get("known_limitations") if isinstance(data.get("known_limitations"), list) else []
+    limitations = [safe_text(item, "") for item in limitations if safe_text(item, "")][:8]
+
+    return {
+        "ok": bool(data.get("ok", False)),
+        "resolver": "gemini_route_agent_test",
+        "confidence": confidence,
+        "route_type": route_type,
+        "origin": safe_text(data.get("origin"), ""),
+        "destination": safe_text(data.get("destination"), ""),
+        "mode": mode,
+        "duration_min": duration_min,
+        "duration_max": duration_max,
+        "recommended_minutes": recommended,
+        "route_summary": safe_text(data.get("route_summary"), ""),
+        "steps": steps,
+        "known_limitations": limitations,
+        "estimated": bool(data.get("estimated", True)),
+    }
+
+
+def resolve_transport_with_gemini_route_agent_for_test(
+    origin: str,
+    destination: str,
+    departure_datetime: str,
+    mode_hint: str,
+    distance_payload: Dict[str, object],
+) -> Dict[str, object]:
+    prompt = _build_gemini_route_agent_test_prompt(
+        origin=origin,
+        destination=destination,
+        departure_datetime=departure_datetime,
+        mode_hint=mode_hint,
+        distance_payload=distance_payload,
+    )
+    started_at = datetime.now()
+    try:
+        generator = Phase1Generator(logger=log_event)
+        raw = generator.generate_trip_plan(prompt, temperature=0.0).strip()
+        parsed = _safe_json_extract(raw) or {}
+        normalized = _normalize_gemini_route_agent_test_result(parsed)
+        normalized["raw"] = raw
+        normalized["elapsed_seconds"] = round((datetime.now() - started_at).total_seconds(), 2)
+        normalized["fallback_used"] = False
+        return normalized
+    except Exception as e:
+        log_event("GeminiRouteAgent診断", f"移動エージェント推定に失敗: {e}", level="warning")
+        return {
+            "ok": False,
+            "resolver": "gemini_route_agent_test",
+            "confidence": "low",
+            "route_type": "unknown",
+            "origin": safe_text(origin, ""),
+            "destination": safe_text(destination, ""),
+            "mode": "unknown",
+            "duration_min": None,
+            "duration_max": None,
+            "recommended_minutes": None,
+            "route_summary": "",
+            "steps": [],
+            "known_limitations": ["Gemini移動エージェントの実行に失敗しました。"],
+            "estimated": True,
+            "raw": "",
+            "error": str(e),
+            "elapsed_seconds": round((datetime.now() - started_at).total_seconds(), 2),
+            "fallback_used": True,
+        }
+
+
+def _render_distance_transport_result_for_test(result: Dict[str, object]) -> None:
+    if not result:
+        st.caption("まだ距離ベース推定を実行していません。")
+        return
+
+    if not result.get("ok"):
+        st.error(safe_text(result.get("error"), "距離ベース推定に失敗しました。"))
+        with st.expander("座標取得診断", expanded=False):
+            st.json({
+                "origin_geocode": result.get("origin_geocode"),
+                "destination_geocode": result.get("destination_geocode"),
+            })
+        return
+
+    st.metric("直線距離", f"{float(result.get('distance_km', 0)):.2f} km")
+    st.caption(safe_text(result.get("distance_note"), "直線距離ベースの推定です。"))
+
+    estimates = result.get("estimates") if isinstance(result.get("estimates"), list) else []
+    if estimates:
+        df_estimates = pd.DataFrame([
+            {
+                "手段": safe_text(item.get("label"), ""),
+                "仮時間": safe_text(item.get("display"), ""),
+                "分": item.get("minutes"),
+                "補足": safe_text(item.get("note"), ""),
+            }
+            for item in estimates
+            if isinstance(item, dict)
+        ])
+        st.dataframe(df_estimates, hide_index=True, use_container_width=True)
+
+    with st.expander("座標・距離計算の詳細", expanded=False):
+        st.json({
+            "origin": result.get("origin_geocode"),
+            "destination": result.get("destination_geocode"),
+            "distance_km": result.get("distance_km"),
+        })
+
+
+def _render_gemini_route_agent_result_for_test(result: Dict[str, object]) -> None:
+    if not result:
+        st.caption("まだGemini移動エージェント推定を実行していません。")
+        return
+
+    summary = {
+        "ok": result.get("ok"),
+        "confidence": result.get("confidence"),
+        "route_type": result.get("route_type"),
+        "mode": result.get("mode"),
+        "duration_min": result.get("duration_min"),
+        "duration_max": result.get("duration_max"),
+        "recommended_minutes": result.get("recommended_minutes"),
+        "route_summary": result.get("route_summary"),
+        "known_limitations": result.get("known_limitations"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "fallback_used": result.get("fallback_used"),
+    }
+    if result.get("error"):
+        summary["error"] = result.get("error")
+    st.json(summary)
+
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    if steps:
+        st.markdown("**推定ステップ**")
+        for idx, step in enumerate(steps, start=1):
+            min_text = safe_text(step.get("duration_min"), "")
+            max_text = safe_text(step.get("duration_max"), "")
+            duration_text = f"{min_text}〜{max_text}分" if min_text and max_text else "-"
+            st.write(
+                f"{idx}. {safe_text(step.get('from'), '')} → {safe_text(step.get('to'), '')} / "
+                f"{safe_text(step.get('mode'), 'unknown')} / {safe_text(step.get('line'), '')} / {duration_text}"
+            )
+            note = safe_text(step.get("note"), "")
+            if note and note != "-":
+                st.caption(note)
+
+    with st.expander("Gemini移動エージェント raw output", expanded=False):
+        st.code(safe_text(result.get("raw"), ""), language="json")
+
+
+def render_transport_estimation_test_panel() -> None:
+    with st.expander("🧪 移動時間テスト（距離×Gemini）", expanded=False):
+        st.caption("診断専用です。ここでの結果は完成旅程・実行シミュレーションへ自動反映しません。")
+        st.caption("距離ベース推定は、Geocodingで座標を取得し、直線距離から徒歩・車・電車の仮時間を出します。Directions/Routesの経路検索は使いません。")
+
+        test_origin = st.text_input("移動テスト 出発地", value="福井駅", key="transport_est_test_origin")
+        test_destination = st.text_input("移動テスト 到着地", value="京都駅", key="transport_est_test_destination")
+        test_departure = st.text_input(
+            "移動テスト 出発日時 (YYYY-MM-DD HH:MM)",
+            value="2026-05-07 13:00",
+            key="transport_est_test_departure",
+        )
+        test_mode_hint = st.selectbox(
+            "Gemini移動エージェント 手段ヒント",
+            options=["自動", "train", "car", "walk", "bus", "taxi", "air", "ship"],
+            index=0,
+            key="transport_est_test_mode_hint",
+        )
+
+        col_distance, col_gemini = st.columns(2)
+        with col_distance:
+            run_distance = st.button(
+                "📏 距離ベース推定",
+                use_container_width=True,
+                key="run_distance_transport_estimate_test",
+            )
+        with col_gemini:
+            run_gemini_agent = st.button(
+                "🤖 Gemini移動エージェント",
+                use_container_width=True,
+                key="run_gemini_route_agent_test",
+            )
+
+        if st.button(
+            "📏🤖 両方を実行",
+            use_container_width=True,
+            key="run_transport_estimation_both_test",
+        ):
+            run_distance = True
+            run_gemini_agent = True
+
+        current_signature = f"{safe_text(test_origin, '')}|{safe_text(test_destination, '')}"
+
+        if run_distance:
+            st.session_state["transport_distance_test_result"] = build_distance_transport_estimate_for_test(
+                origin=test_origin,
+                destination=test_destination,
+            )
+
+        if run_gemini_agent:
+            distance_result = st.session_state.get("transport_distance_test_result", {})
+            if not distance_result or distance_result.get("signature") != current_signature:
+                distance_result = build_distance_transport_estimate_for_test(
+                    origin=test_origin,
+                    destination=test_destination,
+                )
+                st.session_state["transport_distance_test_result"] = distance_result
+
+            if not distance_result.get("ok"):
+                st.session_state["gemini_route_agent_test_result"] = {
+                    "ok": False,
+                    "resolver": "gemini_route_agent_test",
+                    "confidence": "low",
+                    "route_type": "unknown",
+                    "mode": "unknown",
+                    "duration_min": None,
+                    "duration_max": None,
+                    "recommended_minutes": None,
+                    "route_summary": "距離ベース推定に失敗したため、Gemini移動エージェントには渡していません。",
+                    "steps": [],
+                    "known_limitations": ["座標取得に失敗"],
+                    "estimated": True,
+                    "elapsed_seconds": 0,
+                    "fallback_used": True,
+                    "error": safe_text(distance_result.get("error"), "座標取得に失敗"),
+                }
+            else:
+                st.session_state["gemini_route_agent_test_result"] = resolve_transport_with_gemini_route_agent_for_test(
+                    origin=test_origin,
+                    destination=test_destination,
+                    departure_datetime=test_departure,
+                    mode_hint=test_mode_hint,
+                    distance_payload=distance_result,
+                )
+
+        st.divider()
+        st.markdown("**1. 距離ベース推定**")
+        _render_distance_transport_result_for_test(
+            st.session_state.get("transport_distance_test_result", {})
+        )
+
+        st.divider()
+        st.markdown("**2. Gemini移動エージェント推定**")
+        _render_gemini_route_agent_result_for_test(
+            st.session_state.get("gemini_route_agent_test_result", {})
+        )
+
+
+# =========================================================
 # サイドバー
 # =========================================================
 with st.sidebar:
@@ -8824,6 +9409,9 @@ with st.sidebar:
 
     # --- 修正箇所: Gemini transport resolver A/Bテストをサイドバー固定スペースへ追加 ---
     render_gemini_transport_ab_test_panel()
+
+    # --- 修正箇所(v6.2.80): 左サイドバー専用の距離ベース/Gemini移動エージェント診断を追加 ---
+    render_transport_estimation_test_panel()
 
     # --- 修正箇所: Routes API 診断ボタンをサイドバーに追加 ---
     with st.expander("🛠 Routes診断", expanded=False):
