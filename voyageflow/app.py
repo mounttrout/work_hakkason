@@ -139,9 +139,10 @@ except Exception:
 # - v6.2.85: destination側transport行のstart/endを移動カード時間として採用し、長距離短時間破綻をコード側ハードチェックで検出。
 # - v6.2.86: Phase3.5検証エージェントの通常表示を消し、完成旅程チェックをQuality Gateへ一本化。旧Phase3.5関数は退避として残す。
 # - v6.2.87: 既存生成本体は触らず、Phase3後のホテル整形で「同一都市・ユーザー明示なしの複数ホテル」を最初の具体ホテルへ統一。Quality Gateにも同チェックを追加。
+# - v6.2.88: Quality Gate標準プロンプトをPhase1→2→3横断チェックへ拡張。ask_user/blockは自動再作成せず、retry推奨時のみPhase2→Phase3を最大3回まで自動再作成する導線を追加。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.87-hotel-continuity-guard"
+APP_VERSION_NAME = "v6.2.88-quality-gate-auto-retry"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -722,6 +723,10 @@ def init_session_state() -> None:
         "quality_gate_issue_history": [],
         "quality_gate_user_accepted": False,
         "quality_gate_autofix_summary": [],
+        # 修正箇所(v6.2.88): Quality Gate自動再作成ループ管理
+        "quality_gate_auto_retry_summary": [],
+        "quality_gate_auto_retry_last_message": "",
+        "quality_gate_auto_retry_running": False,
     }
 
     for key, value in defaults.items():
@@ -1194,7 +1199,7 @@ def _quality_gate_normalize_check(check: Dict[str, object], source: str = "llm")
     if severity not in {"low", "medium", "high", "critical"}:
         severity = "medium"
     action = safe_text(check.get("recommended_action"), "")
-    if action not in {"accept", "auto_fix", "retry_phase2_phase3", "ask_user", "block"}:
+    if action not in {"accept", "auto_fix", "retry_phase2_only", "retry_phase2_phase3", "retry_phase1_phase2_phase3", "ask_user", "block"}:
         if status == "pass":
             action = "accept"
         elif severity in {"high", "critical"}:
@@ -1591,7 +1596,7 @@ def _quality_gate_merge_checks(result: Dict[str, object], code_checks: List[Dict
     issues = [_quality_gate_check_to_issue(check) for check in checks if safe_text(check.get("status"), "") in {"fail", "warning"}]
     has_block = any(safe_text(c.get("recommended_action"), "") == "block" for c in checks)
     has_ask_user = any(safe_text(c.get("recommended_action"), "") == "ask_user" for c in checks if c.get("status") != "pass")
-    has_retry = any(safe_text(c.get("recommended_action"), "") == "retry_phase2_phase3" for c in checks if c.get("status") != "pass")
+    has_retry = any(safe_text(c.get("recommended_action"), "") in {"retry_phase2_only", "retry_phase2_phase3"} for c in checks if c.get("status") != "pass")
     has_auto_fix = any(safe_text(c.get("recommended_action"), "") == "auto_fix" for c in checks if c.get("status") != "pass")
 
     if has_block:
@@ -1893,6 +1898,96 @@ def retry_phase2_phase3_from_existing_phase1_by_quality_gate() -> Dict[str, str]
     return {"message": "Phase1自然文案は維持し、Phase2→Phase3だけ再作成しました。"}
 
 
+
+# =========================================================
+# 修正箇所(v6.2.88): Quality Gate 自動チェック + 最大3回Phase2→Phase3再作成
+# - ask_user / block / retry_phase1_phase2_phase3 は自動再作成しない
+# - Phase1自然文案は原則維持し、Phase2→Phase3だけを最大3回まで再作成
+# - 各回でQuality Gateを再実行し、同じ問題が続く場合はユーザー判断へ切り替える
+# =========================================================
+def _quality_gate_non_pass_checks(result: Dict[str, object]) -> List[Dict[str, object]]:
+    checks = result.get("checks") if isinstance(result, dict) else []
+    if not isinstance(checks, list):
+        return []
+    return [check for check in checks if isinstance(check, dict) and safe_text(check.get("status"), "") != "pass"]
+
+
+def _quality_gate_has_user_decision_issue(result: Dict[str, object]) -> bool:
+    status = safe_text(result.get("overall_status"), "") if isinstance(result, dict) else ""
+    if status in {"fatal", "user_confirmation_required"}:
+        return True
+    for check in _quality_gate_non_pass_checks(result):
+        action = safe_text(check.get("recommended_action"), "")
+        if action in {"ask_user", "block", "retry_phase1_phase2_phase3"}:
+            return True
+    return False
+
+
+def _quality_gate_has_retryable_phase23_issue(result: Dict[str, object]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    retry_scope = safe_text(result.get("retry_scope"), "none")
+    if retry_scope in {"phase2_phase3_only", "phase2_only"}:
+        return bool(result.get("safe_to_auto_retry", False)) or safe_text(result.get("overall_status"), "") == "retry_recommended"
+    for check in _quality_gate_non_pass_checks(result):
+        if safe_text(check.get("recommended_action"), "") in {"retry_phase2_only", "retry_phase2_phase3"}:
+            return True
+    return False
+
+
+def _quality_gate_result_summary_line(result: Dict[str, object], label: str) -> str:
+    status = safe_text(result.get("overall_status"), "unknown") if isinstance(result, dict) else "unknown"
+    score = safe_text(result.get("score"), "-") if isinstance(result, dict) else "-"
+    retry_scope = safe_text(result.get("retry_scope"), "none") if isinstance(result, dict) else "none"
+    issue_count = len(_quality_gate_non_pass_checks(result)) if isinstance(result, dict) else 0
+    summary = safe_text(result.get("summary"), "") if isinstance(result, dict) else ""
+    return f"{label}: status={status} / score={score} / retry_scope={retry_scope} / issues={issue_count}" + (f" / {summary}" if summary else "")
+
+
+def run_quality_gate_auto_retry(max_retries: int = 3) -> Dict[str, object]:
+    """Quality Gateを実行し、retry推奨のPhase2→Phase3だけ最大3回まで再作成する。"""
+    max_retries = max(1, min(3, int(max_retries or 3)))
+    st.session_state.quality_gate_auto_retry_running = True
+    auto_summary: List[str] = []
+    retries_done = 0
+    final_result: Dict[str, object] = {}
+
+    try:
+        for check_round in range(max_retries + 1):
+            result = run_current_quality_gate()
+            final_result = result if isinstance(result, dict) else {}
+            st.session_state.quality_gate_result = final_result
+            st.session_state.quality_gate_raw = safe_text(final_result.get("raw"), "")
+            st.session_state.quality_gate_last_signature = _quality_gate_issue_signature(final_result)
+            st.session_state.quality_gate_user_accepted = False
+            auto_summary.append(_quality_gate_result_summary_line(final_result, f"チェック{check_round + 1}"))
+
+            if _quality_gate_has_user_decision_issue(final_result):
+                auto_summary.append("ユーザー判断が必要な項目があるため、自動再作成を停止しました。")
+                break
+
+            if not _quality_gate_has_retryable_phase23_issue(final_result):
+                auto_summary.append("Phase2→Phase3再作成が必要な問題は検出されませんでした。")
+                break
+
+            if retries_done >= max_retries:
+                auto_summary.append("最大再作成回数に到達したため、自動再作成を停止しました。")
+                break
+
+            retry_phase2_phase3_from_existing_phase1_by_quality_gate()
+            retries_done += 1
+            auto_summary.append(f"Phase1は維持し、Phase2→Phase3だけ再作成しました（{retries_done}/{max_retries}）。")
+
+        st.session_state.quality_gate_auto_retry_summary = auto_summary
+        final_status = safe_text(final_result.get("overall_status"), "unknown") if isinstance(final_result, dict) else "unknown"
+        message = f"Quality Gate自動チェックを完了しました。Phase2→Phase3再作成: {retries_done}回 / 最終判定: {final_status}"
+        st.session_state.quality_gate_auto_retry_last_message = message
+        log_event("Quality Gate自動再作成", " / ".join(auto_summary), level="info")
+        return {"message": message, "retries_done": retries_done, "summary": auto_summary, "final_result": final_result}
+    finally:
+        st.session_state.quality_gate_auto_retry_running = False
+
+
 def render_quality_gate_panel() -> None:
     if render_quality_gate_panel_ui is None:
         st.markdown("### 🧭 Quality Gate（完成旅程チェック）")
@@ -1902,6 +1997,7 @@ def render_quality_gate_panel() -> None:
     render_quality_gate_panel_ui(
         run_current_quality_gate=run_current_quality_gate,
         retry_phase2_phase3_from_existing_phase1=retry_phase2_phase3_from_existing_phase1_by_quality_gate,
+        run_quality_gate_auto_retry=run_quality_gate_auto_retry,
         safe_text=safe_text,
         log_event=log_event,
     )

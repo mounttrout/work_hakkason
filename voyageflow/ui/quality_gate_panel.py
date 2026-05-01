@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 ui/quality_gate_panel.py
-VoyageFlow v6.2.83
+VoyageFlow v6.2.88
 - Quality Gate の表示UIを app.py から分離
 - LLMチェック、コード側安全補正、Phase2→Phase3再作成処理は callback に委ねる
+- 最大3回の自動チェック→Phase2→Phase3再作成ボタンを追加
 """
 
 from typing import Callable, Dict
@@ -101,36 +102,56 @@ def render_quality_gate_panel_ui(
     *,
     run_current_quality_gate: Callable[[], Dict[str, object]],
     retry_phase2_phase3_from_existing_phase1: Callable[[], Dict[str, str]],
+    run_quality_gate_auto_retry: Callable[..., Dict[str, object]] | None = None,
     safe_text: Callable,
     log_event: Callable,
 ) -> None:
     st.markdown("### 🧭 Quality Gate（完成旅程チェック）")
     st.caption(
-        "Phase3完成旅程をチェックリストで判定します。"
+        "Phase1自然文案・Phase2構造化データ・Phase3完成旅程をチェックリストで判定します。"
         "明確な短距離移動・同一地点移動・ホテル分類ミスなどはコード側の安全ルールで即時補正し、"
         "相撲日程やホテル選択など判断が必要なものはユーザー確認に回します。"
     )
 
-    col1, col2 = st.columns([1, 1])
+    col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
-        if st.button("🧭 完成旅程を品質チェックする", use_container_width=True, key="run_quality_gate_check"):
+        if st.button("🧭 品質チェックする", use_container_width=True, key="run_quality_gate_check"):
             result = run_current_quality_gate()
             st.session_state.quality_gate_result = result
             st.session_state.quality_gate_raw = safe_text(result.get("raw"), "")
             st.session_state.quality_gate_last_signature = _issue_signature(result, safe_text)
             st.session_state.quality_gate_user_accepted = False
     with col2:
-        if st.button("🧹 Quality Gate結果をクリア", use_container_width=True, key="clear_quality_gate_check"):
+        if st.button("🤖 自動チェック→最大3回再作成", use_container_width=True, key="run_quality_gate_auto_retry"):
+            if run_quality_gate_auto_retry is None:
+                st.warning("自動再作成コールバックが未設定です。")
+            else:
+                result_message = run_quality_gate_auto_retry(max_retries=3)
+                st.session_state.quality_gate_auto_retry_last_message = safe_text(result_message.get("message"), "自動チェックを完了しました。")
+                st.rerun()
+    with col3:
+        if st.button("🧹 結果をクリア", use_container_width=True, key="clear_quality_gate_check"):
             st.session_state.quality_gate_result = None
             st.session_state.quality_gate_raw = ""
             st.session_state.quality_gate_last_signature = ""
             st.session_state.quality_gate_user_accepted = False
             st.session_state.quality_gate_autofix_summary = []
+            st.session_state.quality_gate_auto_retry_summary = []
+            st.session_state.quality_gate_auto_retry_last_message = ""
             st.rerun()
+
+    auto_retry_summary = st.session_state.get("quality_gate_auto_retry_summary")
+    auto_retry_message = safe_text(st.session_state.get("quality_gate_auto_retry_last_message"), "")
+    if auto_retry_message and auto_retry_message != "-":
+        st.info(auto_retry_message)
+    if isinstance(auto_retry_summary, list) and auto_retry_summary:
+        with st.expander("自動チェック・再作成ログ", expanded=False):
+            for line in auto_retry_summary:
+                st.write(f"- {safe_text(line, '')}")
 
     result = st.session_state.get("quality_gate_result")
     if not isinstance(result, dict) or not result:
-        st.info("必要なときだけ実行するチェックです。実行するまで旅程の中身は変更しません。")
+        st.info("必要なときだけ実行するチェックです。自動チェックボタンでは、ユーザー判断が不要なretry推奨のみPhase2→Phase3を最大3回まで再作成します。")
         return
 
     status = safe_text(result.get("overall_status"), "user_confirmation_required")
@@ -178,7 +199,7 @@ def render_quality_gate_panel_ui(
                 st.info(body)
 
     st.markdown("#### 次の操作")
-    retry_allowed = safe_to_retry or retry_scope == "phase2_phase3_only" or status == "retry_recommended"
+    retry_allowed = safe_to_retry or retry_scope in {"phase2_only", "phase2_phase3_only"} or status == "retry_recommended"
     if retry_allowed:
         if retry_count >= 2:
             st.warning("Phase2→Phase3再作成を複数回実行済みです。同じ問題が続く場合は、自動的に直そうとせずユーザー判断に切り替えるのが安全です。")

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 services/quality_gate_agent.py
-VoyageFlow v6.2.83
+VoyageFlow v6.2.88
 
 Quality Gate Agent:
-- Geminiには完成旅程のチェックリスト判定だけをさせる
+- GeminiにはPhase1→Phase2→Phase3横断のチェックリスト判定だけをさせる
 - 修正済みの旅程データは返させない
 - 明確な安全補正は app.py 側のコードホワイトリストで処理する
 - 判断分岐があるものはユーザー確認へ回す
@@ -66,7 +66,7 @@ def _normalize_check(check: Dict[str, object]) -> Dict[str, object]:
         severity = "medium"
 
     action = _safe_text(check.get("recommended_action"), "")
-    if action not in {"accept", "auto_fix", "retry_phase2_phase3", "ask_user", "block"}:
+    if action not in {"accept", "auto_fix", "retry_phase2_only", "retry_phase2_phase3", "retry_phase1_phase2_phase3", "ask_user", "block"}:
         if status == "pass":
             action = "accept"
         elif severity in {"high", "critical"}:
@@ -151,7 +151,7 @@ def _normalize_quality_result(parsed: Dict[str, object], raw: str) -> Dict[str, 
             status = "ok"
         elif any(issue.get("recommended_action") == "auto_fix" for issue in issues):
             status = "auto_fix_available"
-        elif any(issue.get("recommended_action") == "retry_phase2_phase3" for issue in issues):
+        elif any(issue.get("recommended_action") in {"retry_phase2_only", "retry_phase2_phase3", "retry_phase1_phase2_phase3"} for issue in issues):
             status = "retry_recommended"
         elif any(issue.get("severity") in {"critical", "high"} for issue in issues):
             status = "user_confirmation_required"
@@ -159,7 +159,7 @@ def _normalize_quality_result(parsed: Dict[str, object], raw: str) -> Dict[str, 
             status = "user_confirmation_required"
 
     retry_scope = _safe_text(parsed.get("retry_scope"), "none")
-    if retry_scope not in {"none", "phase2_phase3_only", "ask_user"}:
+    if retry_scope not in {"none", "phase2_only", "phase2_phase3_only", "phase1_phase2_phase3", "ask_user"}:
         retry_scope = "none"
 
     try:
@@ -175,7 +175,7 @@ def _normalize_quality_result(parsed: Dict[str, object], raw: str) -> Dict[str, 
     score = max(0, min(100, score))
 
     safe_to_retry = bool(parsed.get("safe_to_auto_retry", False))
-    if status == "retry_recommended" and retry_scope == "phase2_phase3_only":
+    if status == "retry_recommended" and retry_scope in {"phase2_only", "phase2_phase3_only"}:
         safe_to_retry = True
     if status in {"fatal", "user_confirmation_required"}:
         safe_to_retry = False
@@ -202,55 +202,78 @@ def _build_quality_gate_prompt(
 ) -> str:
     planning_json = json.dumps(planning_state, ensure_ascii=False, default=str)
     return f"""
-あなたは旅行アプリ VoyageFlow の Phase3 Quality Gate Agent です。
-あなたの役割は「完成旅程をチェックリストに沿って判定すること」だけです。
-旅程を書き換えたり、修正版のPhase2/Phase3を作ったりしてはいけません。
+あなたは旅行アプリ VoyageFlow の Quality Gate Agent です。
+あなたの役割は「Phase1自然文案、Phase2構造化データ、Phase3完成旅程を横断してチェックリストに沿って判定すること」だけです。
+旅程を書き換えたり、修正版のPhase1/Phase2/Phase3を作ったりしてはいけません。
 
 基本方針:
 - LLMは品質判定だけを行う。
 - 自動修正してよいかどうかは recommended_action で示すだけ。
 - 実際の修正はアプリ側コードがホワイトリストで制御する。
 - 判断が必要なものは ask_user にする。
-- Phase1自然文案が良く、Phase2/Phase3構造化だけが怪しい場合は retry_phase2_phase3 を提案する。
+- Phase1自然文案が良く、Phase2構造化だけが怪しい場合は retry_phase2_only を提案する。
+- Phase1自然文案が良く、Phase2/Phase3構造化・経路補完だけが怪しい場合は retry_phase2_phase3 を提案する。
+- Phase1自然文案自体がユーザー条件を満たしていない場合は retry_phase1_phase2_phase3 を提案してよいが、アプリ側は自動再作成せずユーザー確認に回す。
+- ask_user / block / retry_phase1_phase2_phase3 は自動再作成対象外。
 - 同じような再生成を何度も繰り返させず、判断分岐があるものはユーザー確認に回す。
 
 必ず次のチェックリストを1項目ずつ意識して判定してください。
 
-[旅行条件チェック]
+[ユーザー条件チェック]
 1. 旅行日数が条件と合っているか。
 2. 出発地から始まっているか。
 3. 最終帰着地に戻っているか。
 4. 主目的地・固定要望が反映されているか。
+5. ユーザーが明示した移動スタイルが守られているか。
+
+[Phase1自然文案チェック]
+6. 自然文案がユーザー要望を満たしているか。
+7. 日数、日付、目的地、固定予定に矛盾がないか。
+8. ホテルが必要な旅行で宿泊の考え方が示されているか。
+9. 相撲、歌舞伎、劇場、スポーツなど日時依存要素は公式確認が必要な旨を示しているか。
+
+[Phase2構造化データチェック]
+10. Phase1の内容がPhase2に落ちているか。
+11. 泊数分のホテル行があるか。
+12. genre=hotel なのに purpose=transport になっていないか。
+13. purpose=transport の行が移動時間を内包している場合、Phase3でtransport bridge行として扱う必要があるか。
+14. 食事・観光・宿泊・移動の分類が明らかにおかしくないか。
+15. 日付、start_time、end_time が日をまたいで破綻していないか。
 
 [ホテルチェック]
 5. 泊数分の宿泊があるか。
 6. genre=hotel なのに purpose=transport になっていないか。
 7. 帰着後にホテルや観光ノードが残っていないか。
 8. ホテル名が抽象名の場合、無理に具体ホテル扱いしていないか。
+9. 同一都市内・近距離で、ユーザーが明示していないのに複数ホテルを選んでいないか。
+   - 例: 1泊目=かどやホテル、2泊目=安心お宿 Tokyo Man 新宿駅南口店 のようなホテル変更。
+   - ユーザーがホテル変更を明示していなければ recommended_action=auto_fix または retry_phase2_phase3。
 
 [移動カードチェック]
-9. スポット間に移動カードがあるか。
-10. 同一地点移動がないか。
-11. 徒歩圏内なのに電車・バスになっていないか。
-12. 長距離なのに短すぎる移動時間になっていないか。
-13. ユーザーの移動希望と矛盾していないか。
+10. スポット間に移動カードがあるか。
+11. 同一地点移動がないか。
+12. 徒歩圏内なのに電車・バスになっていないか。
+13. 長距離なのに短すぎる移動時間になっていないか。
+14. ユーザーの移動希望と矛盾していないか。
 ※徒歩圏内の短距離移動をwalkにすることは「電車メイン」と矛盾しません。
 
 [目的分類チェック]
-14. 観光施設・資料館・博物館が meal になっていないか。
-15. 食事場所が観光施設扱いになっていないか。
-16. 駅・ホテルが不自然な長時間滞在スポットになっていないか。
+15. 観光施設・資料館・博物館が meal になっていないか。
+16. 食事場所が観光施設扱いになっていないか。
+17. 駅・ホテルが不自然な長時間滞在スポットになっていないか。
 
 [イベント・営業日チェック]
-17. 相撲・歌舞伎など日時依存イベントは日付確認が必要か。
-18. 開催期間外・公演期間外の可能性がある場合は ask_user にする。
-19. 自動で日程変更・スポット変更はしない。
+18. 相撲・歌舞伎など日時依存イベントは日付確認が必要か。
+19. 開催期間外・公演期間外の可能性がある場合は ask_user にする。
+20. 自動で日程変更・スポット変更はしない。
 
 recommended_action の基準:
 - accept: 問題なし
-- auto_fix: 同一地点移動削除、短距離train→walk、明確なpurpose誤分類など、コード側で安全補正できそうなもの
-- retry_phase2_phase3: Phase1は良いが、Phase2/Phase3構造化の再作成で直りそうなもの
-- ask_user: 相撲開催日、ホテル選択、日程変更、旅程方針などユーザー判断が必要なもの
+- auto_fix: 同一地点移動削除、短距離train→walk、明確なpurpose誤分類、ユーザー明示なしの同一都市内ホテル複数化など、コード側で安全補正できそうなもの
+- retry_phase2_only: Phase1は良いが、Phase2構造化の再作成で直りそうなもの
+- retry_phase2_phase3: Phase1は良いが、Phase2/Phase3構造化・経路補完の再作成で直りそうなもの
+- retry_phase1_phase2_phase3: Phase1自然文案自体がユーザー条件を満たしていないもの。ただしこれは自動再作成ではなくユーザー確認に回す。
+- ask_user: 相撲開催日、歌舞伎公演日、ホテル選択、日程変更、旅程方針などユーザー判断が必要なもの
 - block: 重大でこのまま進めるべきでないもの
 
 出力JSON形式:
@@ -258,7 +281,7 @@ recommended_action の基準:
   "overall_status": "ok | auto_fix_available | retry_recommended | user_confirmation_required | fatal",
   "score": 0,
   "summary": "全体所見を短く",
-  "retry_scope": "none | phase2_phase3_only | ask_user",
+  "retry_scope": "none | phase2_only | phase2_phase3_only | phase1_phase2_phase3 | ask_user",
   "safe_to_auto_retry": false,
   "checks": [
     {{
@@ -269,10 +292,12 @@ recommended_action の基準:
       "location": "Dayや時刻など",
       "evidence": "成立/不成立の根拠",
       "suggestion": "どう扱うべきか。修正版データは作らない",
-      "recommended_action": "accept | auto_fix | retry_phase2_phase3 | ask_user | block",
+      "recommended_action": "accept | auto_fix | retry_phase2_only | retry_phase2_phase3 | retry_phase1_phase2_phase3 | ask_user | block",
       "user_message": "ユーザーに確認する場合の短い文"
     }}
-  ]
+  ],
+  "auto_fix_candidates": [],
+  "user_questions": []
 }}
 
 旅行条件:
