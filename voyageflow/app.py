@@ -136,9 +136,11 @@ except Exception:
 # - v6.2.82: サイドバー診断ツールと生成温度/デバッグモードを開発者ツール内へ隠し、診断UIを ui/sidebar_dev_tools.py へ分離。
 # - v6.2.83: Phase3 Quality Gateをチェックリスト方式へ強化。短距離train→walk、ホテルpurpose誤分類、帰着後ノードなど明確なものだけコード側で安全補正する。
 # - v6.2.84: 両国国技館などイベント開催日注意の固定文を廃止し、row["date"] の訪問日から警告文を動的生成する。
+# - v6.2.85: destination側transport行のstart/endを移動カード時間として採用し、長距離短時間破綻をコード側ハードチェックで検出。
+# - v6.2.86: Phase3.5検証エージェントの通常表示を消し、完成旅程チェックをQuality Gateへ一本化。旧Phase3.5関数は退避として残す。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.85-transport-bridge-hardcheck"
+APP_VERSION_NAME = "v6.2.86-remove-phase35-panel"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -10576,7 +10578,8 @@ def render_final_itinerary_content() -> None:
 
         st.markdown("### 完成旅程タイムライン")
         render_google_calendar_sync_panel(df_phase3)
-        render_phase35_validation_panel(st.session_state.trip_plan or "", df_phase3)
+        # --- 修正箇所(v6.2.86): Phase3.5検証エージェントは通常UIから非表示化し、Quality Gateへ一本化 ---
+        # 旧Phase3.5関数はロールバック用に残すが、完成旅程タブでは表示しない。
         render_quality_gate_panel()
         render_transport_policy_warning_panel()
 
