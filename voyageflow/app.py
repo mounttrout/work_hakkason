@@ -140,9 +140,10 @@ except Exception:
 # - v6.2.86: Phase3.5検証エージェントの通常表示を消し、完成旅程チェックをQuality Gateへ一本化。旧Phase3.5関数は退避として残す。
 # - v6.2.87: 既存生成本体は触らず、Phase3後のホテル整形で「同一都市・ユーザー明示なしの複数ホテル」を最初の具体ホテルへ統一。Quality Gateにも同チェックを追加。
 # - v6.2.88: Quality Gate標準プロンプトをPhase1→2→3横断チェックへ拡張。ask_user/blockは自動再作成せず、retry推奨時のみPhase2→Phase3を最大3回まで自動再作成する導線を追加。
+# - v6.2.89: ホテル継続ガードを「銀座周辺ホテル」「両国周辺ホテル」など周辺ホテルラベルにも適用し、補正結果を左サイドバー診断で確認可能にする。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.88-quality-gate-auto-retry"
+APP_VERSION_NAME = "v6.2.89-hotel-continuity-devtools-visible"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -1324,27 +1325,27 @@ def _quality_gate_build_code_checks(
             ))
 
         # --- 修正箇所(v6.2.87): 同一都市・ユーザー明示なしの複数ホテルをQuality Gateでも検出 ---
-        concrete_hotel_rows = _collect_phase3_hotel_rows_for_continuity(df_phase3)
-        concrete_hotel_names: List[str] = []
-        for hotel_row in concrete_hotel_rows:
+        hotel_candidate_rows = _collect_phase3_hotel_rows_for_continuity(df_phase3)
+        hotel_candidate_names: List[str] = []
+        for hotel_row in hotel_candidate_rows:
             name = safe_text(hotel_row.get("destination"), "")
-            if name and name not in concrete_hotel_names:
-                concrete_hotel_names.append(name)
+            if name and name not in hotel_candidate_names:
+                hotel_candidate_names.append(name)
         if (
-            len(concrete_hotel_names) >= 2
+            len(hotel_candidate_names) >= 2
             and not _user_explicitly_requests_hotel_change(planning_state)
-            and _hotel_names_are_safe_to_unify(concrete_hotel_names, df_phase3.reset_index(drop=True), planning_state)
+            and _hotel_names_are_safe_to_unify(hotel_candidate_names, df_phase3.reset_index(drop=True), planning_state)
         ):
-            canonical_hotel = _canonical_hotel_name_for_continuity(concrete_hotel_rows)
-            replace_targets = [name for name in concrete_hotel_names if name != canonical_hotel]
+            canonical_hotel = _canonical_hotel_name_for_continuity(hotel_candidate_rows)
+            replace_targets = [name for name in hotel_candidate_names if name != canonical_hotel]
             checks.append(_quality_gate_make_check(
                 check_id="hotel_multiple_without_user_instruction",
                 category="hotel",
                 status="fail",
                 severity="medium",
                 location="完成旅程全体",
-                evidence=f"ユーザーがホテル変更を明示していないのに、同一都市圏で複数ホテルが出ています: {', '.join(concrete_hotel_names)}",
-                suggestion=f"最初の具体ホテル『{canonical_hotel}』へ統一します。",
+                evidence=f"ユーザーがホテル変更を明示していないのに、同一都市圏で複数ホテル候補が出ています: {', '.join(hotel_candidate_names)}",
+                suggestion=f"最初のホテル候補『{canonical_hotel}』へ統一します。",
                 recommended_action="auto_fix",
                 user_message="同一都市内で複数ホテルが出ているため、最初のホテルへ統一できます。",
                 auto_fix={
@@ -2816,8 +2817,18 @@ def _is_concrete_hotel_row_for_continuity(row: Dict | pd.Series) -> bool:
         return False
     if not _is_valid_hotel_row(row):
         return False
-    if _is_generic_hotel_label(destination) or _is_bad_hotel_label(destination) or _looks_like_invalid_itinerary_node_name(destination):
+    if _is_bad_hotel_label(destination) or _looks_like_invalid_itinerary_node_name(destination):
         return False
+
+    # --- 修正箇所(v6.2.89): 周辺ホテルラベルもホテル継続ガードの候補に含める ---
+    # v6.2.87 では「具体ホテル名」だけを候補にしたため、
+    # 「銀座周辺ホテル」→「両国周辺ホテル」のような同一都市内の周辺ホテル変更を補正できなかった。
+    # ユーザーがホテル変更を明示していない場合は、エリア付き周辺ホテルも継続対象として扱う。
+    if _is_generic_hotel_label(destination):
+        area_hint = _extract_area_hint(destination)
+        generic_without_area = {"ホテル", "宿", "宿泊ホテル", "周辺ホテル", "エリア周辺ホテル", "宿泊先", "ホテル周辺"}
+        return bool(area_hint and destination not in generic_without_area)
+
     return True
 
 
@@ -2888,6 +2899,31 @@ def _canonical_hotel_name_for_continuity(hotel_rows: List[Dict[str, object]]) ->
     return safe_text(sorted_rows[0].get("destination"), "")
 
 
+def _record_hotel_continuity_guard_diag(
+    *,
+    status: str,
+    candidates: Optional[List[str]] = None,
+    canonical: str = "",
+    replaced: Optional[List[str]] = None,
+    notes: Optional[List[str]] = None,
+    reason: str = "",
+) -> None:
+    """左サイドバー診断用に、ホテル継続ガードの直近結果を保存する。"""
+    try:
+        st.session_state.hotel_continuity_guard_last_diag = {
+            "version": APP_VERSION_NAME,
+            "status": status,
+            "candidates": list(candidates or []),
+            "canonical": safe_text(canonical, ""),
+            "replaced": list(replaced or []),
+            "notes": list(notes or []),
+            "reason": safe_text(reason, ""),
+            "checked_at": datetime.now().strftime("%H:%M:%S"),
+        }
+    except Exception:
+        pass
+
+
 def _normalize_phase3_hotel_stay_times(df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
     if df is None or df.empty:
         return df, []
@@ -2917,12 +2953,14 @@ def _normalize_phase3_hotel_stay_times(df: pd.DataFrame) -> tuple[pd.DataFrame, 
 
 def _apply_phase3_hotel_continuity_guard(df: pd.DataFrame, planning_state: Dict[str, object]) -> tuple[pd.DataFrame, List[str]]:
     if df is None or df.empty:
+        _record_hotel_continuity_guard_diag(status="skipped", reason="df_phase3 が空です")
         return df, []
     fixed = df.copy().reset_index(drop=True)
     notes: List[str] = []
     fixed, time_notes = _normalize_phase3_hotel_stay_times(fixed)
     notes.extend(time_notes)
     if _user_explicitly_requests_hotel_change(planning_state):
+        _record_hotel_continuity_guard_diag(status="skipped", notes=notes, reason="ユーザーがホテル変更を明示しています")
         return fixed, notes
     hotel_rows = _collect_phase3_hotel_rows_for_continuity(fixed)
     hotel_names = [safe_text(row.get("destination"), "") for row in hotel_rows]
@@ -2931,14 +2969,18 @@ def _apply_phase3_hotel_continuity_guard(df: pd.DataFrame, planning_state: Dict[
         if name and name not in unique_names:
             unique_names.append(name)
     if len(unique_names) <= 1:
+        _record_hotel_continuity_guard_diag(status="no_multiple_hotels", candidates=unique_names, notes=notes, reason="統一対象の複数ホテル候補はありません")
         return fixed, notes
     if not _hotel_names_are_safe_to_unify(unique_names, fixed, planning_state):
+        _record_hotel_continuity_guard_diag(status="not_safe_to_unify", candidates=unique_names, notes=notes, reason="都市/エリア移動が大きい可能性があるため自動統一しません")
         return fixed, notes
     canonical = _canonical_hotel_name_for_continuity(hotel_rows)
     if not canonical:
+        _record_hotel_continuity_guard_diag(status="not_applied", candidates=unique_names, notes=notes, reason="統一先ホテルを決定できません")
         return fixed, notes
     replaced_names = [name for name in unique_names if name != canonical]
     if not replaced_names:
+        _record_hotel_continuity_guard_diag(status="no_replacement", candidates=unique_names, canonical=canonical, notes=notes, reason="置換対象がありません")
         return fixed, notes
     for idx, row in fixed.iterrows():
         destination = safe_text(row.get("destination"), "")
@@ -2951,6 +2993,7 @@ def _apply_phase3_hotel_continuity_guard(df: pd.DataFrame, planning_state: Dict[
             if col in fixed.columns and safe_text(row.get(col), "") in replaced_names:
                 fixed.at[idx, col] = canonical
     notes.append(f"ユーザー明示なしの複数ホテルを同一ホテルへ統一: {', '.join(replaced_names)} → {canonical}")
+    _record_hotel_continuity_guard_diag(status="applied", candidates=unique_names, canonical=canonical, replaced=replaced_names, notes=notes, reason="同一都市圏・明示指示なしのため自動統一")
     return fixed.reset_index(drop=True), notes
 
 def parse_route_diagnostic_departure_iso(departure_text: str) -> str:

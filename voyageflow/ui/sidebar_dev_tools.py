@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 ui/sidebar_dev_tools.py
-VoyageFlow v6.2.82
+VoyageFlow v6.2.89
 - サイドバー診断ツールを app.py から分離
 - 通常時は開発者ツールを非表示
 - app.py 側の既存関数を context/callback として受け取り、診断機能自体は削除しない
+- v6.2.89: ホテル継続ガードの候補・統一先・補正結果を左サイドバーで確認できる診断欄を追加
 """
 
 import os
@@ -18,6 +19,75 @@ def _safe_call(fn: Callable, *args, **kwargs):
     if fn is None:
         return None
     return fn(*args, **kwargs)
+
+
+def _render_hotel_continuity_guard_status(*, safe_text: Callable) -> None:
+    """ホテル継続ガードが効いたかを左側テストスペースで確認する。"""
+    with st.expander("🏨 ホテル継続ガード確認", expanded=False):
+        st.caption("完成旅程のホテル候補が複数化したとき、同一都市・明示指示なしなら統一されたかを確認します。")
+        diag = st.session_state.get("hotel_continuity_guard_last_diag")
+        if not isinstance(diag, dict):
+            st.info("まだホテル継続ガードの診断結果はありません。完成旅程生成またはQuality Gate実行後に表示されます。")
+        else:
+            status = safe_text(diag.get("status"), "")
+            status_label = {
+                "applied": "✅ 自動統一済み",
+                "no_multiple_hotels": "✅ 複数ホテルなし",
+                "not_safe_to_unify": "⚠️ 自動統一せず",
+                "skipped": "ℹ️ スキップ",
+                "not_applied": "⚠️ 未適用",
+                "no_replacement": "ℹ️ 置換対象なし",
+            }.get(status, status or "不明")
+            st.write(f"状態: {status_label}")
+            if diag.get("checked_at"):
+                st.caption(f"確認時刻: {safe_text(diag.get('checked_at'), '')}")
+            if diag.get("candidates"):
+                st.write("検出したホテル候補")
+                st.json(diag.get("candidates"))
+            if diag.get("canonical"):
+                st.write(f"統一先: {safe_text(diag.get('canonical'), '')}")
+            if diag.get("replaced"):
+                st.write("置換したホテル候補")
+                st.json(diag.get("replaced"))
+            if diag.get("notes"):
+                st.write("補正メモ")
+                for note in diag.get("notes") or []:
+                    st.caption(f"- {safe_text(note, '')}")
+            if diag.get("reason"):
+                st.caption(f"理由: {safe_text(diag.get('reason'), '')}")
+
+        df = st.session_state.get("df_phase3")
+        try:
+            if df is not None and not df.empty and "destination" in df.columns:
+                hotel_rows = []
+                for _, row in df.iterrows():
+                    dest = safe_text(row.get("destination"), "")
+                    purpose = safe_text(row.get("purpose"), "")
+                    genre = safe_text(row.get("genre"), "")
+                    is_transport = bool(row.get("is_transport", False))
+                    if is_transport:
+                        continue
+                    if ("ホテル" in dest) or (genre.lower() == "hotel") or (purpose.lower() in {"accommodation", "hotel", "stay", "lodging"}):
+                        hotel_rows.append({
+                            "day": int(row.get("day")) if row.get("day") is not None else "",
+                            "start": safe_text(row.get("start_time"), ""),
+                            "destination": dest,
+                            "purpose": purpose,
+                            "genre": genre,
+                        })
+                if hotel_rows:
+                    st.write("現在の完成旅程内ホテル行")
+                    st.dataframe(hotel_rows, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("現在の完成旅程内にホテル行は見つかりません。")
+        except Exception as e:
+            st.caption(f"ホテル行の読み取りをスキップしました: {e}")
+
+        summary = st.session_state.get("quality_gate_autofix_summary")
+        if summary:
+            st.write("Quality Gate安全補正の直近メモ")
+            for note in summary:
+                st.caption(f"- {safe_text(note, '')}")
 
 
 def _render_routes_diagnostic(
@@ -358,6 +428,7 @@ def render_sidebar_dev_tools(
     st.markdown("### 🧪 診断ツール")
     render_gemini_transport_ab_test_panel()
     render_transport_estimation_test_panel()
+    _render_hotel_continuity_guard_status(safe_text=safe_text)
 
     _render_routes_diagnostic(
         parse_route_diagnostic_departure_iso=parse_route_diagnostic_departure_iso,
