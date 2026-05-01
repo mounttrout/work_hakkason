@@ -107,7 +107,7 @@ except Exception:
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.75-transport-policy-resolver"
+APP_VERSION_NAME = "v6.2.76-transport-policy-day-start-and-public-mode-fix"
 APP_UPDATED_DATE = "2026-04-30"
 
 
@@ -4619,10 +4619,12 @@ def _resolve_segment_transport_policy(
             mode = hinted_mode if hinted_mode in {"train", "bus"} else "train"
             warning = f"{origin}→{dest}: 旅程内に車を置いて公共交通へ切り替える文脈があるため、例外的に{_mode_label_for_warning(mode)}扱いにしました。"
             reason = "自家用車希望だが、車を置いて公共交通へ切替える明示文脈を優先"
-        elif any(token in segment_text for token in ["徒歩", "歩いて", "徒歩圏", "散策", "同一エリア", "周辺"]):
-            # 徒歩は明示がある場合だけ許可。自家用車旅行でも施設内・近接地では自然。
+        elif any(token in segment_text for token in ["徒歩で移動", "歩いて移動", "徒歩圏", "徒歩移動"]):
+            # 修正箇所(v6.2.76):
+            # 「観光地で散策する」というメモを、スポット間移動の徒歩指定と誤解しない。
+            # 自家用車旅行で徒歩を許可するのは、移動そのものが徒歩だと明示された場合だけ。
             mode = "walk"
-            reason = "自家用車旅行だが、区間文脈に徒歩・散策が明示されているため徒歩を採用"
+            reason = "自家用車旅行だが、区間移動として徒歩が明示されているため徒歩を採用"
         elif hinted_mode in {"train", "bus"} and service_hint:
             warning = f"{origin}→{dest}: 構造化データに公共交通ヒント「{service_hint}」がありますが、ユーザーの自家用車希望を優先して自家用車扱いにしました。非効率・駐車制約がある場合は現地確認してください。"
     elif style == "電車メイン" or base_mode == "train":
@@ -4772,7 +4774,8 @@ def _enforce_private_car_mode_for_segment(
         return "bus"
 
     # 明示的な徒歩・タクシーは許可。
-    if mode_key == "walk" and any(token in context for token in ["徒歩", "歩いて", "徒歩圏", "散策", "同一エリア", "周辺"]):
+    # 修正箇所(v6.2.76): 「散策」「周辺」だけでスポット間移動を徒歩にしない。
+    if mode_key == "walk" and any(token in context for token in ["徒歩で移動", "歩いて移動", "徒歩圏", "徒歩移動"]):
         return "walk"
     if mode_key == "taxi" or any(token in context for token in ["タクシー"]):
         return "taxi"
@@ -4943,6 +4946,68 @@ def _looks_like_phase2_embedded_transport_row(current: pd.Series | Dict, actual_
     station_like = ("駅" in current_dest) or ("station" in genre)
 
     return bool(station_like and has_transport_context and touches_next)
+
+
+
+def _looks_like_embedded_departure_transport_row(current: pd.Series | Dict, actual_next: pd.Series | Dict, min_minutes: int = 15) -> bool:
+    """
+    修正箇所(v6.2.76):
+    Phase2が「出発地点/ホテル名 09:00-11:00 / 高速道路で次スポットへ」のように、
+    その日の最初の移動をスポット行として出すケースを検知する。
+
+    以前の福井駅→東京駅ガードを、2日目以降の宿・出発地点にも広げる。
+    ただし通常のホテル滞在・観光スポット滞在は変換しない。
+    """
+    if current is None or actual_next is None:
+        return False
+
+    if bool(_row_value(current, "is_transport", False)) or bool(_row_value(actual_next, "is_transport", False)):
+        return False
+
+    origin_name = safe_text(_row_value(current, "destination", ""), "")
+    destination_name = safe_text(_row_value(actual_next, "destination", ""), "")
+    if not origin_name or not destination_name or _same_effective_place(origin_name, destination_name):
+        return False
+
+    start_time = safe_text(_row_value(current, "start_time", ""), "")
+    end_time = safe_text(_row_value(current, "end_time", ""), "")
+    next_start = safe_text(_row_value(actual_next, "start_time", ""), "")
+    start_min = _time_to_minutes(start_time)
+    end_min = _time_to_minutes(end_time)
+    if start_min is None or end_min is None:
+        return False
+
+    duration = end_min - start_min
+    if duration < 0:
+        duration += 24 * 60
+    if duration < min_minutes:
+        return False
+
+    # currentの終了時刻が次スポットの開始時刻に接続しているものだけを対象にする。
+    # これにより、普通の滞在行を移動カード化しない。
+    gap_to_next = _minutes_between_clock(end_time, next_start) if end_time and next_start else None
+    if gap_to_next is None or not (0 <= gap_to_next <= 10):
+        return False
+
+    purpose = safe_text(_row_value(current, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(current, "genre", ""), "").lower()
+    one_point = safe_text(_row_value(current, "one_point", ""), "")
+    context = f"{origin_name} {purpose} {genre} {one_point}"
+
+    purpose_transportish = purpose in {"transport", "move", "departure", "return", "arrival"} or any(token in purpose for token in ["移動", "出発", "帰路"])
+    memo_transportish = any(token in context for token in [
+        "移動", "出発", "向かう", "向かいます", "利用", "高速道路", "自動車道", "新幹線", "電車", "列車",
+        "バス", "シャトル", "タクシー", "自家用車", "マイカー", "レンタカー", "ドライブ"
+    ])
+
+    # ホテル行でも「目的: 移動」「目的: 出発」や道路利用メモがある場合は、
+    # 宿泊滞在ではなくその日の出発移動として扱う。
+    if _is_hotel_or_lodging_row(current):
+        return bool(purpose_transportish or any(token in one_point for token in ["向か", "利用", "高速", "自動車道", "出発", "移動"]))
+
+    # 駅・空港・港のような起点、または目的/メモが移動文脈なら対象。
+    terminal_like = any(token in origin_name for token in ["駅", "空港", "港", "バスターミナル"])
+    return bool((terminal_like and memo_transportish) or (purpose_transportish and memo_transportish))
 
 
 def _looks_like_embedded_long_return_transport(current: pd.Series | Dict, actual_next: pd.Series | Dict, planning_state: Dict[str, object], min_minutes: int = 90) -> bool:
@@ -5322,6 +5387,66 @@ def _enforce_private_car_modes_on_df(df3: pd.DataFrame, planning_state: Dict[str
     return fixed
 
 
+
+def _is_public_transport_trip(planning_state: Dict[str, object]) -> bool:
+    style = safe_text(planning_state.get("transport_style"), "")
+    return style == "電車メイン" or _infer_mode_from_transport_style(style) == "train"
+
+
+def _enforce_public_transport_modes_on_df(df3: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
+    """
+    修正箇所(v6.2.76):
+    電車メインの旅程で、Phase2メモや簡易一覧の表示補正により徒歩/車へ落ちるのを防ぐ最後の保険。
+    ユーザーの電車希望を最優先にし、明示的なタクシー・バス・航空等は残す。
+    """
+    if df3 is None or df3.empty or not _is_public_transport_trip(planning_state):
+        return df3
+    if "is_transport" not in df3.columns or "transport_mode" not in df3.columns:
+        return df3
+
+    fixed = df3.copy().reset_index(drop=True)
+    for idx in fixed.index[fixed["is_transport"] == True].tolist():  # noqa: E712
+        row = fixed.loc[idx]
+        origin_name, destination_name = _route_pair_from_transport_row(row)
+        if not origin_name or not destination_name:
+            continue
+
+        before_mode_raw = safe_text(row.get("transport_mode"), "")
+        before_mode = _normalize_transport_mode_key(before_mode_raw)
+        context = " ".join([
+            safe_text(row.get("destination"), ""),
+            safe_text(row.get("one_point"), ""),
+            safe_text(origin_name, ""),
+            safe_text(destination_name, ""),
+        ])
+
+        # バス・タクシー・航空・船などの明示的な例外は保持。
+        if before_mode in {"bus", "taxi", "air", "flight", "ship", "ferry"}:
+            continue
+
+        # 電車メインでは、徒歩/車/不明は公共交通へ戻す。
+        # 「徒歩で移動」と明示され、かつ15分以内の超近距離だけは徒歩を許可。
+        if before_mode == "walk":
+            minutes = int(float(row.get("duration_minutes") or 0) or 0)
+            explicit_walk = any(token in context for token in ["徒歩で移動", "歩いて移動", "徒歩圏", "徒歩移動"])
+            if explicit_walk and 0 < minutes <= 15:
+                continue
+
+        if before_mode not in {"train", "transit", "rail"}:
+            fixed.at[idx, "transport_mode"] = "train"
+            fixed.at[idx, "route_from"] = origin_name
+            fixed.at[idx, "route_to"] = destination_name
+            fixed.at[idx, "route_url"] = build_google_maps_dir_url(origin_name, destination_name, "train")
+            source = safe_text(row.get("route_data_source"), "")
+            fixed.at[idx, "route_data_source"] = (source + "+public_transport_final_sweep").strip("+")[:80]
+            log_event(
+                "Phase3電車メインガード",
+                f"最終出力直前に移動手段を補正: {origin_name}→{destination_name} / {before_mode_raw or before_mode}→train",
+                level="warning",
+            )
+    return fixed
+
+
 def _is_hotel_departure_overlap_candidate(current: pd.Series | Dict, actual_next: pd.Series | Dict) -> bool:
     """ホテル出発行と次スポットの時刻が重なり、移動カードが抜けやすいケースを検知する。"""
     if current is None or actual_next is None:
@@ -5489,7 +5614,9 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
         # Phase2が「福井駅 09:00-12:00 / 北陸新幹線で東京へ移動」のように、
         # 1つのスポット行へ長距離移動を含めてしまった場合、ここでさらに
         # 福井駅→東京駅のtransportを追加すると二重移動になるため、生成を抑止する。
-        if _looks_like_phase2_embedded_transport_row(current, actual_next) or _looks_like_embedded_long_return_transport(current, actual_next, planning_state):
+        if (_looks_like_phase2_embedded_transport_row(current, actual_next)
+            or _looks_like_embedded_departure_transport_row(current, actual_next)
+            or _looks_like_embedded_long_return_transport(current, actual_next, planning_state)):
             _promote_last_row_to_embedded_transport(rows, current, actual_next, planning_state, service_hint=service_hint)
             log_event(
                 "Phase3二重移動防止",
@@ -5615,6 +5742,8 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
     # --- 修正箇所(v6.2.74.4): ホテル出発重なり補正 + 自家用車モード最終掃き直し ---
     df3 = _convert_hotel_departure_overlap_to_transport(df3, planning_state)
     df3 = _enforce_private_car_modes_on_df(df3, planning_state)
+    # --- 修正箇所(v6.2.76): 電車メインでも徒歩/車に落ちた移動カードを公共交通へ戻す ---
+    df3 = _enforce_public_transport_modes_on_df(df3, planning_state)
 
     # --- 修正箇所(v6.2.75): 最終的にユーザー固定方針と矛盾する移動手段が残っていないか検査 ---
     if _transport_style_is_user_locked(planning_state) and "is_transport" in df3.columns and "transport_mode" in df3.columns:
@@ -6611,24 +6740,34 @@ def _simple_should_show_walk_candidate(row_dict: Dict[str, object], origin: str,
 
 
 def _simple_transport_content_label(row_dict: Dict[str, object], origin: str, destination: str, mode_label: str) -> str:
-    # --- 修正箇所(v6.2.44/v6.2.46): 簡易一覧の移動表示ルールを確定 ---
-    # ルール:
-    # - 徒歩候補に該当する近接移動は「徒歩候補」と表示（旅程本体は変更しない）
-    # - 電車のみ「電車：最寄り駅→最寄り駅」
-    # - タクシー/徒歩/バス/その他は手段のみ
-    # - 前後スポット名は内容列に出さない
+    # --- 修正箇所(v6.2.44/v6.2.46/v6.2.76): 簡易一覧の移動表示ルールを確定 ---
+    # v6.2.76では、2日目以降の出発地点が内容列から消えないよう、
+    # 非電車でも「手段：出発地→到着地」を出す。
+    active_context = _get_active_trip_context(st.session_state.get("planning_state", {}))
+    if safe_text(active_context.get("transport_style"), "") == "電車メイン" and mode_label in {"徒歩", "車", "自家用車", "移動"}:
+        mode_label = "電車"
+
     if _simple_should_show_walk_candidate(row_dict, origin, destination, mode_label):
         return "徒歩候補"
+
+    clean_origin = safe_text(origin, "")
+    clean_destination = safe_text(destination, "")
+    has_route_pair = bool(clean_origin and clean_destination and clean_origin not in {"現在地", "-"} and clean_destination not in {"目的地", "-"})
+
     if mode_label == "電車":
-        from_station = _simple_extract_station_name(origin)
-        to_station = _simple_extract_station_name(destination)
+        from_station = _simple_extract_station_name(clean_origin)
+        to_station = _simple_extract_station_name(clean_destination)
         if from_station and to_station:
             return f"電車：{from_station}→{to_station}"
         if from_station or to_station:
             return f"電車：{from_station or '最寄り駅'}→{to_station or '最寄り駅'}"
+        if has_route_pair:
+            return f"電車：{clean_origin}→{clean_destination}"
         return "電車：最寄り駅→最寄り駅"
-    return mode_label or "移動"
 
+    if has_route_pair:
+        return f"{mode_label or '移動'}：{clean_origin}→{clean_destination}"
+    return mode_label or "移動"
 
 def _build_hotel_booking_search_url(hotel_name: str, visit_date: str = "") -> str:
     name = safe_text(hotel_name, "ホテル")
