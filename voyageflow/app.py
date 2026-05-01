@@ -142,9 +142,10 @@ except Exception:
 # - v6.2.88: Quality Gate標準プロンプトをPhase1→2→3横断チェックへ拡張。ask_user/blockは自動再作成せず、retry推奨時のみPhase2→Phase3を最大3回まで自動再作成する導線を追加。
 # - v6.2.89: ホテル継続ガードを「銀座周辺ホテル」「両国周辺ホテル」など周辺ホテルラベルにも適用し、補正結果を左サイドバー診断で確認可能にする。
 # - v6.2.90: Quality Gateのask_userで自動処理を即停止せず、安全補正・Phase2→Phase3再作成を先に処理するAction Routerを追加。
+# - v6.2.91: ask_user混在時もretry系チェックを優先して処理し、宿泊行不足をPhase3後の安全補助ホテル行として自動補正。自動チェックの前後差分をログに表示。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.90-quality-gate-action-router"
+APP_VERSION_NAME = "v6.2.91-quality-gate-visible-actions"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -1302,7 +1303,8 @@ def _quality_gate_build_code_checks(
     """LLMに任せきりにせず、コードで明確に判定できる項目をチェックする。"""
     checks: List[Dict[str, object]] = []
 
-    expected_nights = _quality_gate_expected_nights(planning_state)
+    # --- 修正箇所(v6.2.91): planning_state が古い日数を保持していても、Phase2/Phase3上の日数を優先して泊数不足を判定する ---
+    expected_nights = _quality_gate_expected_nights_from_data(planning_state, df_phase2, df_phase3)
     if isinstance(df_phase3, pd.DataFrame) and not df_phase3.empty:
         activity_rows = df_phase3[df_phase3.get("is_transport", False) == False].reset_index(drop=False)  # noqa: E712
         hotel_rows = []
@@ -1320,9 +1322,10 @@ def _quality_gate_build_code_checks(
                 severity="high",
                 location="完成旅程全体",
                 evidence=f"{expected_nights}泊分が必要ですが、宿泊行として認識できる行は{len(hotel_rows)}件です。",
-                suggestion="Phase2構造化で宿泊行が落ちた可能性があります。Phase2→Phase3だけ再作成するか、ホテル行を確認してください。",
-                recommended_action="retry_phase2_phase3",
-                user_message="宿泊行が不足している可能性があります。構造化だけ再作成しますか？",
+                suggestion="Phase2構造化で宿泊行が落ちた可能性があります。まず表示崩れを防ぐため、Phase3後処理で未確定ホテル行を補助追加します。",
+                recommended_action="auto_fix",
+                user_message="宿泊行が不足しているため、未確定ホテル行を補助追加できます。",
+                auto_fix={"target": "phase3_insert_missing_hotel_nights", "expected_nights": expected_nights},
             ))
 
         # --- 修正箇所(v6.2.87): 同一都市・ユーザー明示なしの複数ホテルをQuality Gateでも検出 ---
@@ -1642,7 +1645,9 @@ def _quality_gate_merge_checks(result: Dict[str, object], code_checks: List[Dict
     else:
         result["retry_scope"] = safe_text(result.get("retry_scope"), "none")
         result["safe_to_auto_retry"] = bool(result.get("safe_to_auto_retry", False))
-    if has_ask_user or has_block:
+    # --- 修正箇所(v6.2.91): ask_user が混ざっても、retry_phase2_phase3 の技術的問題はAction Router側で処理できるようにする ---
+    # block だけは自動再作成不可。相撲/歌舞伎などの ask_user は最後に残すが、ホテル不足・長距離移動などは先に処理する。
+    if has_block:
         result["safe_to_auto_retry"] = False
     return result
 
@@ -1752,6 +1757,21 @@ def _apply_quality_gate_safe_autofixes(result: Dict[str, object]) -> Dict[str, o
             except Exception:
                 continue
 
+        elif target == "phase3_insert_missing_hotel_nights" and df3_work is not None:
+            try:
+                df3_work, hotel_notes = _quality_gate_insert_missing_hotel_nights(
+                    df3_work,
+                    st.session_state.get("planning_state", {}),
+                    df_phase2=df2_work,
+                    natural_plan_text=safe_text(st.session_state.get("trip_plan"), "") or safe_text(st.session_state.get("trip_plan_draft"), ""),
+                )
+                if hotel_notes:
+                    changed_df3 = True
+                    notes.extend(hotel_notes)
+            except Exception as e:
+                log_event("Quality Gateホテル補助", f"宿泊行不足の補助追加をスキップ: {e}", level="warning")
+                continue
+
         elif target == "phase2_update_row" and df2_work is not None:
             try:
                 row_index = int(auto_fix.get("row_index"))
@@ -1783,6 +1803,22 @@ def _apply_quality_gate_safe_autofixes(result: Dict[str, object]) -> Dict[str, o
                         notes.append(note)
         except Exception as e:
             log_event("ホテル継続ガード", f"Quality Gate後ホテル継続ガードをスキップ: {e}", level="warning")
+        # --- 修正箇所(v6.2.91): LLM/Phase2再作成で宿泊行が落ちた場合、表示崩れを防ぐ補助ホテル行を追加 ---
+        try:
+            guarded_df3, missing_hotel_notes = _quality_gate_insert_missing_hotel_nights(
+                df3_work,
+                st.session_state.get("planning_state", {}),
+                df_phase2=df2_work,
+                natural_plan_text=safe_text(st.session_state.get("trip_plan"), "") or safe_text(st.session_state.get("trip_plan_draft"), ""),
+            )
+            if missing_hotel_notes:
+                df3_work = guarded_df3
+                changed_df3 = True
+                for note in missing_hotel_notes:
+                    if note not in notes:
+                        notes.append(note)
+        except Exception as e:
+            log_event("Quality Gateホテル補助", f"Quality Gate後の宿泊行不足補正をスキップ: {e}", level="warning")
 
     if changed_df2 and df2_work is not None:
         st.session_state.df_phase2 = _quality_gate_resequence(df2_work)
@@ -1943,12 +1979,14 @@ def _quality_gate_has_user_decision_issue(result: Dict[str, object]) -> bool:
 def _quality_gate_has_retryable_phase23_issue(result: Dict[str, object]) -> bool:
     if not isinstance(result, dict):
         return False
-    retry_scope = safe_text(result.get("retry_scope"), "none")
-    if retry_scope in {"phase2_phase3_only", "phase2_only"}:
-        return bool(result.get("safe_to_auto_retry", False)) or safe_text(result.get("overall_status"), "") == "retry_recommended"
+    # --- 修正箇所(v6.2.91): ask_user混在で overall_status=user_confirmation_required でも、
+    # code/LLM が retry_phase2_phase3 を出している技術的問題は先に再作成対象にする。
     for check in _quality_gate_non_pass_checks(result):
         if safe_text(check.get("recommended_action"), "") in {"retry_phase2_only", "retry_phase2_phase3"}:
             return True
+    retry_scope = safe_text(result.get("retry_scope"), "none")
+    if retry_scope in {"phase2_phase3_only", "phase2_only"}:
+        return bool(result.get("safe_to_auto_retry", False)) or safe_text(result.get("overall_status"), "") == "retry_recommended"
     return False
 
 
@@ -1961,6 +1999,49 @@ def _quality_gate_result_summary_line(result: Dict[str, object], label: str) -> 
     return f"{label}: status={status} / score={score} / retry_scope={retry_scope} / issues={issue_count}" + (f" / {summary}" if summary else "")
 
 
+def _quality_gate_snapshot_for_visible_actions(df: pd.DataFrame) -> Dict[str, object]:
+    """自動チェック前後の変化をユーザーに見える形で要約する。"""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"rows": 0, "hotels": [], "transports": 0, "long_short": 0}
+    working = df.reset_index(drop=True)
+    hotels: List[str] = []
+    long_short = 0
+    transports = 0
+    for _, row in working.iterrows():
+        if bool(row.get("is_transport", False)):
+            transports += 1
+            origin = safe_text(row.get("route_from"), "")
+            to = safe_text(row.get("route_to"), "")
+            try:
+                minutes = int(float(row.get("duration_minutes") or 0))
+            except Exception:
+                minutes = 0
+            dist = _quality_gate_transport_distance(origin, to) if origin and to and minutes > 0 else None
+            if dist is not None and ((dist >= 200 and minutes < 120) or (dist >= 80 and minutes < 60)):
+                long_short += 1
+        else:
+            if _is_hotel_or_lodging_row(row):
+                dest = safe_text(row.get("destination"), "")
+                if dest and dest not in hotels:
+                    hotels.append(dest)
+    return {"rows": int(len(working)), "hotels": hotels, "transports": transports, "long_short": long_short}
+
+
+def _quality_gate_visible_diff_line(before: Dict[str, object], after: Dict[str, object]) -> str:
+    before_hotels = before.get("hotels") if isinstance(before.get("hotels"), list) else []
+    after_hotels = after.get("hotels") if isinstance(after.get("hotels"), list) else []
+    parts: List[str] = []
+    if before.get("rows") != after.get("rows"):
+        parts.append(f"行数 {before.get('rows')}→{after.get('rows')}")
+    if before_hotels != after_hotels:
+        parts.append(f"ホテル {before_hotels or ['なし']}→{after_hotels or ['なし']}")
+    if before.get("long_short") != after.get("long_short"):
+        parts.append(f"長距離短時間 {before.get('long_short')}→{after.get('long_short')}")
+    if before.get("transports") != after.get("transports"):
+        parts.append(f"移動カード数 {before.get('transports')}→{after.get('transports')}")
+    return " / ".join(parts) if parts else "見える差分なし（判定結果のみ更新）"
+
+
 def run_quality_gate_auto_retry(max_retries: int = 3) -> Dict[str, object]:
     """Quality Gateを実行し、Action Routerで安全補正/Phase2→Phase3再作成を最大3回まで行う。"""
     max_retries = max(1, min(3, int(max_retries or 3)))
@@ -1970,6 +2051,7 @@ def run_quality_gate_auto_retry(max_retries: int = 3) -> Dict[str, object]:
     final_result: Dict[str, object] = {}
 
     try:
+        before_snapshot = _quality_gate_snapshot_for_visible_actions(st.session_state.get("df_phase3"))
         # --- 修正箇所(v6.2.90): ask_user が混ざっても即停止しない。
         # まずコード側で安全補正できるものを反映し、retry_phase2_phase3 が残る場合は再作成する。
         # その後に残った相撲/歌舞伎/日程などだけユーザー確認へ回す。
@@ -2004,6 +2086,8 @@ def run_quality_gate_auto_retry(max_retries: int = 3) -> Dict[str, object]:
             auto_summary.append("Phase2→Phase3再作成が必要な問題は検出されませんでした。")
             break
 
+        after_snapshot = _quality_gate_snapshot_for_visible_actions(st.session_state.get("df_phase3"))
+        auto_summary.append("自動チェック前後の差分: " + _quality_gate_visible_diff_line(before_snapshot, after_snapshot))
         st.session_state.quality_gate_auto_retry_summary = auto_summary
         final_status = safe_text(final_result.get("overall_status"), "unknown") if isinstance(final_result, dict) else "unknown"
         message = f"Quality Gate自動チェックを完了しました。Phase2→Phase3再作成: {retries_done}回 / 最終判定: {final_status}"
@@ -2993,6 +3077,130 @@ def _normalize_phase3_hotel_stay_times(df: pd.DataFrame) -> tuple[pd.DataFrame, 
             fixed.at[idx, "start_time"] = prev_end
             notes.append(f"ホテル宿泊開始時刻を前予定の終了時刻へ補正: Day{day} {safe_text(row.get('destination'), '')} {start}→{prev_end}")
     return fixed, notes
+
+
+def _quality_gate_max_day_from_data(*dfs: object) -> int:
+    max_day = 1
+    for df in dfs:
+        if isinstance(df, pd.DataFrame) and not df.empty and "day" in df.columns:
+            try:
+                vals = pd.to_numeric(df["day"], errors="coerce").dropna().astype(int).tolist()
+                if vals:
+                    max_day = max(max_day, max(vals))
+            except Exception:
+                continue
+    return max_day
+
+
+def _quality_gate_expected_nights_from_data(planning_state: Dict[str, object], df_phase2: object = None, df_phase3: object = None) -> int:
+    """planning_stateの日数が古い場合でも、実データ上の日数から必要泊数を補正して判定する。"""
+    base = _quality_gate_expected_nights(planning_state)
+    data_days = _quality_gate_max_day_from_data(df_phase2, df_phase3)
+    return max(base, max(0, data_days - 1))
+
+
+def _quality_gate_candidate_hotel_label(
+    planning_state: Dict[str, object],
+    df_phase2: object = None,
+    df_phase3: object = None,
+    natural_plan_text: str = "",
+) -> str:
+    """宿泊行不足時に使う未確定ホテルラベルを安全に決める。具体名を捏造しない。"""
+    explicit_keys = ["hotel_name", "hotel", "selected_hotel", "lodging", "accommodation"]
+    for key in explicit_keys:
+        value = safe_text(planning_state.get(key), "") if isinstance(planning_state, dict) else ""
+        if value and value not in {"未設定", "なし", "-"} and not _is_bad_hotel_label(value):
+            return value
+    # Phase2/Phase3に出ているホテルラベルを優先。帰着後に出たラベルでも、未確定ホテルとしては利用できる。
+    candidates: List[str] = []
+    for df in [df_phase3, df_phase2]:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            for _, row in df.reset_index(drop=True).iterrows():
+                dest = safe_text(row.get("destination"), "")
+                if not dest:
+                    continue
+                if _is_valid_hotel_row(row) and not _is_bad_hotel_label(dest) and not _looks_like_invalid_itinerary_node_name(dest):
+                    if dest not in candidates:
+                        candidates.append(dest)
+    if candidates:
+        return candidates[0]
+    extracted = _extract_concrete_hotel_name_from_plan_text(natural_plan_text)
+    if extracted:
+        return extracted
+    primary = safe_text(planning_state.get("primary_destination"), "") if isinstance(planning_state, dict) else ""
+    if primary:
+        return f"{primary}周辺ホテル"
+    return "宿泊先未設定ホテル"
+
+
+def _quality_gate_insert_missing_hotel_nights(
+    df: pd.DataFrame,
+    planning_state: Dict[str, object],
+    *,
+    df_phase2: object = None,
+    natural_plan_text: str = "",
+) -> tuple[pd.DataFrame, List[str]]:
+    """Phase3後処理のみで、表示上不足している宿泊行を補助追加する。旅行方針やスポット選択は変えない。"""
+    if df is None or df.empty:
+        return df, []
+    fixed = df.copy().reset_index(drop=True)
+    expected_nights = _quality_gate_expected_nights_from_data(planning_state, df_phase2, fixed)
+    if expected_nights <= 0:
+        return fixed, []
+    notes: List[str] = []
+    hotel_label = _quality_gate_candidate_hotel_label(planning_state, df_phase2=df_phase2, df_phase3=fixed, natural_plan_text=natural_plan_text)
+    inserted_rows: List[tuple[int, Dict[str, object]]] = []
+
+    for day in range(1, expected_nights + 1):
+        try:
+            day_df = fixed[pd.to_numeric(fixed.get("day"), errors="coerce").fillna(0).astype(int) == int(day)]
+        except Exception:
+            day_df = fixed[fixed.get("day") == day] if "day" in fixed.columns else pd.DataFrame()
+        if day_df.empty:
+            continue
+        existing_hotel = False
+        for _, row in day_df.iterrows():
+            if bool(row.get("is_transport", False)):
+                continue
+            if _is_hotel_or_lodging_row(row):
+                existing_hotel = True
+                break
+        if existing_hotel:
+            continue
+
+        non_transport = day_df[day_df.get("is_transport", False) == False] if "is_transport" in day_df.columns else day_df
+        anchor = non_transport.iloc[-1] if not non_transport.empty else day_df.iloc[-1]
+        insert_after = int(anchor.name)
+        start_time = safe_text(anchor.get("end_time"), "") or safe_text(anchor.get("start_time"), "") or "20:00"
+        if start_time < "15:00":
+            start_time = "20:00"
+        row_dict = {col: None for col in fixed.columns}
+        row_dict.update({
+            "day": int(day),
+            "sequence": 999,
+            "date": anchor.get("date") if "date" in fixed.columns else "",
+            "start_time": start_time,
+            "end_time": "翌09:00",
+            "destination": hotel_label,
+            "purpose": "accommodation",
+            "genre": "hotel",
+            "is_transport": False,
+            "duration_minutes": 0,
+            "estimated_duration_label": "宿泊（Quality Gate補助）",
+            "one_point": "Quality Gate: 宿泊行不足を検出したため、未確定ホテル行を補助追加しました。具体ホテルは予約サイト側で選択してください。",
+        })
+        inserted_rows.append((insert_after, row_dict))
+        notes.append(f"宿泊行不足を補助追加: Day{day} {hotel_label}（{start_time}〜翌09:00）")
+
+    if not inserted_rows:
+        return fixed, []
+    # 後ろから挿入してindexずれを防ぐ
+    rows = fixed.to_dict("records")
+    for insert_after, row_dict in sorted(inserted_rows, key=lambda x: x[0], reverse=True):
+        rows.insert(insert_after + 1, row_dict)
+    result = pd.DataFrame(rows)
+    result = _quality_gate_resequence(result)
+    return result.reset_index(drop=True), notes
 
 
 def _apply_phase3_hotel_continuity_guard(df: pd.DataFrame, planning_state: Dict[str, object]) -> tuple[pd.DataFrame, List[str]]:

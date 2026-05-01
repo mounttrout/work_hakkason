@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 ui/sidebar_dev_tools.py
-VoyageFlow v6.2.90
+VoyageFlow v6.2.91
 - サイドバー診断ツールを app.py から分離
 - 通常時は開発者ツールを非表示
 - app.py 側の既存関数を context/callback として受け取り、診断機能自体は削除しない
 - v6.2.90: ホテル継続ガードの候補・統一先・補正結果を左サイドバーで確認できる診断欄を追加
+- v6.2.91: Quality Gate自動チェックの前後差分・再作成ログも左サイドバーで確認可能にする
 """
 
 import os
@@ -87,6 +88,12 @@ def _render_hotel_continuity_guard_status(*, safe_text: Callable) -> None:
         if summary:
             st.write("Quality Gate安全補正の直近メモ")
             for note in summary:
+                st.caption(f"- {safe_text(note, '')}")
+
+        auto_retry_summary = st.session_state.get("quality_gate_auto_retry_summary")
+        if auto_retry_summary:
+            st.write("Quality Gate自動チェック・再作成ログ")
+            for note in auto_retry_summary:
                 st.caption(f"- {safe_text(note, '')}")
 
 
