@@ -138,7 +138,7 @@ except Exception:
 # - v6.2.84: 両国国技館などイベント開催日注意の固定文を廃止し、row["date"] の訪問日から警告文を動的生成する。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.84-dynamic-event-date-warning"
+APP_VERSION_NAME = "v6.2.85-transport-bridge-hardcheck"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -1410,8 +1410,29 @@ def _quality_gate_build_code_checks(
                     ))
                     continue
 
+                distance_km = _quality_gate_transport_distance(origin, to)
+                try:
+                    duration_minutes = int(float(row.get("duration_minutes") or 0) or 0)
+                except Exception:
+                    duration_minutes = 0
+
+                # --- 修正箇所(v6.2.85): 長距離なのに短すぎる移動時間はLLM任せにせずコードで強制検出 ---
+                if distance_km is not None and duration_minutes > 0:
+                    too_short = (distance_km >= 200 and duration_minutes < 120) or (distance_km >= 80 and duration_minutes < 60)
+                    if too_short:
+                        checks.append(_quality_gate_make_check(
+                            check_id="long_distance_too_short",
+                            category="transport",
+                            status="fail",
+                            severity="critical",
+                            location=f"Day{day} {start} {origin} → {to}",
+                            evidence=f"直線距離が約{distance_km:.2f}kmあるのに、移動時間が約{duration_minutes}分になっています。",
+                            suggestion="Phase2のtransport行またはPhase3のbridge解釈がずれている可能性があります。Phase2→Phase3だけ再作成、またはtransport bridge補正を確認してください。",
+                            recommended_action="retry_phase2_phase3",
+                            user_message="長距離移動時間が短すぎます。構造化だけ再作成するか、移動カードを確認してください。",
+                        ))
+
                 if mode in {"train", "transit", "bus"}:
-                    distance_km = _quality_gate_transport_distance(origin, to)
                     if distance_km is not None and distance_km <= 1.2:
                         walk_minutes = max(5, int(_estimate_minutes_from_distance(distance_km, "walk")))
                         checks.append(_quality_gate_make_check(
@@ -6475,6 +6496,129 @@ def _should_keep_hotel_departure_row_without_transport(current: pd.Series | Dict
     return 0 <= gap <= 5
 
 
+def _phase2_row_clock_duration(row: pd.Series | Dict) -> Optional[int]:
+    # --- 修正箇所(v6.2.85): Phase2行自身のstart/endから所要時間を安全に取得 ---
+    start_time = safe_text(_row_value(row, "start_time", ""), "")
+    end_time = safe_text(_row_value(row, "end_time", ""), "")
+    if not start_time or not end_time:
+        return None
+    minutes = _minutes_between_clock(start_time, end_time)
+    if minutes is None:
+        return None
+    try:
+        minutes = int(minutes)
+    except Exception:
+        return None
+    if minutes <= 0 or minutes > 24 * 60:
+        return None
+    return minutes
+
+
+def _looks_like_destination_embedded_transport_row(origin_row: pd.Series | Dict, embedded_row: pd.Series | Dict, min_minutes: int = 45) -> bool:
+    # --- 修正箇所(v6.2.85): destination側のtransport行を、前地点→そのdestinationへの移動として解釈する ---
+    # 例: Phase2が「09:00-09:30 福井駅 departure」「09:30-12:40 東京駅 transport」と出した場合、
+    # 東京駅行のstart/endが「福井駅→東京駅」の移動時間であり、福井駅行の09:00-09:30を移動時間として採用しない。
+    if origin_row is None or embedded_row is None:
+        return False
+    if bool(_row_value(origin_row, "is_transport", False)) or bool(_row_value(embedded_row, "is_transport", False)):
+        return False
+
+    origin_name = safe_text(_row_value(origin_row, "destination", ""), "")
+    destination_name = safe_text(_row_value(embedded_row, "destination", ""), "")
+    if not origin_name or not destination_name or _same_effective_place(origin_name, destination_name):
+        return False
+
+    purpose = safe_text(_row_value(embedded_row, "purpose", ""), "").lower()
+    genre = safe_text(_row_value(embedded_row, "genre", ""), "").lower()
+    if purpose not in {"transport", "move", "return", "arrival"} and "移動" not in purpose and "帰路" not in purpose:
+        return False
+    if _is_hotel_or_lodging_row(embedded_row):
+        return False
+    if _is_transport_service_like_destination(destination_name):
+        return False
+
+    minutes = _phase2_row_clock_duration(embedded_row)
+    if minutes is None or minutes < min_minutes:
+        return False
+
+    origin_end = safe_text(_row_value(origin_row, "end_time", ""), "")
+    embedded_start = safe_text(_row_value(embedded_row, "start_time", ""), "")
+    gap = _minutes_between_clock(origin_end, embedded_start) if origin_end and embedded_start else None
+    if gap is None or not (0 <= gap <= 10):
+        return False
+
+    one_point = safe_text(_row_value(embedded_row, "one_point", ""), "")
+    context = f"{origin_name} {destination_name} {purpose} {genre} {one_point}"
+    transport_tokens = [
+        "移動", "新幹線", "電車", "列車", "特急", "かがやき", "はくたか",
+        "サンダーバード", "向かう", "向かいます", "直通", "出発", "到着", "発", "着", "帰路"
+    ]
+    has_transport_context = any(token in context for token in transport_tokens)
+    destination_terminal_like = any(token in destination_name for token in ["駅", "空港", "港", "バスターミナル"]) or genre in {"station", "airport", "terminal"}
+    return bool(has_transport_context and destination_terminal_like)
+
+
+def _append_destination_embedded_transport_row(
+    rows: List[Dict[str, object]],
+    origin_row: pd.Series | Dict,
+    embedded_row: pd.Series | Dict,
+    planning_state: Dict[str, object],
+    service_hint: str = "",
+) -> None:
+    # --- 修正箇所(v6.2.85): destination側transport行の時刻を使って移動カードを生成 ---
+    origin_name = safe_text(_row_value(origin_row, "destination", ""), "")
+    destination_name = safe_text(_row_value(embedded_row, "destination", ""), "")
+    start_time = safe_text(_row_value(embedded_row, "start_time", ""), "")
+    end_time = safe_text(_row_value(embedded_row, "end_time", ""), "")
+    minutes = _phase2_row_clock_duration(embedded_row)
+    if not origin_name or not destination_name or not start_time or not end_time or minutes is None:
+        return
+
+    context_hint = " ".join([
+        service_hint,
+        safe_text(_row_value(embedded_row, "destination", ""), ""),
+        safe_text(_row_value(embedded_row, "purpose", ""), ""),
+        safe_text(_row_value(embedded_row, "genre", ""), ""),
+        safe_text(_row_value(embedded_row, "one_point", ""), ""),
+    ])
+    annotated_mode = safe_text(_row_value(origin_row, "transport_mode_to_next", ""), "") or safe_text(_row_value(embedded_row, "transport_mode_to_next", ""), "")
+    mode = _normalize_transport_mode_key(annotated_mode) if annotated_mode else ""
+    if not mode:
+        mode = _infer_mode_from_service_hint(context_hint, _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "自動（おすすめ）")))
+    mode = _enforce_private_car_mode_for_segment(
+        mode,
+        planning_state,
+        origin_name,
+        destination_name,
+        current_note=safe_text(_row_value(origin_row, "one_point", ""), ""),
+        next_note=safe_text(_row_value(embedded_row, "one_point", ""), ""),
+        service_hint=service_hint,
+    )
+
+    row = {
+        "day": int(_row_value(embedded_row, "day", _row_value(origin_row, "day", 1)) or 1),
+        "sequence": float(_row_value(origin_row, "sequence", len(rows) + 1) or len(rows) + 1) + 0.5,
+        "date": safe_text(_row_value(embedded_row, "date", ""), safe_text(_row_value(origin_row, "date", ""), safe_text(planning_state.get("start_date"), ""))),
+        "start_time": start_time,
+        "end_time": end_time,
+        "destination": f"{origin_name} → {destination_name}",
+        "purpose": "transport",
+        "genre": "transport",
+        "duration_minutes": int(minutes),
+        "is_transport": True,
+        "transport_mode": mode if mode != "air" else "train",
+        "one_point": (safe_text(_row_value(embedded_row, "one_point", ""), "") + " / Phase2のdestination側transport行の時刻を移動カードとして採用しました。").strip(" /")[:220],
+        "address": "",
+        "route_from": origin_name,
+        "route_to": destination_name,
+        "route_url": build_google_maps_dir_url(origin_name, destination_name, mode if mode != "air" else "train"),
+        "route_data_source": "phase2_destination_embedded_transport_bridge",
+        "estimated_duration_label": f"約{int(minutes)}分",
+        "route_departure_at": f"{safe_text(_row_value(embedded_row, 'date', ''), safe_text(planning_state.get('start_date'), ''))} {start_time}".strip(),
+    }
+    rows.append(row)
+
+
 def _promote_last_row_to_embedded_transport(rows: List[Dict[str, object]], current: pd.Series | Dict, actual_next: pd.Series | Dict, planning_state: Dict[str, object], service_hint: str = "") -> None:
     # --- 修正箇所: v6.2.55 ---
     # すでに rows に追加済みの current 行を、スポットカードではなく移動カードへ安全に変換する。
@@ -6898,6 +7042,32 @@ def _convert_hotel_departure_overlap_to_transport(df3: pd.DataFrame, planning_st
         fixed["sequence"] = fixed.groupby("day").cumcount() + 1
     return fixed
 
+def _log_long_distance_short_duration_hard_checks(df3: pd.DataFrame) -> None:
+    # --- 修正箇所(v6.2.85): 完成旅程生成直後にも長距離短時間破綻をコードで検知してログに残す ---
+    if df3 is None or df3.empty or "is_transport" not in df3.columns:
+        return
+    for _, row in df3[df3["is_transport"] == True].iterrows():  # noqa: E712
+        origin_name, destination_name = _route_pair_from_transport_row(row)
+        if not origin_name or not destination_name or _same_effective_place(origin_name, destination_name):
+            continue
+        try:
+            minutes = int(float(row.get("duration_minutes") or 0) or 0)
+        except Exception:
+            minutes = 0
+        if minutes <= 0:
+            continue
+        distance_km = _quality_gate_transport_distance(origin_name, destination_name)
+        if distance_km is None:
+            continue
+        too_short = (distance_km >= 200 and minutes < 120) or (distance_km >= 80 and minutes < 60)
+        if too_short:
+            log_event(
+                "Quality Gate距離ハードチェック",
+                f"長距離移動時間が短すぎます: {origin_name}→{destination_name} / {distance_km:.1f}km / {minutes}分",
+                level="warning",
+            )
+
+
 def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state: Dict[str, object]) -> pd.DataFrame:
     # --- 修正箇所: train / transport 行は独立スポットにせず、前後スポットを橋渡しする移動ヒントとして扱う ---
     if df2 is None or df2.empty:
@@ -6911,8 +7081,11 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
     if "transport_mode_to_next" not in source_df.columns:
         source_df = _annotate_phase2_transport_modes(source_df, planning_state)
     rows: List[Dict[str, object]] = []
+    skipped_destination_embedded_transport_indexes: set[int] = set()
 
     for idx in range(len(source_df)):
+        if idx in skipped_destination_embedded_transport_indexes:
+            continue
         current = source_df.iloc[idx].copy()
         current_purpose = safe_text(current.get("purpose"), "").lower()
         current_destination = safe_text(current.get("destination"), "")
@@ -6963,6 +7136,21 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
 
         if _same_effective_place(origin_name, destination_name):
             log_event("Phase3", f"同一地点移動をスキップ: {origin_name} → {destination_name}", level="info")
+            continue
+
+        # --- 修正箇所(v6.2.85): destination側transport行のstart/endを移動カード時間として採用 ---
+        if _looks_like_destination_embedded_transport_row(current, actual_next):
+            _append_destination_embedded_transport_row(rows, current, actual_next, planning_state, service_hint=service_hint)
+            skipped_destination_embedded_transport_indexes.add(next_idx)
+            log_event(
+                "Phase3 transport bridge",
+                (
+                    f"destination側transport行を移動カード化: "
+                    f"Day{safe_text(current.get('day'), '')} {origin_name} → {destination_name} "
+                    f"/ {safe_text(actual_next.get('start_time'), '')}-{safe_text(actual_next.get('end_time'), '')}"
+                ),
+                level="warning",
+            )
             continue
 
         if _should_keep_hotel_departure_row_without_transport(current, actual_next):
@@ -7107,6 +7295,9 @@ def build_phase3_from_sequential_destinations(df2: pd.DataFrame, planning_state:
     df3 = _enforce_private_car_modes_on_df(df3, planning_state)
     # --- 修正箇所(v6.2.76): 電車メインでも徒歩/車に落ちた移動カードを公共交通へ戻す ---
     df3 = _enforce_public_transport_modes_on_df(df3, planning_state)
+
+    # --- 修正箇所(v6.2.85): 長距離短時間破綻を生成直後ログでも検出 ---
+    _log_long_distance_short_duration_hard_checks(df3)
 
     # --- 修正箇所(v6.2.75): 最終的にユーザー固定方針と矛盾する移動手段が残っていないか検査 ---
     if _transport_style_is_user_locked(planning_state) and "is_transport" in df3.columns and "transport_mode" in df3.columns:
