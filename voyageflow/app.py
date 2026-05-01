@@ -135,9 +135,10 @@ except Exception:
 # - v6.2.82: Quality Gateを追加。自動修正はせず、問題判定後にPhase2→Phase3だけ再作成できるボタンを追加。
 # - v6.2.82: サイドバー診断ツールと生成温度/デバッグモードを開発者ツール内へ隠し、診断UIを ui/sidebar_dev_tools.py へ分離。
 # - v6.2.83: Phase3 Quality Gateをチェックリスト方式へ強化。短距離train→walk、ホテルpurpose誤分類、帰着後ノードなど明確なものだけコード側で安全補正する。
+# - v6.2.84: 両国国技館などイベント開催日注意の固定文を廃止し、row["date"] の訪問日から警告文を動的生成する。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.83-quality-gate-checklist-safe-autofix"
+APP_VERSION_NAME = "v6.2.84-dynamic-event-date-warning"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -7722,9 +7723,11 @@ SPOT_RELIABILITY_RULES = {
     "両国国技館": {
         "type": "event_date",
         "official_url": "https://kokugikan.sumo.or.jp/Schedule/show/2026-05",
+        "event_label": "大相撲五月場所",
         "event_keywords": ["相撲", "大相撲", "五月場所", "夏場所"],
         "valid_ranges": [("2026-05-10", "2026-05-24")],
-        "warning": "2026年5月5日は大相撲五月場所の開催期間外です。五月場所は2026-05-10〜2026-05-24の公式予定です。",
+        # 修正箇所(v6.2.84): 訪問日を固定文にしない。row["date"] を使って build_spot_reliability_warnings 内で動的生成する。
+        "warning": "対象イベントの開催期間外の可能性があります。",
         "alternative": "代替案: 相撲博物館、両国散策、ちゃんこ料理、または開催期間中への日程変更を検討してください。",
     },
     "東京国立博物館": {
@@ -7789,6 +7792,53 @@ def _date_in_range(date_value, start_text: str, end_text: str) -> bool:
         return False
 
 
+def _format_visit_date_ja(date_value) -> str:
+    # --- 修正箇所(v6.2.84): 開催日警告の訪問日を固定文ではなく旅程行の日付から生成 ---
+    if not date_value:
+        return "この日付"
+    try:
+        return f"{date_value.year}年{date_value.month}月{date_value.day}日"
+    except Exception:
+        return "この日付"
+
+
+def _format_event_valid_range_label(valid_ranges: List[tuple]) -> str:
+    labels = []
+    for start, end in valid_ranges or []:
+        if start and end:
+            labels.append(f"{start}〜{end}")
+    return "、".join(labels) if labels else "公式発表期間"
+
+
+def _build_dynamic_event_date_warning(rule: Dict[str, object], visit_date) -> str:
+    # --- 修正箇所(v6.2.84): 両国国技館などのイベント警告文をrow["date"]で動的生成 ---
+    event_label = safe_text(rule.get("event_label"), "対象イベント")
+    visit_label = _format_visit_date_ja(visit_date)
+    range_label = _format_event_valid_range_label(rule.get("valid_ranges") or [])
+    return f"{visit_label}は{event_label}の開催期間外です。{event_label}は{range_label}の公式予定です。"
+
+
+def _rewrite_event_date_warning_if_needed(destination: str, visit_date, warnings: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    # --- 修正箇所(v6.2.84): 外付けSpot Info Agentが古い固定文を返した場合も、表示直前に動的文へ差し替える ---
+    key, rule = _spot_rule_for_destination(destination)
+    if not rule or safe_text(rule.get("type"), "") != "event_date" or not visit_date:
+        return warnings
+    dynamic_message = _build_dynamic_event_date_warning(rule, visit_date)
+    rewritten: List[Dict[str, str]] = []
+    for warning in warnings or []:
+        item = dict(warning)
+        title = safe_text(item.get("title"), "")
+        message = safe_text(item.get("message"), "")
+        if "開催日" in title or "五月場所" in message or "大相撲" in message:
+            item["message"] = dynamic_message
+            if not safe_text(item.get("action"), ""):
+                item["action"] = safe_text(rule.get("alternative"), "公式スケジュールを確認してください。")
+            if not safe_text(item.get("url"), ""):
+                item["url"] = safe_text(rule.get("official_url"), "")
+        rewritten.append(item)
+    return rewritten
+
+
 def _is_jp_public_holiday(date_value) -> bool:
     if not date_value:
         return False
@@ -7829,7 +7879,10 @@ def build_spot_reliability_warnings(row_dict: Dict[str, object]) -> List[Dict[st
                         "action": safe_text(warning.get("action"), ""),
                         "url": safe_text(warning.get("url"), ""),
                     })
-                return normalized_warnings
+                visit_date_for_external = _parse_date_value(safe_text(row_dict.get("date"), ""))
+                if normalized_warnings:
+                    return _rewrite_event_date_warning_if_needed(destination, visit_date_for_external, normalized_warnings)
+                # 外付け側が空配列を返した場合でも、内蔵の開催日・休館日ルールを続けて確認する。
         except Exception as e:
             log_event("Spot Info Agent", f"外付け信頼性チェックに失敗したため内蔵ルールへfallback: {e}", level="warning")
 
@@ -7850,7 +7903,8 @@ def build_spot_reliability_warnings(row_dict: Dict[str, object]) -> List[Dict[st
         valid_ranges = rule.get("valid_ranges") or []
         in_valid_range = any(_date_in_range(visit_date, start, end) for start, end in valid_ranges)
         if mentions_event and not in_valid_range:
-            warnings.append({"level": "warning", "title": "開催日注意", "message": safe_text(rule.get("warning"), "この日付は対象イベントの開催期間外の可能性があります。"), "action": safe_text(rule.get("alternative"), "公式スケジュールを確認してください。"), "url": safe_text(rule.get("official_url"), "")})
+            dynamic_message = _build_dynamic_event_date_warning(rule, visit_date)
+            warnings.append({"level": "warning", "title": "開催日注意", "message": dynamic_message, "action": safe_text(rule.get("alternative"), "公式スケジュールを確認してください。"), "url": safe_text(rule.get("official_url"), "")})
     elif rule_type == "opening_hours" and visit_date:
         weekday = visit_date.weekday()
         closed_weekdays = rule.get("closed_weekdays") or []
