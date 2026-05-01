@@ -141,9 +141,10 @@ except Exception:
 # - v6.2.87: 既存生成本体は触らず、Phase3後のホテル整形で「同一都市・ユーザー明示なしの複数ホテル」を最初の具体ホテルへ統一。Quality Gateにも同チェックを追加。
 # - v6.2.88: Quality Gate標準プロンプトをPhase1→2→3横断チェックへ拡張。ask_user/blockは自動再作成せず、retry推奨時のみPhase2→Phase3を最大3回まで自動再作成する導線を追加。
 # - v6.2.89: ホテル継続ガードを「銀座周辺ホテル」「両国周辺ホテル」など周辺ホテルラベルにも適用し、補正結果を左サイドバー診断で確認可能にする。
+# - v6.2.90: Quality Gateのask_userで自動処理を即停止せず、安全補正・Phase2→Phase3再作成を先に処理するAction Routerを追加。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.89-hotel-continuity-devtools-visible"
+APP_VERSION_NAME = "v6.2.90-quality-gate-action-router"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -1768,6 +1769,21 @@ def _apply_quality_gate_safe_autofixes(result: Dict[str, object]) -> Dict[str, o
         df3_work = df3_work.drop(index=sorted(drop_phase3_indexes)).reset_index(drop=True)
         changed_df3 = True
 
+    # --- 修正箇所(v6.2.90): LLMがホテル問題をpass扱いしても、
+    # 表示中の完成旅程からコード側でホテル継続ガードを必ず走らせる。
+    # ask_user系イベントが混ざっても、明示指示なしの同一都市内ホテル複数化は安全補正対象。
+    if df3_work is not None:
+        try:
+            guarded_df3, hotel_notes = _apply_phase3_hotel_continuity_guard(df3_work, st.session_state.get("planning_state", {}))
+            if hotel_notes:
+                df3_work = guarded_df3
+                changed_df3 = True
+                for note in hotel_notes:
+                    if note not in notes:
+                        notes.append(note)
+        except Exception as e:
+            log_event("ホテル継続ガード", f"Quality Gate後ホテル継続ガードをスキップ: {e}", level="warning")
+
     if changed_df2 and df2_work is not None:
         st.session_state.df_phase2 = _quality_gate_resequence(df2_work)
     if changed_df3 and df3_work is not None:
@@ -1946,7 +1962,7 @@ def _quality_gate_result_summary_line(result: Dict[str, object], label: str) -> 
 
 
 def run_quality_gate_auto_retry(max_retries: int = 3) -> Dict[str, object]:
-    """Quality Gateを実行し、retry推奨のPhase2→Phase3だけ最大3回まで再作成する。"""
+    """Quality Gateを実行し、Action Routerで安全補正/Phase2→Phase3再作成を最大3回まで行う。"""
     max_retries = max(1, min(3, int(max_retries or 3)))
     st.session_state.quality_gate_auto_retry_running = True
     auto_summary: List[str] = []
@@ -1954,7 +1970,11 @@ def run_quality_gate_auto_retry(max_retries: int = 3) -> Dict[str, object]:
     final_result: Dict[str, object] = {}
 
     try:
-        for check_round in range(max_retries + 1):
+        # --- 修正箇所(v6.2.90): ask_user が混ざっても即停止しない。
+        # まずコード側で安全補正できるものを反映し、retry_phase2_phase3 が残る場合は再作成する。
+        # その後に残った相撲/歌舞伎/日程などだけユーザー確認へ回す。
+        max_checks = max_retries + 4
+        for check_round in range(max_checks):
             result = run_current_quality_gate()
             final_result = result if isinstance(result, dict) else {}
             st.session_state.quality_gate_result = final_result
@@ -1963,28 +1983,33 @@ def run_quality_gate_auto_retry(max_retries: int = 3) -> Dict[str, object]:
             st.session_state.quality_gate_user_accepted = False
             auto_summary.append(_quality_gate_result_summary_line(final_result, f"チェック{check_round + 1}"))
 
+            autofix_notes = final_result.get("auto_fix_summary") if isinstance(final_result.get("auto_fix_summary"), list) else []
+            if autofix_notes:
+                auto_summary.append("安全自動補正を反映したため、再チェックします。")
+                continue
+
+            if _quality_gate_has_retryable_phase23_issue(final_result):
+                if retries_done >= max_retries:
+                    auto_summary.append("最大再作成回数に到達したため、自動再作成を停止しました。")
+                    break
+                retry_phase2_phase3_from_existing_phase1_by_quality_gate()
+                retries_done += 1
+                auto_summary.append(f"Phase1は維持し、Phase2→Phase3だけ再作成しました（{retries_done}/{max_retries}）。")
+                continue
+
             if _quality_gate_has_user_decision_issue(final_result):
-                auto_summary.append("ユーザー判断が必要な項目があるため、自動再作成を停止しました。")
+                auto_summary.append("安全補正・再作成で処理できる項目は処理済みです。残りはユーザー判断が必要なため停止しました。")
                 break
 
-            if not _quality_gate_has_retryable_phase23_issue(final_result):
-                auto_summary.append("Phase2→Phase3再作成が必要な問題は検出されませんでした。")
-                break
-
-            if retries_done >= max_retries:
-                auto_summary.append("最大再作成回数に到達したため、自動再作成を停止しました。")
-                break
-
-            retry_phase2_phase3_from_existing_phase1_by_quality_gate()
-            retries_done += 1
-            auto_summary.append(f"Phase1は維持し、Phase2→Phase3だけ再作成しました（{retries_done}/{max_retries}）。")
+            auto_summary.append("Phase2→Phase3再作成が必要な問題は検出されませんでした。")
+            break
 
         st.session_state.quality_gate_auto_retry_summary = auto_summary
         final_status = safe_text(final_result.get("overall_status"), "unknown") if isinstance(final_result, dict) else "unknown"
         message = f"Quality Gate自動チェックを完了しました。Phase2→Phase3再作成: {retries_done}回 / 最終判定: {final_status}"
         st.session_state.quality_gate_auto_retry_last_message = message
         log_event("Quality Gate自動再作成", " / ".join(auto_summary), level="info")
-        return {"message": message, "retries_done": retries_done, "summary": auto_summary, "final_result": final_result}
+        return final_result
     finally:
         st.session_state.quality_gate_auto_retry_running = False
 
@@ -2861,6 +2886,12 @@ def _hotel_names_are_safe_to_unify(hotel_names: List[str], df: pd.DataFrame, pla
             unique_names.append(name)
     if len(unique_names) <= 1:
         return False
+
+    # --- 修正箇所(v6.2.90): 「銀座周辺ホテル」「両国周辺ホテル」のような周辺ホテルラベルは、
+    # LLM/Phase2補完が日ごとに勝手に変えやすい。ユーザーがホテル変更を明示していない場合、
+    # 同一大都市圏内なら距離APIの失敗に依存せず、最初のホテルラベルへ統一する。
+    all_area_hotel_labels = all(_is_generic_hotel_label(name) and bool(_extract_area_hint(name)) for name in unique_names)
+
     groups = []
     for name in unique_names:
         area = _extract_area_hint(name)
@@ -2869,6 +2900,20 @@ def _hotel_names_are_safe_to_unify(hotel_names: List[str], df: pd.DataFrame, pla
             groups.append(group)
     if groups and len(set(groups)) >= 2:
         return False
+
+    primary_group = _major_metro_group(safe_text(planning_state.get("primary_destination"), ""))
+    if all_area_hotel_labels and (primary_group or groups):
+        try:
+            days = sorted(df["day"].dropna().astype(int).unique().tolist()) if "day" in df.columns else []
+            for prev_day, next_day in zip(days, days[1:]):
+                prev_df = df[df["day"].astype(int) == int(prev_day)]
+                next_df = df[df["day"].astype(int) == int(next_day)]
+                if _detect_large_area_change_between_days(prev_df, next_df):
+                    return False
+        except Exception:
+            pass
+        return True
+
     distance_values: List[float] = []
     for i in range(len(unique_names)):
         for j in range(i + 1, len(unique_names)):
@@ -2877,7 +2922,6 @@ def _hotel_names_are_safe_to_unify(hotel_names: List[str], df: pd.DataFrame, pla
                 distance_values.append(float(dist))
     if distance_values:
         return max(distance_values) <= 30.0
-    primary_group = _major_metro_group(safe_text(planning_state.get("primary_destination"), ""))
     if primary_group:
         days = sorted(df["day"].dropna().astype(int).unique().tolist()) if "day" in df.columns else []
         for prev_day, next_day in zip(days, days[1:]):
