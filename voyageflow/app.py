@@ -138,9 +138,10 @@ except Exception:
 # - v6.2.84: 両国国技館などイベント開催日注意の固定文を廃止し、row["date"] の訪問日から警告文を動的生成する。
 # - v6.2.85: destination側transport行のstart/endを移動カード時間として採用し、長距離短時間破綻をコード側ハードチェックで検出。
 # - v6.2.86: Phase3.5検証エージェントの通常表示を消し、完成旅程チェックをQuality Gateへ一本化。旧Phase3.5関数は退避として残す。
+# - v6.2.87: 既存生成本体は触らず、Phase3後のホテル整形で「同一都市・ユーザー明示なしの複数ホテル」を最初の具体ホテルへ統一。Quality Gateにも同チェックを追加。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.86-remove-phase35-panel"
+APP_VERSION_NAME = "v6.2.87-hotel-continuity-guard"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -1317,6 +1318,37 @@ def _quality_gate_build_code_checks(
                 user_message="宿泊行が不足している可能性があります。構造化だけ再作成しますか？",
             ))
 
+        # --- 修正箇所(v6.2.87): 同一都市・ユーザー明示なしの複数ホテルをQuality Gateでも検出 ---
+        concrete_hotel_rows = _collect_phase3_hotel_rows_for_continuity(df_phase3)
+        concrete_hotel_names: List[str] = []
+        for hotel_row in concrete_hotel_rows:
+            name = safe_text(hotel_row.get("destination"), "")
+            if name and name not in concrete_hotel_names:
+                concrete_hotel_names.append(name)
+        if (
+            len(concrete_hotel_names) >= 2
+            and not _user_explicitly_requests_hotel_change(planning_state)
+            and _hotel_names_are_safe_to_unify(concrete_hotel_names, df_phase3.reset_index(drop=True), planning_state)
+        ):
+            canonical_hotel = _canonical_hotel_name_for_continuity(concrete_hotel_rows)
+            replace_targets = [name for name in concrete_hotel_names if name != canonical_hotel]
+            checks.append(_quality_gate_make_check(
+                check_id="hotel_multiple_without_user_instruction",
+                category="hotel",
+                status="fail",
+                severity="medium",
+                location="完成旅程全体",
+                evidence=f"ユーザーがホテル変更を明示していないのに、同一都市圏で複数ホテルが出ています: {', '.join(concrete_hotel_names)}",
+                suggestion=f"最初の具体ホテル『{canonical_hotel}』へ統一します。",
+                recommended_action="auto_fix",
+                user_message="同一都市内で複数ホテルが出ているため、最初のホテルへ統一できます。",
+                auto_fix={
+                    "target": "phase3_apply_hotel_continuity_guard",
+                    "canonical_hotel": canonical_hotel,
+                    "replace_targets": replace_targets,
+                },
+            ))
+
         return_place = safe_text(planning_state.get("return_place"), "")
         if return_place:
             terminal_index = None
@@ -1704,6 +1736,15 @@ def _apply_quality_gate_safe_autofixes(result: Dict[str, object]) -> Dict[str, o
             except Exception:
                 continue
 
+        elif target == "phase3_apply_hotel_continuity_guard" and df3_work is not None:
+            try:
+                df3_work, hotel_notes = _apply_phase3_hotel_continuity_guard(df3_work, st.session_state.get("planning_state", {}))
+                if hotel_notes:
+                    changed_df3 = True
+                    notes.extend(hotel_notes)
+            except Exception:
+                continue
+
         elif target == "phase2_update_row" and df2_work is not None:
             try:
                 row_index = int(auto_fix.get("row_index"))
@@ -1814,6 +1855,11 @@ def retry_phase2_phase3_from_existing_phase1_by_quality_gate() -> Dict[str, str]
         raise ValueError("Quality Gate再作成: Phase3生成に失敗しました。")
 
     df3 = _trim_rows_after_terminal_return(df3, s)
+
+    # --- 修正箇所(v6.2.87): Phase3後のホテル整形だけで、同一都市・明示なしの複数ホテルを統一 ---
+    df3, hotel_continuity_notes = _apply_phase3_hotel_continuity_guard(df3, s)
+    for note in hotel_continuity_notes:
+        log_event("ホテル継続ガード", note, level="info")
     gap_messages = inspect_transport_step_gaps(df3)
     if gap_messages:
         for msg in gap_messages:
@@ -2639,6 +2685,177 @@ def _finalize_hotel_fallback_labels(df: pd.DataFrame, planning_state: Dict) -> p
                 fixed.at[idx, col] = f"{area}周辺ホテル" if area and area != "周辺" else "周辺ホテル"
     return fixed
 
+
+
+# =========================================================
+# 修正箇所(v6.2.87): Phase3後ホテル継続ガード
+# - 既存のPhase1/Phase2/Phase3生成本体は触らない
+# - 完成旅程生成後の整形として、同一都市・近距離・ユーザー明示なしの複数ホテルを最初の具体ホテルへ統一
+# - ルート端点(route_from/route_to)も同じホテル名へ揃え、表示上の混乱を抑える
+# =========================================================
+def _user_explicitly_requests_hotel_change(planning_state: Dict[str, object]) -> bool:
+    texts: List[str] = []
+    for key in ["hotel_preference", "primary_destination", "transport_style"]:
+        texts.append(safe_text(planning_state.get(key), ""))
+    for key in ["conversation_notes", "revision_requests"]:
+        values = planning_state.get(key) or []
+        if isinstance(values, list):
+            texts.extend([safe_text(v, "") for v in values])
+        else:
+            texts.append(safe_text(values, ""))
+    joined = " ".join([t for t in texts if t])
+    if not joined:
+        return False
+    explicit_tokens = [
+        "ホテルを変", "ホテル変更", "宿を変", "宿泊先を変", "別ホテル", "別のホテル",
+        "1泊目", "一泊目", "2泊目", "二泊目", "日ごと", "毎日違", "泊ごと",
+        "この日は", "この日だけ", "宿泊地を変", "ホテル移動", "宿を移動",
+    ]
+    return any(token in joined for token in explicit_tokens)
+
+
+def _is_concrete_hotel_row_for_continuity(row: Dict | pd.Series) -> bool:
+    destination = safe_text(_row_value(row, "destination", ""), "")
+    if not destination:
+        return False
+    if not _is_valid_hotel_row(row):
+        return False
+    if _is_generic_hotel_label(destination) or _is_bad_hotel_label(destination) or _looks_like_invalid_itinerary_node_name(destination):
+        return False
+    return True
+
+
+def _collect_phase3_hotel_rows_for_continuity(df: pd.DataFrame) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    if df is None or df.empty:
+        return rows
+    normalized = df.reset_index(drop=True)
+    for idx, row in normalized.iterrows():
+        if bool(row.get("is_transport", False)):
+            continue
+        if not _is_concrete_hotel_row_for_continuity(row):
+            continue
+        destination = safe_text(row.get("destination"), "")
+        rows.append({
+            "index": int(idx),
+            "day": int(row.get("day")) if pd.notna(row.get("day")) else 1,
+            "start_time": safe_text(row.get("start_time"), ""),
+            "end_time": safe_text(row.get("end_time"), ""),
+            "destination": destination,
+            "purpose": safe_text(row.get("purpose"), "").lower(),
+        })
+    return rows
+
+
+def _hotel_names_are_safe_to_unify(hotel_names: List[str], df: pd.DataFrame, planning_state: Dict[str, object]) -> bool:
+    unique_names = []
+    for name in hotel_names:
+        if name and name not in unique_names:
+            unique_names.append(name)
+    if len(unique_names) <= 1:
+        return False
+    groups = []
+    for name in unique_names:
+        area = _extract_area_hint(name)
+        group = _major_metro_group(area or name)
+        if group:
+            groups.append(group)
+    if groups and len(set(groups)) >= 2:
+        return False
+    distance_values: List[float] = []
+    for i in range(len(unique_names)):
+        for j in range(i + 1, len(unique_names)):
+            dist = _quality_gate_transport_distance(unique_names[i], unique_names[j])
+            if dist is not None:
+                distance_values.append(float(dist))
+    if distance_values:
+        return max(distance_values) <= 30.0
+    primary_group = _major_metro_group(safe_text(planning_state.get("primary_destination"), ""))
+    if primary_group:
+        days = sorted(df["day"].dropna().astype(int).unique().tolist()) if "day" in df.columns else []
+        for prev_day, next_day in zip(days, days[1:]):
+            prev_df = df[df["day"].astype(int) == int(prev_day)]
+            next_df = df[df["day"].astype(int) == int(next_day)]
+            if _detect_large_area_change_between_days(prev_df, next_df):
+                return False
+        return True
+    return False
+
+
+def _canonical_hotel_name_for_continuity(hotel_rows: List[Dict[str, object]]) -> str:
+    if not hotel_rows:
+        return ""
+    sorted_rows = sorted(hotel_rows, key=lambda r: (int(r.get("day", 1)), safe_text(r.get("start_time"), "99:99"), int(r.get("index", 0))))
+    for row in sorted_rows:
+        if safe_text(row.get("purpose"), "") in {"accommodation", "hotel", "stay", "lodging"}:
+            return safe_text(row.get("destination"), "")
+    return safe_text(sorted_rows[0].get("destination"), "")
+
+
+def _normalize_phase3_hotel_stay_times(df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
+    if df is None or df.empty:
+        return df, []
+    fixed = df.copy().reset_index(drop=True)
+    notes: List[str] = []
+    if "day" not in fixed.columns:
+        return fixed, notes
+    for idx, row in fixed.iterrows():
+        if bool(row.get("is_transport", False)) or not _is_valid_hotel_row(row):
+            continue
+        purpose = safe_text(row.get("purpose"), "").lower()
+        if purpose not in {"accommodation", "hotel", "stay", "lodging"}:
+            continue
+        start = safe_text(row.get("start_time"), "")
+        if not start or start >= "12:00":
+            continue
+        day = int(row.get("day")) if pd.notna(row.get("day")) else 1
+        prev_rows = fixed[(fixed.index < idx) & (fixed["day"].astype(int) == day)]
+        if prev_rows.empty:
+            continue
+        prev_end = safe_text(prev_rows.iloc[-1].get("end_time"), "")
+        if prev_end and prev_end >= "15:00":
+            fixed.at[idx, "start_time"] = prev_end
+            notes.append(f"ホテル宿泊開始時刻を前予定の終了時刻へ補正: Day{day} {safe_text(row.get('destination'), '')} {start}→{prev_end}")
+    return fixed, notes
+
+
+def _apply_phase3_hotel_continuity_guard(df: pd.DataFrame, planning_state: Dict[str, object]) -> tuple[pd.DataFrame, List[str]]:
+    if df is None or df.empty:
+        return df, []
+    fixed = df.copy().reset_index(drop=True)
+    notes: List[str] = []
+    fixed, time_notes = _normalize_phase3_hotel_stay_times(fixed)
+    notes.extend(time_notes)
+    if _user_explicitly_requests_hotel_change(planning_state):
+        return fixed, notes
+    hotel_rows = _collect_phase3_hotel_rows_for_continuity(fixed)
+    hotel_names = [safe_text(row.get("destination"), "") for row in hotel_rows]
+    unique_names: List[str] = []
+    for name in hotel_names:
+        if name and name not in unique_names:
+            unique_names.append(name)
+    if len(unique_names) <= 1:
+        return fixed, notes
+    if not _hotel_names_are_safe_to_unify(unique_names, fixed, planning_state):
+        return fixed, notes
+    canonical = _canonical_hotel_name_for_continuity(hotel_rows)
+    if not canonical:
+        return fixed, notes
+    replaced_names = [name for name in unique_names if name != canonical]
+    if not replaced_names:
+        return fixed, notes
+    for idx, row in fixed.iterrows():
+        destination = safe_text(row.get("destination"), "")
+        if destination in replaced_names and _is_valid_hotel_row(row):
+            fixed.at[idx, "destination"] = canonical
+            fixed.at[idx, "genre"] = "hotel"
+            if safe_text(row.get("purpose"), "").lower() in {"", "transport"}:
+                fixed.at[idx, "purpose"] = "accommodation"
+        for col in ["route_from", "route_to"]:
+            if col in fixed.columns and safe_text(row.get(col), "") in replaced_names:
+                fixed.at[idx, col] = canonical
+    notes.append(f"ユーザー明示なしの複数ホテルを同一ホテルへ統一: {', '.join(replaced_names)} → {canonical}")
+    return fixed.reset_index(drop=True), notes
 
 def parse_route_diagnostic_departure_iso(departure_text: str) -> str:
     value = str(departure_text or "").strip()
@@ -7361,6 +7578,11 @@ def approve_and_build_phase2_phase3() -> None:
         raise ValueError("フェーズ3で最終旅程表を生成できませんでした。")
 
     df3 = _trim_rows_after_terminal_return(df3, s)
+
+    # --- 修正箇所(v6.2.87): Phase3後のホテル整形だけで、同一都市・明示なしの複数ホテルを統一 ---
+    df3, hotel_continuity_notes = _apply_phase3_hotel_continuity_guard(df3, s)
+    for note in hotel_continuity_notes:
+        log_event("ホテル継続ガード", note, level="info")
 
     gap_messages = inspect_transport_step_gaps(df3)
     if gap_messages:
