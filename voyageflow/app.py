@@ -106,9 +106,10 @@ except Exception:
 # - v6.2.53: Spot Enrichmentを別ファイル services/spot_enrichment.py + data/spot_event_dictionary.py として最小統合
 # - スポットカード下部・簡易一覧の公式情報リンクを辞書ベース優先に変更
 # - LLMにイベント名を生成させず、辞書未登録時は公式情報検索へfallback
+# - v6.2.79: 上高地bus例外を「沢渡/平湯等ゲート↔上高地内」に限定。ホテル宿泊時刻は表示専用で翌朝表記へ補正。2日目以降の出発地点アンカーを安定表示。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.78-llm-transport-policy-structured-segments"
+APP_VERSION_NAME = "v6.2.79-transport-segment-exception-tighten-hotel-display-fix"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -4419,6 +4420,29 @@ def _annotate_phase2_transport_modes(df2: pd.DataFrame, planning_state: Dict[str
             annotated.at[idx, "transport_mode_to_next"] = base_mode
             annotated.at[idx, "transport_reason_to_next"] = "LLM区間判定が欠損したため、旅行全体ポリシーの主移動手段を補完"
 
+        # --- 修正箇所(v6.2.79): Phase2付与済みの区間移動手段にも、上高地bus例外の限定を適用 ---
+        tightened_mode, tightened_reason, tightened_warning, applied = _tighten_kamikochi_exception_mode(
+            annotated.at[idx, "transport_mode_to_next"],
+            context_state,
+            safe_text(cur.get("destination"), ""),
+            safe_text(nxt.get("destination"), ""),
+            current_note=safe_text(cur.get("one_point"), ""),
+            next_note=safe_text(nxt.get("one_point"), ""),
+            reason=safe_text(annotated.at[idx, "transport_reason_to_next"], ""),
+            warning=safe_text(annotated.at[idx, "transport_warning_to_next"], ""),
+        )
+        if applied:
+            before_mode = safe_text(annotated.at[idx, "transport_mode_to_next"], "")
+            annotated.at[idx, "transport_mode_to_next"] = tightened_mode
+            annotated.at[idx, "transport_reason_to_next"] = tightened_reason
+            annotated.at[idx, "transport_warning_to_next"] = tightened_warning
+            if before_mode and _normalize_transport_mode_key(before_mode) != tightened_mode:
+                log_event(
+                    "Phase2移動手段補正",
+                    f"上高地bus例外を限定: {safe_text(cur.get('destination'), '')}→{safe_text(nxt.get('destination'), '')} / {before_mode}→{tightened_mode}",
+                    level="info",
+                )
+
     return annotated
 
 
@@ -4988,6 +5012,94 @@ def _mode_label_for_warning(mode: str) -> str:
         "air": "飛行機",
     }.get(_normalize_transport_mode_key(mode), safe_text(mode, "移動"))
 
+# =========================================================
+# 修正箇所(v6.2.79): 上高地 bus 例外の範囲を限定
+# - これまでは「上高地/沢渡/平湯」などの語が区間文脈に含まれるだけで bus に寄りすぎていた。
+# - bus扱いは「沢渡/平湯/あかんだな等のゲート ↔ 上高地内（河童橋/上高地BT等）」に限定する。
+# - 宿→沢渡、沢渡→松本城などは自家用車旅行なら private_car を維持し、必要な注意だけ表示する。
+# =========================================================
+def _is_kamikochi_gateway_name(name: str) -> bool:
+    text = safe_text(name, "")
+    return any(token in text for token in ["沢渡", "さわんど", "平湯", "あかんだな"])
+
+
+def _is_kamikochi_inner_name(name: str) -> bool:
+    text = safe_text(name, "")
+    if not text:
+        return False
+    if _is_kamikochi_gateway_name(text):
+        return False
+    return any(token in text for token in ["上高地", "河童橋", "大正池", "明神池", "田代池", "上高地バスターミナル"])
+
+
+def _tighten_kamikochi_exception_mode(
+    mode: str,
+    planning_state: Dict[str, object],
+    origin_name: str,
+    destination_name: str,
+    current_note: str = "",
+    next_note: str = "",
+    reason: str = "",
+    warning: str = "",
+) -> tuple[str, str, str, bool]:
+    """上高地の例外バス化を、ゲート↔上高地内の区間だけに限定する。
+
+    戻り値: (mode, reason, warning, applied)
+    applied=True は、v6.2.79の限定ルールを適用したことを示す。
+    """
+    active_state = _get_active_trip_context(planning_state)
+    base_mode = _normalize_transport_mode_key(
+        active_state.get("base_transport_mode") or _infer_mode_from_transport_style(active_state.get("transport_style", ""))
+    )
+    is_private_car_policy = (
+        safe_text(active_state.get("transport_style"), "") == "自家用車"
+        or base_mode == "private_car"
+        or _is_private_car_trip(active_state)
+    )
+    if not is_private_car_policy:
+        return _normalize_transport_mode_key(mode), reason, warning, False
+
+    origin = safe_text(origin_name, "")
+    dest = safe_text(destination_name, "")
+    origin_gate = _is_kamikochi_gateway_name(origin)
+    dest_gate = _is_kamikochi_gateway_name(dest)
+    origin_inner = _is_kamikochi_inner_name(origin)
+    dest_inner = _is_kamikochi_inner_name(dest)
+
+    # ゲート↔上高地内だけ bus。これが唯一の自動bus例外。
+    if (origin_gate and dest_inner) or (origin_inner and dest_gate):
+        limited_reason = "上高地マイカー規制のため、沢渡/平湯等の乗換地点と上高地内の区間だけバス扱い"
+        limited_warning = f"{origin}→{dest}: 上高地マイカー規制区間のため、シャトルバス利用を前提にしています。"
+        return "bus", limited_reason, warning or limited_warning, True
+
+    # 上高地内同士は徒歩寄り。河童橋→明神池などの散策を車/バスにしない。
+    if origin_inner and dest_inner:
+        limited_reason = "上高地内の散策区間として徒歩扱い"
+        return "walk", limited_reason, warning, True
+
+    # 宿/市街地→沢渡、沢渡→市街地は自家用車でよい。
+    if origin_gate or dest_gate:
+        limited_reason = "沢渡/平湯等の乗換地点までは自家用車移動を維持"
+        return "private_car", limited_reason, warning, True
+
+    # 上高地内→市街地、または市街地→上高地内が直接つながっている場合は、
+    # 本来は「ゲートまでのシャトル＋自家用車」の複合移動。ここでは主移動手段をprivate_carに戻し、注意だけ残す。
+    if origin_inner or dest_inner:
+        limited_reason = "上高地の直接入出場は複合移動のため、主移動手段は自家用車として保持"
+        limited_warning = (
+            f"{origin}→{dest}: 上高地内はマイカー規制区間です。"
+            "実際には沢渡/平湯等でシャトルバスに乗り換える必要があります。"
+        )
+        return "private_car", limited_reason, warning or limited_warning, True
+
+    # メモに上高地/マイカー規制が出てきても、地点名が対象区間でなければbusへ広げない。
+    combined_note = f"{current_note} {next_note}"
+    if any(token in combined_note for token in ["上高地", "マイカー規制", "シャトルバス", "シャトル"]) and _normalize_transport_mode_key(mode) == "bus":
+        limited_reason = "上高地関連メモだけではbus例外を広げず、自家用車を維持"
+        return "private_car", limited_reason, warning, True
+
+    return _normalize_transport_mode_key(mode), reason, warning, False
+
 
 def _resolve_segment_transport_policy(
     planning_state: Dict[str, object],
@@ -4999,12 +5111,25 @@ def _resolve_segment_transport_policy(
     context_state = _get_active_trip_context(planning_state)
 
     # 修正箇所(v6.2.78): Phase2構造化データに付与済みの「次区間移動手段」を最優先する。
+    # 修正箇所(v6.2.79): ただし上高地bus例外だけは、地点ペアを見て範囲を再限定する。
     row_policy = _phase2_row_transport_policy(current)
     if row_policy:
+        origin_for_policy = safe_text(_row_value(current, "destination", ""), "")
+        dest_for_policy = safe_text(_row_value(actual_next, "destination", ""), "")
+        tightened_mode, tightened_reason, tightened_warning, applied = _tighten_kamikochi_exception_mode(
+            row_policy.get("mode", "train"),
+            context_state,
+            origin_for_policy,
+            dest_for_policy,
+            current_note=safe_text(_row_value(current, "one_point", ""), ""),
+            next_note=safe_text(_row_value(actual_next, "one_point", ""), ""),
+            reason=row_policy.get("reason", "Phase2構造化データに付与されたLLM区間移動手段を採用"),
+            warning=row_policy.get("warning", ""),
+        )
         return {
-            "mode": row_policy.get("mode", "train"),
-            "reason": row_policy.get("reason", "Phase2構造化データに付与されたLLM区間移動手段を採用"),
-            "warning": row_policy.get("warning", ""),
+            "mode": tightened_mode if applied else row_policy.get("mode", "train"),
+            "reason": tightened_reason if applied else row_policy.get("reason", "Phase2構造化データに付与されたLLM区間移動手段を採用"),
+            "warning": tightened_warning if applied else row_policy.get("warning", ""),
             "user_locked": bool(context_state.get("transport_user_locked", False)),
         }
 
@@ -5026,11 +5151,21 @@ def _resolve_segment_transport_policy(
         mode = "private_car"
         reason = "ユーザーが自家用車を明示しているため、区間移動は原則として自家用車を優先"
 
-        kamikochi_tokens = ["上高地", "沢渡", "さわんど", "平湯", "あかんだな", "マイカー規制", "シャトルバス"]
-        if any(token in segment_text for token in kamikochi_tokens):
-            mode = "bus"
-            warning = f"{origin}→{dest}: 上高地周辺はマイカー規制・シャトルバス利用が必要になる場合があるため、例外的にバス扱いにしました。"
-            reason = "自家用車希望を基本にしつつ、上高地周辺のマイカー規制を優先"
+        # --- 修正箇所(v6.2.79): 「上高地/沢渡」語の広すぎるbus化をやめ、地点ペアで限定 ---
+        tightened_mode, tightened_reason, tightened_warning, applied = _tighten_kamikochi_exception_mode(
+            mode,
+            context_state,
+            origin,
+            dest,
+            current_note=safe_text(_row_value(current, "one_point", ""), ""),
+            next_note=safe_text(_row_value(actual_next, "one_point", ""), ""),
+            reason=reason,
+            warning=warning,
+        )
+        if applied:
+            mode = tightened_mode
+            reason = tightened_reason
+            warning = tightened_warning
         elif _private_car_allows_public_transport(segment_text):
             mode = hinted_mode if hinted_mode in {"train", "bus"} else "train"
             warning = f"{origin}→{dest}: 旅程内に車を置いて公共交通へ切り替える文脈があるため、例外的に{_mode_label_for_warning(mode)}扱いにしました。"
@@ -5185,9 +5320,19 @@ def _enforce_private_car_mode_for_segment(
     mode_key = _normalize_transport_mode_key(mode)
     context = _private_car_segment_context(origin_name, destination_name, current_note, next_note, service_hint, extra_text)
 
-    # 上高地など、車で直接入れない文脈は bus/shuttle を優先。
-    if any(token in context for token in ["上高地", "沢渡", "さわんど", "平湯", "あかんだな", "マイカー規制", "シャトルバス", "シャトル"]):
-        return "bus"
+    # 修正箇所(v6.2.79): 上高地bus例外は、地点ペアが「ゲート↔上高地内」の場合だけ許可。
+    tightened_mode, _, _, applied = _tighten_kamikochi_exception_mode(
+        mode_key,
+        planning_state,
+        origin_name,
+        destination_name,
+        current_note=current_note,
+        next_note=next_note,
+        reason="",
+        warning="",
+    )
+    if applied:
+        return tightened_mode
 
     # 明示的な徒歩・タクシーは許可。
     # 修正箇所(v6.2.76): 「散策」「周辺」だけでスポット間移動を徒歩にしない。
@@ -7931,6 +8076,92 @@ def render_simple_itinerary_page() -> None:
     )
 
 
+
+# =========================================================
+# 修正箇所(v6.2.79): ホテル宿泊時刻の表示専用補正
+# - DataFrameの時刻データは触らず、カード表示の「滞在時間」だけを安全に補正する。
+# - 17:30-09:30 のような宿泊行は「17:30 - 翌09:30」と表示する。
+# - 05:00-23:00 のようなLLM由来の宿泊時刻崩れは「宿泊（時刻目安）」に寄せる。
+# =========================================================
+def _format_hotel_stay_text_for_display(row_dict: Dict[str, object], stay_text: str) -> str:
+    if not _is_hotel_or_lodging_row(row_dict):
+        return safe_text(stay_text, "")
+
+    start_time = safe_text(row_dict.get("start_time"), "")
+    end_time = safe_text(row_dict.get("end_time"), "")
+    if not start_time or not end_time:
+        return safe_text(stay_text, "") or "宿泊"
+
+    start_min = _time_to_minutes(start_time)
+    end_min = _time_to_minutes(end_time)
+    if start_min is None or end_min is None:
+        return safe_text(stay_text, "") or "宿泊"
+
+    # 正常な宿泊表現: 夕方チェックイン→翌朝チェックアウト
+    if end_min < start_min:
+        return f"{start_time} - 翌{end_time}"
+
+    # LLM構造化で 05:00-23:00 / 07:00-23:00 のように丸一日扱いになった宿泊行。
+    # 表示だけ丸め、移動計算や元データは変えない。
+    if start_min <= 8 * 60 and end_min >= 20 * 60:
+        return "宿泊（時刻目安: チェックイン〜翌朝）"
+
+    # 夕方チェックインで end が 23:00 など同日夜止まりの場合も、宿泊表示として自然にする。
+    if start_min >= 15 * 60 and end_min >= 21 * 60:
+        return f"{start_time} - 翌朝"
+
+    return safe_text(stay_text, "") or f"{start_time} - {end_time}"
+
+
+# =========================================================
+# 修正箇所(v6.2.79): 2日目以降の出発地点アンカー安定表示
+# - Phase3 DataFrameは増やさず、表示時だけ「この日の最初の移動元」を補助カードとして出す。
+# - Day2/Day3がいきなり移動カードから始まっても、宿/出発地点が消えたように見えない。
+# =========================================================
+def _has_adjacent_spot_with_destination(day_df: pd.DataFrame, local_pos: int, place_name: str, direction: str) -> bool:
+    if day_df is None or day_df.empty or not place_name:
+        return False
+    search_range = range(local_pos - 1, -1, -1) if direction == "before" else range(local_pos + 1, len(day_df))
+    for pos in search_range:
+        try:
+            candidate = day_df.iloc[pos]
+        except Exception:
+            continue
+        if bool(candidate.get("is_transport", False)):
+            continue
+        candidate_destination = safe_text(candidate.get("destination"), "")
+        if _same_effective_place(candidate_destination, place_name):
+            return True
+        return False
+    return False
+
+
+def _render_departure_anchor_card(place_name: str, time_text: str, source_row: Dict[str, object]) -> None:
+    place = safe_text(place_name, "")
+    if not place or place == "-":
+        return
+    # 駅は既存の駅アンカーに任せる。
+    if _is_station_anchor_name(place):
+        return
+
+    safe_place = html.escape(place)
+    safe_time = html.escape(safe_text(time_text, ""))
+    status = safe_text(source_row.get("execution_status"), "")
+    status_label = "キャンセル" if status == "cancelled" else "これから"
+    note = "この日の最初の移動カードに含まれる出発地点を、目印として補助表示しています。"
+    body = f"""
+<div class="vf-card vf-card-future">
+  <div style="font-size:1.05rem;font-weight:800;color:#1d4ed8;margin-bottom:6px;">📍 {safe_time} - {safe_place}</div>
+  <div>状態: {html.escape(status_label)}</div>
+  <div>目的: 出発</div>
+  <div>滞在時間: 目印表示</div>
+  <div style="margin-top:6px;opacity:0.82;">{html.escape(note)}</div>
+</div>
+"""
+    st.markdown(body, unsafe_allow_html=True)
+    st.link_button("📍 Google Mapsで場所を見る", build_google_maps_search_url(place), use_container_width=True)
+
+
 # =========================================================
 # 修正箇所(v6.2.57): 駅アンカー補助表示
 # - Phase2/Phase3のDataFrame自体は書き換えない
@@ -8053,6 +8284,15 @@ def render_itinerary_cards(
                     else:
                         origin, destination = "現在地", destination_text
 
+                    # --- 修正箇所(v6.2.79): 2日目以降が移動カードから始まる場合、出発地点を表示時だけ補助表示 ---
+                    if (
+                        local_pos == 0
+                        and int(day) >= 2
+                        and not _is_station_anchor_name(origin)
+                        and not _has_adjacent_spot_with_destination(day_df, local_pos, origin, "before")
+                    ):
+                        _render_departure_anchor_card(origin, safe_text(row_dict.get("start_time"), ""), row_dict)
+
                     # --- 修正箇所(v6.2.57): 移動カードに吸収された出発駅を、表示時だけ駅カードとして補助表示 ---
                     if _is_station_anchor_name(origin) and not _has_adjacent_station_spot(day_df, local_pos, origin, "before"):
                         _render_station_anchor_card(origin, safe_text(row_dict.get("start_time"), ""), "出発・乗車", row_dict)
@@ -8160,6 +8400,8 @@ def render_itinerary_cards(
                         end_time = safe_text(row_dict.get("end_time"), "")
                         if start_time and end_time:
                             stay_text = f"{start_time} - {end_time}"
+                    # --- 修正箇所(v6.2.79): ホテル宿泊時刻は表示専用で翌朝/時刻目安へ補正 ---
+                    stay_text = _format_hotel_stay_text_for_display(row_dict, stay_text)
                     comment_html = _format_highlight_comment_html(one_point)
                     destination = html.escape(safe_text(row_dict.get("destination")))
                     time_text = html.escape(safe_text(row_dict.get("start_time")))
