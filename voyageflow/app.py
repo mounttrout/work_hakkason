@@ -143,9 +143,10 @@ except Exception:
 # - v6.2.89: ホテル継続ガードを「銀座周辺ホテル」「両国周辺ホテル」など周辺ホテルラベルにも適用し、補正結果を左サイドバー診断で確認可能にする。
 # - v6.2.90: Quality Gateのask_userで自動処理を即停止せず、安全補正・Phase2→Phase3再作成を先に処理するAction Routerを追加。
 # - v6.2.91: ask_user混在時もretry系チェックを優先して処理し、宿泊行不足をPhase3後の安全補助ホテル行として自動補正。自動チェックの前後差分をログに表示。
+# - v6.2.92: Phase3後処理だけで、前夜の宿泊ホテルから翌朝最初のスポットへの出発目印と移動カードを補助追加する。
 # =========================================================
 APP_DISPLAY_NAME = "VoyageFlow - 対話式旅行プランナー"
-APP_VERSION_NAME = "v6.2.91-quality-gate-visible-actions"
+APP_VERSION_NAME = "v6.2.92-hotel-overnight-continuity"
 APP_UPDATED_DATE = "2026-05-01"
 
 
@@ -1820,6 +1821,21 @@ def _apply_quality_gate_safe_autofixes(result: Dict[str, object]) -> Dict[str, o
         except Exception as e:
             log_event("Quality Gateホテル補助", f"Quality Gate後の宿泊行不足補正をスキップ: {e}", level="warning")
 
+        # --- 修正箇所(v6.2.92): 前夜ホテルを翌朝の出発地点として接続。宿泊行追加だけで終わらせない。 ---
+        try:
+            connected_df3, overnight_notes = _quality_gate_connect_overnight_hotels_to_next_morning(
+                df3_work,
+                st.session_state.get("planning_state", {}),
+            )
+            if overnight_notes:
+                df3_work = connected_df3
+                changed_df3 = True
+                for note in overnight_notes:
+                    if note not in notes:
+                        notes.append(note)
+        except Exception as e:
+            log_event("Quality Gateホテル接続", f"翌朝ホテル接続補正をスキップ: {e}", level="warning")
+
     if changed_df2 and df2_work is not None:
         st.session_state.df_phase2 = _quality_gate_resequence(df2_work)
     if changed_df3 and df3_work is not None:
@@ -3203,6 +3219,188 @@ def _quality_gate_insert_missing_hotel_nights(
     return result.reset_index(drop=True), notes
 
 
+def _quality_gate_first_activity_row_for_day(day_rows: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    # --- 修正箇所(v6.2.92): 宿泊ホテルから翌朝最初のスポットへ接続するためのアンカー取得 ---
+    for row in sorted(day_rows, key=lambda r: (safe_text(r.get("start_time"), "99:99"), int(float(r.get("sequence", 999) or 999)))):
+        if bool(row.get("is_transport", False)):
+            continue
+        destination = safe_text(row.get("destination"), "")
+        if not destination or _is_hotel_or_lodging_row(row):
+            continue
+        return row
+    return None
+
+
+def _quality_gate_last_overnight_hotel_for_day(day_rows: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    # --- 修正箇所(v6.2.92): 前夜の宿泊ホテルを、翌朝出発地点として使う ---
+    hotel_rows = []
+    for row in day_rows:
+        if bool(row.get("is_transport", False)):
+            continue
+        if not _is_hotel_or_lodging_row(row):
+            continue
+        purpose = safe_text(row.get("purpose"), "").lower()
+        start_time = safe_text(row.get("start_time"), "")
+        end_time = safe_text(row.get("end_time"), "")
+        is_overnight = purpose in {"accommodation", "hotel", "stay", "lodging"} or "翌" in end_time or (start_time >= "15:00")
+        if is_overnight:
+            hotel_rows.append(row)
+    if not hotel_rows:
+        return None
+    return sorted(hotel_rows, key=lambda r: (safe_text(r.get("start_time"), "00:00"), int(float(r.get("sequence", 0) or 0))))[-1]
+
+
+def _quality_gate_has_morning_hotel_connection(day_rows: List[Dict[str, object]], hotel_name: str, first_start: str) -> bool:
+    # --- 修正箇所(v6.2.92): 既にホテル出発目印またはホテル→最初のスポット移動がある場合は二重追加しない ---
+    hotel_key = re.sub(r"[\s\u3000]+", "", safe_text(hotel_name, ""))
+    if not hotel_key:
+        return True
+    for row in day_rows:
+        row_start = safe_text(row.get("start_time"), "")
+        if first_start and row_start and row_start > first_start:
+            continue
+        if bool(row.get("is_transport", False)):
+            route_from = re.sub(r"[\s\u3000]+", "", safe_text(row.get("route_from"), ""))
+            if route_from == hotel_key:
+                return True
+            continue
+        destination = re.sub(r"[\s\u3000]+", "", safe_text(row.get("destination"), ""))
+        purpose = safe_text(row.get("purpose"), "").lower()
+        if destination == hotel_key and (purpose in {"departure", "accommodation", "hotel", "stay", "lodging"} or _is_hotel_or_lodging_row(row)):
+            return True
+    return False
+
+
+def _quality_gate_morning_departure_start(first_start: str) -> str:
+    # --- 修正箇所(v6.2.92): 翌朝のホテル出発時刻。既存スポット時刻は動かさず、接続カードだけ追加する ---
+    first_start = safe_text(first_start, "09:00") or "09:00"
+    gap_from_9 = _minutes_between_clock("09:00", first_start)
+    if gap_from_9 is not None and 0 <= gap_from_9 <= 90:
+        return "09:00"
+    if gap_from_9 is not None and gap_from_9 > 90:
+        return _subtract_minutes_from_clock(first_start, 30)
+    return _subtract_minutes_from_clock(first_start, 30)
+
+
+def _quality_gate_make_overnight_hotel_departure_rows(
+    *,
+    base_row: Dict[str, object],
+    day: int,
+    date_text: str,
+    hotel_name: str,
+    first_destination: str,
+    departure_start: str,
+    first_start: str,
+    planning_state: Dict[str, object],
+) -> List[Dict[str, object]]:
+    # --- 修正箇所(v6.2.92): 前夜ホテル→翌朝最初のスポットへの目印と移動カードを作る ---
+    marker = dict(base_row)
+    marker.update({
+        "day": int(day),
+        "sequence": 0.1,
+        "date": date_text,
+        "start_time": departure_start,
+        "end_time": departure_start,
+        "destination": hotel_name,
+        "purpose": "departure",
+        "genre": "hotel",
+        "duration_minutes": 0,
+        "is_transport": False,
+        "transport_mode": None,
+        "one_point": "Quality Gate: 前夜の宿泊ホテルを翌朝の出発地点として補助表示しました。",
+        "route_from": "",
+        "route_to": "",
+        "route_url": "",
+        "route_data_source": "quality_gate_overnight_hotel_connection",
+        "estimated_duration_label": "目印表示",
+    })
+
+    mode = _infer_mode_from_transport_style(safe_text(planning_state.get("transport_style"), "電車メイン"))
+    if mode in {"", "auto"}:
+        mode = "train"
+    minutes = _minutes_between_clock(departure_start, first_start) or 30
+    transport = dict(base_row)
+    transport.update({
+        "day": int(day),
+        "sequence": 0.2,
+        "date": date_text,
+        "start_time": departure_start,
+        "end_time": first_start,
+        "destination": f"{hotel_name} → {first_destination}",
+        "purpose": "transport",
+        "genre": "transport",
+        "duration_minutes": int(minutes),
+        "is_transport": True,
+        "transport_mode": mode,
+        "one_point": "Quality Gate: 前夜の宿泊ホテルから翌朝最初のスポットへの接続を補助追加しました。",
+        "address": "",
+        "route_from": hotel_name,
+        "route_to": first_destination,
+        "route_url": build_google_maps_dir_url(hotel_name, first_destination, mode),
+        "route_data_source": "quality_gate_overnight_hotel_connection",
+        "estimated_duration_label": f"約{int(minutes)}分（ホテル接続補正）",
+    })
+    return [marker, transport]
+
+
+def _quality_gate_connect_overnight_hotels_to_next_morning(
+    df: pd.DataFrame,
+    planning_state: Dict[str, object],
+) -> tuple[pd.DataFrame, List[str]]:
+    # --- 修正箇所(v6.2.92): Phase3後処理だけで、宿泊ホテル→翌朝最初のスポットへの接続を補う ---
+    if df is None or df.empty:
+        return df, []
+    fixed = df.copy().reset_index(drop=True)
+    if "day" not in fixed.columns:
+        return fixed, []
+
+    try:
+        day_values = sorted(pd.to_numeric(fixed["day"], errors="coerce").dropna().astype(int).unique().tolist())
+    except Exception:
+        return fixed, []
+    if len(day_values) <= 1:
+        return fixed, []
+
+    rows_by_day: Dict[int, List[Dict[str, object]]] = {}
+    for day in day_values:
+        day_df = fixed[pd.to_numeric(fixed["day"], errors="coerce").fillna(0).astype(int) == int(day)].sort_values(["sequence"], kind="stable")
+        rows_by_day[int(day)] = [row.to_dict() for _, row in day_df.iterrows()]
+
+    rebuilt_rows: List[Dict[str, object]] = []
+    notes: List[str] = []
+    for day in day_values:
+        day_rows = list(rows_by_day.get(int(day), []))
+        if day != day_values[0]:
+            prev_hotel = _quality_gate_last_overnight_hotel_for_day(rows_by_day.get(int(day) - 1, []))
+            first_activity = _quality_gate_first_activity_row_for_day(day_rows)
+            if prev_hotel and first_activity:
+                hotel_name = safe_text(prev_hotel.get("destination"), "")
+                first_destination = safe_text(first_activity.get("destination"), "")
+                first_start = safe_text(first_activity.get("start_time"), "09:00") or "09:00"
+                if hotel_name and first_destination and not _quality_gate_has_morning_hotel_connection(day_rows, hotel_name, first_start):
+                    departure_start = _quality_gate_morning_departure_start(first_start)
+                    date_text = safe_text(first_activity.get("date"), safe_text(prev_hotel.get("date"), safe_text(planning_state.get("start_date"), "")))
+                    added = _quality_gate_make_overnight_hotel_departure_rows(
+                        base_row=first_activity,
+                        day=int(day),
+                        date_text=date_text,
+                        hotel_name=hotel_name,
+                        first_destination=first_destination,
+                        departure_start=departure_start,
+                        first_start=first_start,
+                        planning_state=planning_state,
+                    )
+                    day_rows = added + day_rows
+                    notes.append(f"翌朝ホテル接続を補助追加: Day{day} {hotel_name} → {first_destination}（{departure_start}〜{first_start}）")
+        rebuilt_rows.extend(day_rows)
+
+    if not notes:
+        return fixed, []
+    result = pd.DataFrame(rebuilt_rows)
+    result = _quality_gate_resequence(result)
+    return result.reset_index(drop=True), notes
+
+
 def _apply_phase3_hotel_continuity_guard(df: pd.DataFrame, planning_state: Dict[str, object]) -> tuple[pd.DataFrame, List[str]]:
     if df is None or df.empty:
         _record_hotel_continuity_guard_diag(status="skipped", reason="df_phase3 が空です")
@@ -3733,6 +3931,18 @@ def _add_minutes_to_clock(start_time: str, minutes: int) -> str:
         return (base + timedelta(minutes=int(minutes))).strftime("%H:%M")
     except Exception:
         return start_time
+
+
+def _subtract_minutes_from_clock(end_time: str, minutes: int) -> str:
+    # --- 修正箇所(v6.2.92): 翌朝ホテル出発カードの開始時刻を安全に逆算 ---
+    value = str(end_time or "").strip()
+    if not value:
+        return end_time
+    try:
+        base = datetime.strptime(value, "%H:%M")
+        return (base - timedelta(minutes=int(minutes))).strftime("%H:%M")
+    except Exception:
+        return end_time
 
 
 def _llm_transport_duration_estimate(
@@ -7974,6 +8184,11 @@ def approve_and_build_phase2_phase3() -> None:
     df3, hotel_continuity_notes = _apply_phase3_hotel_continuity_guard(df3, s)
     for note in hotel_continuity_notes:
         log_event("ホテル継続ガード", note, level="info")
+
+    # --- 修正箇所(v6.2.92): Phase3後処理だけで、宿泊ホテル→翌朝最初のスポットへの接続を補う ---
+    df3, overnight_hotel_notes = _quality_gate_connect_overnight_hotels_to_next_morning(df3, s)
+    for note in overnight_hotel_notes:
+        log_event("ホテル翌朝接続", note, level="info")
 
     gap_messages = inspect_transport_step_gaps(df3)
     if gap_messages:
